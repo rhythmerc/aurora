@@ -286,8 +286,15 @@ bool has_replacement(const GXTexObj_&, const GXTlutObj_&) noexcept { return fals
 // --- Window stub ---
 #include "../lib/window.hpp"
 namespace aurora::window {
+namespace testing {
+// smstrikers-port: GXAdjustForOverscan takes the SDK arithmetic when a game
+// has pinned the render target (set_frame_buffer_scale > 0). 0 is the stock
+// behaviour; gx_overscan_test.cpp sets it to exercise the other branch.
+float g_frameBufferScale = 0.f;
+} // namespace testing
 AuroraWindowSize get_window_size() { return {640, 480, 640, 480, 640, 480, 1.0f}; }
 void set_frame_buffer_aspect_fit(bool) {}
+float get_frame_buffer_scale() { return testing::g_frameBufferScale; }
 } // namespace aurora::window
 
 // --- WebGPU C API stubs (prevent linker errors from wgpu:: destructors) ---

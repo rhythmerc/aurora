@@ -821,8 +821,12 @@ auto lighting_func(const ShaderConfig& config, const ColorChannelConfig& cc, u8 
   if (cc.attnFn == GX_AF_NONE) {
     lightAttnFn = "attn = 1.0;"s;
   } else if (cc.attnFn == GX_AF_SPOT) {
+    // smstrikers-port: clamp the spot cosine to [0,1], NaN-safe. A point light
+    // leaves the direction words uninitialized, which the hardware annihilates
+    // with a zero coefficient; in f32, cosine*cosine overflows and 0.0*inf is NaN.
     lightAttnFn = fmt::format(R"""(
-          var cosine = max(0.0, dot(ldir, light.dir));
+          var cosraw = dot(ldir, light.dir);
+          var cosine = select(0.0, min(cosraw, 1.0), cosraw > 0.0);
           var cos_attn = dot(light.cos_att, vec3f(1.0, cosine, cosine * cosine));
           var dist_attn = dot(light.dist_att, vec3f(1.0, dist, dist2));
           attn = max(0.0, cos_attn / dist_attn);)""");
@@ -831,8 +835,10 @@ auto lighting_func(const ShaderConfig& config, const ColorChannelConfig& cc, u8 
     std::string dist_attn = diffFn != GX_DF_NONE
                                 ? "max(0.0, dot(normalize(light.dist_att), vec3f(1.0, attn, attn * attn)));"
                                 : "max(0.0, dot(light.dist_att, vec3f(1.0, attn, attn * attn)));";
+    // smstrikers-port: the same [0,1] NaN-safe clamp as the GX_AF_SPOT branch.
     lightAttnFn = fmt::format(R"""(
-          attn = select(0.0, max(0.0, dot({0}, light.dir)), dot({0}, ldir) >= 0.0);
+          var cosraw = dot({0}, light.dir);
+          attn = select(0.0, min(cosraw, 1.0), cosraw > 0.0 && dot({0}, ldir) >= 0.0);
           var cos_attn = dot(light.cos_att, vec3f(1.0, attn, attn * attn));
           var dist_attn = {1};
           attn = max(0.0, cos_attn / dist_attn);)""",
@@ -1595,10 +1601,18 @@ std::string build_shader_source(const ShaderConfig& config, uint32_t normalAttac
       vtxXfrAttrs += fmt::format("\n    var tc{} = vec4f({}, 1.0);", i, vtx_attr(config, GX_VA_POS));
     } else if (tcg.src == GX_TG_NRM) {
       vtxXfrAttrs += fmt::format("\n    var tc{} = vec4f({}, 1.0);", i, vtx_attr(config, GX_VA_NRM));
-    } else if (tcg.src == GX_TG_COLOR0) {
-      vtxXfrAttrs += fmt::format("\n    var tc{} = {};", i, vtx_attr(config, GX_VA_CLR0));
-    } else if (tcg.src == GX_TG_COLOR1) {
-      vtxXfrAttrs += fmt::format("\n    var tc{} = {};", i, vtx_attr(config, GX_VA_CLR1));
+    } else if (tcg.src == GX_TG_COLOR0 || tcg.src == GX_TG_COLOR1) {
+      // smstrikers-port: a colour-source texgen takes the channel's rasterized
+      // output, the lit result, and not the raw vertex colour.
+      const u32 ch = tcg.src == GX_TG_COLOR0 ? 0 : 1;
+      const auto vtxSrc = vtx_attr(config, static_cast<GXAttr>(GX_VA_CLR0 + ch));
+      // Per-pixel lighting computes the channel in the fragment stage, where a
+      // vertex-stage texgen cannot reach it; fall back to the attribute there.
+      if (!UsePerPixelLighting && info.sampledColorChannels.test(ch)) {
+        vtxXfrAttrs += fmt::format("\n    var tc{} = out.cc{};", i, ch);
+      } else {
+        vtxXfrAttrs += fmt::format("\n    var tc{} = {};", i, vtxSrc);
+      }
     } else if (tcg.src == GX_TG_BINRM) {
       vtxXfrAttrs += fmt::format("\n    var tc{} = vec4f({}, 1.0);", i, nbt_slice_local(NbtSlice::B));
     } else if (tcg.src == GX_TG_TANGENT) {
@@ -1606,14 +1620,19 @@ std::string build_shader_source(const ShaderConfig& config, uint32_t normalAttac
     } else
       UNLIKELY FATAL("unhandled tcg src {}", underlying(tcg.src));
     if (tcg.type == GX_TG_MTX2x4 || tcg.type == GX_TG_MTX3x4) {
+      // smstrikers-port: postex_mtx is pnMtx[0..MaxPnMtx) then texMtxs, so a
+      // texture matrix indexed as row/3 is only right while MaxPnMtx is 10.
       if (info.indexAttr.test(GX_VA_TEX0MTXIDX + i)) {
-        vtxXfrAttrs += fmt::format(
-            "\n    var tc{0}_tmp = tc{0} * ubuf.postex_mtx[min(in_texmtxidx{0} / 3u, {1}u)];", i,
-            MaxPnMtx + MaxTexMtx - 1);
+        vtxXfrAttrs += fmt::format("\n    var tc{0}_tmp = tc{0} * ubuf.postex_mtx[min(select(in_texmtxidx{0} / 3u, "
+                                   "{1}u + (in_texmtxidx{0} - {2}u) / 3u, in_texmtxidx{0} >= {2}u), {3}u)];",
+                                   i, MaxPnMtx, static_cast<u32>(GX_TEXMTX0), MaxPnMtx + MaxTexMtx - 1);
       } else if (tcg.mtx == GX_IDENTITY) {
         vtxXfrAttrs += fmt::format("\n    var tc{0}_tmp = tc{0}.xyz;", i);
       } else {
-        u32 texMtxIdx = std::min(static_cast<u32>(tcg.mtx / 3), MaxPnMtx + MaxTexMtx - 1);
+        // smstrikers-port: texture matrices start at uniform slot MaxPnMtx (13), not
+        // GX_TEXMTX0 / 3 (10). Clamped, as a texgen naming GX_IDENTITY lands past them.
+        const u32 texMtxIdx = std::min(tcg.mtx >= GX_TEXMTX0 ? MaxPnMtx + (tcg.mtx - GX_TEXMTX0) / 3 : tcg.mtx / 3,
+                                       MaxPnMtx + MaxTexMtx - 1);
         vtxXfrAttrs += fmt::format("\n    var tc{0}_tmp = tc{0} * ubuf.postex_mtx[{1}];", i, texMtxIdx);
       }
       if (tcg.type == GX_TG_MTX2x4) {

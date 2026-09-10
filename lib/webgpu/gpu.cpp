@@ -1011,6 +1011,16 @@ bool initialize(AuroraBackend auroraBackend, bool allowCpu) {
     g_textureComponentSwizzleSupported = false;
     wgpu::SupportedFeatures supportedFeatures;
     g_adapter.GetFeatures(&supportedFeatures);
+    {
+      std::string all;
+      for (size_t i = 0; i < supportedFeatures.featureCount; ++i) {
+        all += static_cast<char>(10);
+        all += "  ";
+        all += fmt::format("0x{:08X} ", static_cast<uint32_t>(supportedFeatures.features[i]));
+        all += magic_enum::enum_name(supportedFeatures.features[i]);
+      }
+      Log.info("Adapter supports: {}", all);
+    }
     for (size_t i = 0; i < supportedFeatures.featureCount; ++i) {
       const auto feature = supportedFeatures.features[i];
       if (feature == wgpu::FeatureName::CoreFeaturesAndLimits || feature == wgpu::FeatureName::TextureCompressionBC ||

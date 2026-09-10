@@ -4,30 +4,28 @@
 
 namespace aurora::gfx {
 inline constexpr bool UseTextureBuffer = true;
-/* Melee's busiest Classic frames land right on 24 MiB of per-draw uniforms
- * and occasionally tip over it (observed: 25167920 requested). These pools
- * are non-owning views onto the mapped staging buffer, so overflowing is a
- * hard abort, not a realloc. MELEE_GFX_STATS=1 prints the peak each second
- * if this needs sizing again. */
+/* These pools are non-owning views onto the mapped staging buffer, so
+ * overflowing one is a hard abort, not a realloc. */
 #if defined(__ANDROID__)
-// Mobile optimization: clamp GPU buffer pools to conserve memory on 2-3GB mobile devices
-// while retaining sufficient headroom for Melee draw calls.
-inline constexpr uint64_t UniformBufferSize = 25165824; // 24 MiB (ample for Melee peak 24MB, instead of 48MB)
+// melee-pc's Quest sizes, kept until Strikers is measured there
+// (STRIKERS_LOG_GPUMEM). The XR eye replay and SpaceWarp's motion pass add
+// uniforms and decoded vertices on top of the flat frame's: Melee's busiest
+// frames reached 24 MiB of uniforms, 1 MiB of indices and 4 MiB of storage.
+inline constexpr uint64_t UniformBufferSize = 25165824; // 24 MiB
 inline constexpr uint64_t VertexBufferSize = 4194304;   // 4 MiB
-// Indices: 1 MiB overflowed on the 4-player results screen in XR (1048660
-// bytes requested).
 inline constexpr uint64_t IndexBufferSize = 4194304;    // 4 MiB
-// Storage holds the CPU-decoded vertices (AURORA_VTX_DECODE), every attribute
-// expanded to floats: 4 MiB overflowed on Pokemon Stadium's first frames in the
-// attract demo (4200356 bytes); a running 4-player Onett peaks near 2.8 MiB.
 inline constexpr uint64_t StorageBufferSize = 16777216; // 16 MiB
 inline constexpr uint64_t TextureUploadSize = 12582912; // 12 MiB
 #else
-inline constexpr uint64_t UniformBufferSize = 50331648; // 48 MiB
-inline constexpr uint64_t VertexBufferSize = 5242880;   // 5 MiB
-inline constexpr uint64_t IndexBufferSize = 2097152;    // 2 MiB
-inline constexpr uint64_t StorageBufferSize = 8388608;  // 8 MiB
-inline constexpr uint64_t TextureUploadSize = 25165824; // 24 MiB
+// smstrikers-port: sized from this game's measured peaks rather than upstream's
+// defaults (uniform 24, storage 8 MiB). Measured worst case is 1.92, 1.95, 0.52,
+// 8.10 and 19.45 MiB in the order below; overflow of the first four is a bare
+// abort(), so each carries 2-4x margin. Storage is grown, not shrunk.
+inline constexpr uint64_t UniformBufferSize = 8388608;   // 8 MiB
+inline constexpr uint64_t VertexBufferSize = 5242880;    // 5 MiB
+inline constexpr uint64_t IndexBufferSize = 2097152;     // 2 MiB
+inline constexpr uint64_t StorageBufferSize = 16777216;  // 16 MiB
+inline constexpr uint64_t TextureUploadSize = 25165824;  // 24 MiB
 #endif
 
 namespace detail {

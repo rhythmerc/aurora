@@ -1,4 +1,8 @@
 #include <aurora/aurora.h>
+#include <chrono>
+#include <cstdio>
+#include <string>
+#include <vector>
 #include <aurora/time.hpp>
 #include <cmath>
 
@@ -295,6 +299,134 @@ const AuroraEvent* update() noexcept {
   return window::poll_events();
 }
 
+// smstrikers-port: GPU frame time without timestamp queries, which read back zero
+// on a tile-based deferred renderer. An upper bound: the submit-to-callback
+// interval includes any wait behind previously queued work.
+namespace gpu_time {
+std::atomic<uint64_t> g_totalNs{0};
+std::atomic<uint64_t> g_count{0};
+std::atomic<uint64_t> g_maxNs{0};
+std::atomic<uint64_t> g_lastNs{0};
+
+uint64_t now_ns() {
+  return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                   std::chrono::steady_clock::now().time_since_epoch())
+                                   .count());
+}
+
+void record(uint64_t ns) {
+  g_lastNs.store(ns, std::memory_order_relaxed);
+  g_totalNs.fetch_add(ns, std::memory_order_relaxed);
+  g_count.fetch_add(1, std::memory_order_relaxed);
+  uint64_t prev = g_maxNs.load(std::memory_order_relaxed);
+  while (ns > prev && !g_maxNs.compare_exchange_weak(prev, ns, std::memory_order_relaxed)) {
+  }
+}
+} // namespace gpu_time
+
+// smstrikers-port: read the presented frame back as a binary PPM, on the encoder
+// Aurora is already using. A blit from another encoder trips Metal's "A command
+// encoder is already encoding to this command buffer".
+namespace capture {
+std::string g_path;
+bool g_pending = false;
+
+// WebGPU requires bytes-per-row of a texture copy to be a multiple of 256.
+constexpr uint32_t kRowAlign = 256;
+constexpr uint32_t align_up(uint32_t v, uint32_t a) { return (v + a - 1) & ~(a - 1); }
+
+wgpu::Buffer g_buffer;
+uint32_t g_width = 0, g_height = 0, g_paddedRow = 0;
+bool g_bgra = false;
+
+// Called with Aurora's encoder, before it is finished.
+void record(const wgpu::CommandEncoder& encoder) {
+  if (!g_pending) {
+    return;
+  }
+  const auto& src = webgpu::present_source();
+  if (src.texture == nullptr) {
+    g_pending = false;
+    return;
+  }
+  g_width = src.size.width;
+  g_height = src.size.height;
+  g_paddedRow = align_up(g_width * 4, kRowAlign);
+  g_bgra = src.format == wgpu::TextureFormat::BGRA8Unorm ||
+           src.format == wgpu::TextureFormat::BGRA8UnormSrgb;
+
+  const uint64_t total = static_cast<uint64_t>(g_paddedRow) * g_height;
+  const wgpu::BufferDescriptor bufDesc{
+      .label = "Frame capture readback",
+      .usage = wgpu::BufferUsage::CopyDst | wgpu::BufferUsage::MapRead,
+      .size = total,
+  };
+  g_buffer = webgpu::g_device.CreateBuffer(&bufDesc);
+  if (g_buffer == nullptr) {
+    g_pending = false;
+    return;
+  }
+
+  const wgpu::TexelCopyTextureInfo copySrc{
+      .texture = src.texture,
+      .mipLevel = 0,
+      .origin = {0, 0, 0},
+      .aspect = wgpu::TextureAspect::All,
+  };
+  const wgpu::TexelCopyBufferInfo copyDst{
+      .layout = {.offset = 0, .bytesPerRow = g_paddedRow, .rowsPerImage = g_height},
+      .buffer = g_buffer,
+  };
+  const wgpu::Extent3D extent{g_width, g_height, 1};
+  encoder.CopyTextureToBuffer(&copySrc, &copyDst, &extent);
+}
+
+// Called after the frame has been submitted.
+void resolve() {
+  if (!g_pending || g_buffer == nullptr) {
+    return;
+  }
+  g_pending = false;
+
+  const uint64_t total = static_cast<uint64_t>(g_paddedRow) * g_height;
+  bool ok = false;
+  const wgpu::Future future = g_buffer.MapAsync(
+      wgpu::MapMode::Read, 0, static_cast<size_t>(total), wgpu::CallbackMode::WaitAnyOnly,
+      [&ok](wgpu::MapAsyncStatus status, wgpu::StringView) { ok = status == wgpu::MapAsyncStatus::Success; });
+  wgpu::FutureWaitInfo wait{};
+  wait.future = future;
+  webgpu::g_instance.WaitAny(1, &wait, UINT64_MAX);
+
+  if (ok) {
+    const auto* mapped = static_cast<const uint8_t*>(g_buffer.GetConstMappedRange(0, static_cast<size_t>(total)));
+    FILE* f = mapped != nullptr ? std::fopen(g_path.c_str(), "wb") : nullptr;
+    if (f != nullptr) {
+      std::fprintf(f, "P6\n%u %u\n255\n", g_width, g_height);
+      std::vector<uint8_t> row(static_cast<size_t>(g_width) * 3);
+      for (uint32_t y = 0; y < g_height; ++y) {
+        const uint8_t* srcRow = mapped + static_cast<size_t>(y) * g_paddedRow;
+        for (uint32_t x = 0; x < g_width; ++x) {
+          const uint8_t* px = srcRow + x * 4;
+          row[x * 3 + 0] = g_bgra ? px[2] : px[0];
+          row[x * 3 + 1] = px[1];
+          row[x * 3 + 2] = g_bgra ? px[0] : px[2];
+        }
+        std::fwrite(row.data(), 1, row.size(), f);
+      }
+      std::fclose(f);
+      Log.info("Wrote frame capture to {}", g_path);
+    } else {
+      Log.warn("Frame capture: could not open {}", g_path);
+    }
+    g_buffer.Unmap();
+  } else {
+    Log.warn("Frame capture: buffer map failed");
+  }
+  g_buffer.Destroy();
+  g_buffer = nullptr;
+}
+} // namespace capture
+
 bool begin_frame() noexcept {
   ZoneScoped;
 #ifdef AURORA_ENABLE_GX
@@ -485,6 +617,7 @@ void end_frame() noexcept {
     } else if (!skipPresent) {
       Log.info("Skipping present; no usable surface texture ({})", magic_enum::enum_name(surfaceStatus));
     }
+    capture::record(encoder);   // smstrikers-port
     webgpu::gpu_prof::frame_end(encoder);
     const wgpu::CommandBufferDescriptor cmdBufDescriptor{.label = "Redraw command buffer"};
     const auto buffer = encoder.Finish(&cmdBufDescriptor);
@@ -493,6 +626,18 @@ void end_frame() noexcept {
       gfx::AtraceScope trace{"Submit frame"};
       g_queue.Submit(1, &buffer);
     }
+    {
+      // smstrikers-port: see namespace gpu_time above.
+      const uint64_t submitNs = gpu_time::now_ns();
+      g_queue.OnSubmittedWorkDone(
+          wgpu::CallbackMode::AllowSpontaneous,
+          [submitNs](wgpu::QueueWorkDoneStatus status, wgpu::StringView) {
+            if (status == wgpu::QueueWorkDoneStatus::Success) {
+              gpu_time::record(gpu_time::now_ns() - submitNs);
+            }
+          });
+    }
+    capture::resolve();
     webgpu::gpu_prof::after_submit();
 #ifdef AURORA_ENABLE_OPENXR
     // Hands every image begun this frame to the XR thread: the virtual
@@ -585,6 +730,10 @@ void end_frame() noexcept {
     TracyPlot("aurora: lastTextureUploadSize", static_cast<int64_t>(stats.lastTextureUploadSize));
   });
 
+  // smstrikers-port: mark the frame boundary, so Tracy's zones group by frame.
+  // FrameMark expands to nothing unless TRACY_ENABLE is set.
+  FrameMark;
+
 #endif
 }
 } // namespace
@@ -595,6 +744,36 @@ AuroraInfo aurora_initialize(int argc, char* argv[], const AuroraConfig* config)
   return aurora::initialize(argc, argv, *config);
 }
 void aurora_shutdown() { aurora::shutdown(); }
+void aurora_set_frame_buffer_scale(float scale) {
+  // smstrikers-port: window::set_frame_buffer_scale was not reachable from the
+  // public API.
+  aurora::window::set_frame_buffer_scale(scale);
+}
+AuroraWindowSize aurora_window_size() {
+  // smstrikers-port: see aurora.h. get_window_size() reads the window every time it is called, which is what makes it usable as a poll.
+  return aurora::window::get_window_size();
+}
+void aurora_apply_frame_buffer_resize() {
+  // smstrikers-port: see aurora.h. resize_swapchain() is what the deferred FutureResize event ends up calling, without the round trip.
+  aurora::window::resize_frame_buffer_now();
+}
+void aurora_gpu_frame_time(uint64_t* lastNs, uint64_t* meanNs, uint64_t* maxNs, uint64_t* count) {
+  // smstrikers-port: see namespace gpu_time in this file.
+  const uint64_t n = aurora::gpu_time::g_count.load(std::memory_order_relaxed);
+  if (lastNs != nullptr) *lastNs = aurora::gpu_time::g_lastNs.load(std::memory_order_relaxed);
+  if (maxNs != nullptr) *maxNs = aurora::gpu_time::g_maxNs.load(std::memory_order_relaxed);
+  if (count != nullptr) *count = n;
+  if (meanNs != nullptr) {
+    *meanNs = n ? aurora::gpu_time::g_totalNs.load(std::memory_order_relaxed) / n : 0;
+  }
+}
+void aurora_capture_frame(const char* path) {
+  // smstrikers-port: recorded during the next end_frame.
+  if (path != nullptr) {
+    aurora::capture::g_path = path;
+    aurora::capture::g_pending = true;
+  }
+}
 const AuroraEvent* aurora_update() { return aurora::update(); }
 bool aurora_begin_frame() { return aurora::begin_frame(); }
 void aurora_end_frame() { aurora::end_frame(); }

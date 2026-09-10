@@ -5,6 +5,7 @@
 #include "../gfx/frame.hpp"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cstring>
 #include <limits>
@@ -44,6 +45,11 @@ std::atomic_bool sMainThreadWaitingForProcessed{false};
 thread::Thread sWorkerThread;
 std::atomic<DrawDoneCallback> sDrawDoneCallback{nullptr};
 
+// smstrikers-port: see DisplayListSplice in fifo.hpp.
+constexpr size_t kSpliceRing = 512;
+std::array<DisplayListSplice, kSpliceRing> sSplices{};
+std::atomic<uint64_t> sSpliceCount{0};
+
 void dispatch_draw_done() noexcept {
   if (const auto callback = sDrawDoneCallback.load(std::memory_order_acquire); callback != nullptr) {
     callback();
@@ -68,7 +74,9 @@ void process_to(uint64_t target, std::memory_order order) noexcept {
                     sStreamBase + detail::sBufferSize);
       const auto start = static_cast<uint32_t>(processed - sStreamBase);
       const auto size = static_cast<uint32_t>(target - processed);
-      result = process(detail::sBufferData + start, size);
+      // smstrikers-port: `processed` turns a chunk-relative offset into a stream
+      // position, and so into a display list.
+      result = process(detail::sBufferData + start, size, processed);
     }
     AURORA_ASSERT(result.bytesProcessed > 0 && result.bytesProcessed <= target - processed,
                   "FIFO processor made invalid progress: processed {} of {} remaining bytes", result.bytesProcessed,
@@ -145,6 +153,8 @@ void init() {
   detail::sDlBuffer = nullptr;
   detail::sDlSize = 0;
   detail::sDlWritePos = 0;
+
+  sSpliceCount.store(0, std::memory_order_relaxed);
 
   sFrameActive = false;
   sPendingDraws = 0;
@@ -249,6 +259,31 @@ uint32_t end_display_list() {
 }
 
 bool in_display_list() { return detail::sInDisplayList; }
+
+// smstrikers-port: called on the GX thread immediately before the list's bytes
+// are appended, so sBufferSize is still the offset they will land at. Lock-free:
+// its only reader is a processor that is already aborting.
+void note_display_list(const void* src, const uint32_t size) noexcept {
+  const uint64_t seq = sSpliceCount.load(std::memory_order_relaxed);
+  sSplices[seq % kSpliceRing] = {
+      .streamPos = sStreamBase + detail::sBufferSize,
+      .size = size,
+      .src = src,
+  };
+  sSpliceCount.store(seq + 1, std::memory_order_release);
+}
+
+const DisplayListSplice* find_display_list(const uint64_t streamPos) noexcept {
+  const uint64_t count = sSpliceCount.load(std::memory_order_acquire);
+  const uint64_t oldest = count > kSpliceRing ? count - kSpliceRing : 0;
+  for (uint64_t seq = count; seq-- > oldest;) {
+    const auto& splice = sSplices[seq % kSpliceRing];
+    if (streamPos >= splice.streamPos && streamPos < splice.streamPos + splice.size) {
+      return &splice;
+    }
+  }
+  return nullptr;
+}
 
 void drain() {
   if (detail::sBufferSize == 0) {

@@ -336,6 +336,10 @@ bool create_window(AuroraBackend backend) {
   if (g_config.startFullscreen) {
     flags |= SDL_WINDOW_FULLSCREEN;
   }
+  // smstrikers-port: SDL applies this at show, so fullscreen still wins.
+  if (g_config.startMaximized) {
+    flags |= SDL_WINDOW_MAXIMIZED;
+  }
 #endif
   auto width = static_cast<Sint32>(g_config.windowWidth);
   auto height = static_cast<Sint32>(g_config.windowHeight);
@@ -497,7 +501,11 @@ AuroraWindowSize get_window_size() {
     }
 #endif
     if (g_frameBufferAspect > 0.f) {
-      const auto [fitW, fitH] = fit_frame_buffer_to_aspect(fb_w, fb_h, g_frameBufferAspect);
+      // smstrikers-port: while fitting, prefer the aspect VILockAspectRatio was
+      // given, the shape the framebuffer is meant to be seen at rather than its
+      // pixel count.
+      const float locked = vi::locked_aspect();
+      const auto [fitW, fitH] = fit_frame_buffer_to_aspect(fb_w, fb_h, locked > 0.f ? locked : g_frameBufferAspect);
       fb_w = fitW;
       fb_h = fitH;
     }
@@ -608,6 +616,16 @@ void request_frame_buffer_resize() {
     push_future_resize_event();
   }
 }
+
+// smstrikers-port: the same work without the deferral; a deferred rebuild would land a frame late, and that frame has black bars.
+void resize_frame_buffer_now() {
+  if (g_window != nullptr) {
+    resize_swapchain();
+  }
+}
+
+// smstrikers-port: non-zero once the caller has pinned the render target to the VI render mode rather than the window, which GXAdjustForOverscan needs to know.
+float get_frame_buffer_scale() { return g_frameBufferScale; }
 
 void set_frame_buffer_scale(float scale) {
   if (scale < 0.f) {

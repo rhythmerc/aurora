@@ -84,6 +84,7 @@ if (AURORA_ENABLE_GX)
     ../lib/gx/attr_fmt.cpp
     ../lib/gx/dl.cpp
     gx_dl_test.cpp
+    gx_overscan_test.cpp
   )
 
   target_include_directories(gx_fifo_tests PRIVATE

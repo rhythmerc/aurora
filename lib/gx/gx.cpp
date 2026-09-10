@@ -247,6 +247,12 @@ wgpu::PrimitiveState to_primitive_state(GXCullMode gx_cullMode) {
   case GX_CULL_BACK:
     cullMode = wgpu::CullMode::Back;
     break;
+  case GX_CULL_ALL:
+    // smstrikers-port: no wgpu cull mode discards both faces, so GX_CULL_ALL is
+    // handled in populate_pipeline_config by turning off every write mask. The
+    // value here is then arbitrary.
+    cullMode = wgpu::CullMode::Back;
+    break;
   case GX_CULL_NONE:
     break;
   }
@@ -694,9 +700,11 @@ void populate_pipeline_config(PipelineConfig& config, GXPrimitive primitive, GXV
       .polygonOffsetScaleBits = std::bit_cast<uint32_t>(polygonOffsetScale),
       .polygonOffsetClampBits = std::bit_cast<uint32_t>(g_gxState.clamp),
       .depthCompare = g_gxState.depthCompare,
-      .depthUpdate = g_gxState.depthUpdate,
-      .alphaUpdate = g_gxState.alphaUpdate,
-      .colorUpdate = g_gxState.colorUpdate,
+      // GX_CULL_ALL discards every triangle. wgpu cannot say that, so the draw
+      // is made to write nothing instead; see to_primitive_state.
+      .depthUpdate = cullMode == GX_CULL_ALL ? false : g_gxState.depthUpdate,
+      .alphaUpdate = cullMode == GX_CULL_ALL ? false : g_gxState.alphaUpdate,
+      .colorUpdate = cullMode == GX_CULL_ALL ? false : g_gxState.colorUpdate,
   };
 }
 

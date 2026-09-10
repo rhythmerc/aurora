@@ -104,6 +104,19 @@ void begin_display_list(uint8_t* buf, uint32_t size);
 uint32_t end_display_list();
 bool in_display_list();
 
+// smstrikers-port: display list provenance. GXCallDisplayList splices a list's
+// bytes into the FIFO stream and nothing afterwards remembers that it did, so an
+// abort names an offset into a 64KB buffer and not the list the byte came from.
+struct DisplayListSplice {
+  uint64_t streamPos; // absolute stream offset of the list's first byte
+  uint32_t size;      // nbytes as passed to GXCallDisplayList
+  const void* src;    // the caller's buffer, before the copy into the FIFO
+};
+void note_display_list(const void* src, uint32_t size) noexcept;
+// Returns the splice containing an absolute stream position, or null when the
+// position is in immediate-mode stream rather than in a called list.
+const DisplayListSplice* find_display_list(uint64_t streamPos) noexcept;
+
 // Ensure all buffered commands have been processed.
 void drain();
 

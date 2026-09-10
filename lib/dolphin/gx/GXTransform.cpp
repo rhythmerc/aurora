@@ -54,7 +54,9 @@ void GXSetProjectionv(const f32* ptr) {
 }
 
 void GXLoadPosMtxImm(const void* mtx_, u32 id) {
-  CHECK(id >= GX_PNMTX0 && id <= GX_PNMTX9, "invalid pn mtx {}", static_cast<int>(id));
+  // smstrikers-port: skinning may address any row of matrix memory, not just the
+  // ten named pairs. See MaxPnMtx in gx.hpp.
+  CHECK(id <= (aurora::gx::MaxPnMtx - 1) * 3, "invalid pn mtx {}", static_cast<int>(id));
   const auto* mtx = reinterpret_cast<const f32*>(mtx_);
 
   GX_WRITE_U8(0x10);
@@ -73,7 +75,8 @@ void GXLoadPosMtxIndx(u16 mtxIndx, u32 id) {
 }
 
 void GXLoadNrmMtxImm(const void* mtx_, u32 id) {
-  CHECK(id >= GX_PNMTX0 && id <= GX_PNMTX9, "invalid pn mtx {}", static_cast<int>(id));
+  // smstrikers-port: see GXLoadPosMtxImm above.
+  CHECK(id <= (aurora::gx::MaxPnMtx - 1) * 3, "invalid pn mtx {}", static_cast<int>(id));
   const auto* mtx = reinterpret_cast<const f32*>(mtx_);
 
   GX_WRITE_U8(0x10);

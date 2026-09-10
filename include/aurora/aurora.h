@@ -91,6 +91,8 @@ typedef struct {
   uint16_t maxTextureAnisotropy;
   bool vsync;
   bool startFullscreen;
+  /* smstrikers-port: open maximised; windowWidth/windowHeight is the size it restores to. */
+  bool startMaximized;
   bool allowJoystickBackgroundEvents;
   bool pauseOnFocusLost;
   bool allowTextureDumps;
@@ -154,6 +156,18 @@ typedef struct {
 
 AuroraInfo aurora_initialize(int argc, char* argv[], const AuroraConfig* config);
 void aurora_shutdown();
+/* smstrikers-port: write the next presented frame to `path` as a binary PPM. */
+void aurora_capture_frame(const char* path);
+/* smstrikers-port: queue submit to OnSubmittedWorkDone, which is not GPU
+ * execution time on Metal: the MSAA sample count does not move it. */
+void aurora_gpu_frame_time(uint64_t* lastNs, uint64_t* meanNs, uint64_t* maxNs, uint64_t* count);
+/* smstrikers-port: size the GX framebuffer from the VI render mode times
+ * `scale` rather than from the window. 0 restores the default. */
+void aurora_set_frame_buffer_scale(float scale);
+/* smstrikers-port: the window as it is right now, polled, because macOS reports a move between displays of different backing scale through a scale change, a resize, both or neither. */
+AuroraWindowSize aurora_window_size();
+/* smstrikers-port: rebuild the framebuffer from the window and the locked aspect now rather than on the next event pump. Safe between frames only; idempotent. */
+void aurora_apply_frame_buffer_resize();
 const AuroraEvent* aurora_update();
 bool aurora_begin_frame();
 void aurora_end_frame();

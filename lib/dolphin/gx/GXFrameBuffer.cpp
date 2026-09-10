@@ -192,25 +192,31 @@ GXRenderModeObj GXMpal480IntDf = {
 };
 
 void GXAdjustForOverscan(GXRenderModeObj* rmin, GXRenderModeObj* rmout, u16 hor, u16 ver) {
-  const GXRenderModeObj in = *rmin;
-  const u16 hor2 = hor * 2;
-  const u16 ver2 = ver * 2;
-  const u32 efbHeight = in.efbHeight;
-
-  *rmout = in;
-  rmout->fbWidth = in.fbWidth - hor2;
-  rmout->efbHeight = efbHeight - (ver2 * efbHeight) / in.xfbHeight;
-
-  if (in.xFBmode == VI_XFBMODE_SF && (in.viTVmode & 2) != 2) {
-    rmout->xfbHeight = in.xfbHeight - ver;
-  } else {
-    rmout->xfbHeight = in.xfbHeight - ver2;
+  *rmout = *rmin;
+  // smstrikers-port: the window is the wrong EFB size once the render target is
+  // pinned to the VI mode, because this answer feeds VIConfigure and becomes the
+  // logical framebuffer. Do the SDK's own arithmetic in that case.
+  if (aurora::window::get_frame_buffer_scale() > 0.f) {
+    const u16 hor2 = static_cast<u16>(hor * 2);
+    const u16 ver2 = static_cast<u16>(ver * 2);
+    const u32 mode = rmin->viTVmode & 3;
+    rmout->fbWidth = static_cast<u16>(rmin->fbWidth - hor2);
+    if (rmin->xfbHeight != 0) {
+      const u32 verf = (static_cast<u32>(ver2) * rmin->efbHeight) / rmin->xfbHeight;
+      rmout->efbHeight = static_cast<u16>(rmin->efbHeight - verf);
+    }
+    rmout->xfbHeight = static_cast<u16>(rmin->xfbHeight -
+                                        ((rmin->xFBmode == VI_XFBMODE_SF && mode == 0) ? ver2 / 2 : ver2));
+    rmout->viWidth = static_cast<u16>(rmin->viWidth - hor2);
+    rmout->viHeight = static_cast<u16>(rmin->viHeight - (mode == 1 ? ver2 * 2 : ver2));
+    rmout->viXOrigin = static_cast<u16>(rmin->viXOrigin + hor);
+    rmout->viYOrigin = static_cast<u16>(rmin->viYOrigin + ver);
+    return;
   }
-
-  rmout->viWidth = in.viWidth - hor2;
-  rmout->viHeight = in.viHeight - ver2;
-  rmout->viXOrigin = in.viXOrigin + hor;
-  rmout->viYOrigin = in.viYOrigin + ver;
+  const auto size = aurora::window::get_window_size();
+  rmout->fbWidth = size.fb_width;
+  rmout->efbHeight = size.fb_height;
+  rmout->xfbHeight = size.fb_height;
 }
 
 void GXSetDispCopySrc(u16 left, u16 top, u16 wd, u16 ht) {}

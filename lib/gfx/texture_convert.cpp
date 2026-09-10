@@ -1,5 +1,7 @@
 #include "texture_convert.hpp"
 
+#include <atomic>
+
 #include "../internal.hpp"
 #include "../gx/gx_fmt.hpp"
 
@@ -30,9 +32,7 @@ size_t calc_offset_rgba8(uint32_t x, uint32_t y, uint32_t width) {
   return (static_cast<size_t>(y) * static_cast<size_t>(width) + static_cast<size_t>(x)) * sizeof(RGBA8);
 }
 
-/**
- * Downscales RGBA8 data using a simple box filter.
- */
+/* Downscales RGBA8 data using a simple box filter. */
 ByteBuffer downscale(const uint8_t* src, uint32_t srcWidth, uint32_t srcHeight, uint32_t dstWidth, uint32_t dstHeight) {
   ByteBuffer dst{calc_size_rgba8(dstWidth, dstHeight)};
   auto* dstPixels = dst.data();
@@ -72,11 +72,7 @@ float avg_diff(const uint8_t* lhs, const uint8_t* rhs, uint32_t width, uint32_t 
   return static_cast<float>(std::sqrt(diffSum / sampleCount) / 2.56);
 }
 
-/**
- * Attempts to detect whether the mipmaps of a texture are manually-authored, which is sometimes used for mipmap-based
- * distance effects. This is achieved by downscaling the mipmaps using a box filter and comparing the average pixel
- * difference between the original and downscaled mipmaps.
- */
+/* Attempts to detect whether the mipmaps of a texture are manually-authored, which is sometimes used for mipmap-based distance effects. */
 bool arb_mip_check(uint32_t width, uint32_t height, uint32_t mips, ArrayRef<uint8_t> data) {
   if (mips < 2) {
     return false;
@@ -572,6 +568,34 @@ static ByteBuffer BuildRGBA8FromBC1(uint32_t width, uint32_t height, uint32_t mi
   return buf;
 }
 
+// PORT-PROBE: what the console's textures cost after conversion.
+namespace {
+struct TexTally {
+  std::atomic<uint64_t> count{0};
+  std::atomic<uint64_t> srcBytes{0};
+  std::atomic<uint64_t> dstBytes{0};
+};
+TexTally g_texTally[64];
+
+// smstrikers-port: read the texture tally from outside Aurora. src/platform/overlay.cpp draws it; see aurora_gfx_pool_stats for the reason these accessors exist at all.
+void tex_tally_totals(uint64_t* src, uint64_t* dst, uint64_t* count) {
+  uint64_t s = 0, d = 0, n = 0;
+  for (u32 f = 0; f < 64; ++f) {
+    n += g_texTally[f].count.load(std::memory_order_relaxed);
+    s += g_texTally[f].srcBytes.load(std::memory_order_relaxed);
+    d += g_texTally[f].dstBytes.load(std::memory_order_relaxed);
+  }
+  if (src != nullptr) *src = s;
+  if (dst != nullptr) *dst = d;
+  if (count != nullptr) *count = n;
+}
+} // namespace
+
+extern "C" void aurora_gfx_texture_stats(uint64_t* srcBytes, uint64_t* uploadedBytes,
+                                         uint64_t* count) {
+  tex_tally_totals(srcBytes, uploadedBytes, count);
+}
+
 ConvertedTexture convert_texture(u32 format, uint32_t width, uint32_t height, uint32_t mips, ArrayRef<uint8_t> data) {
   ZoneScoped;
   ByteBuffer converted;
@@ -655,6 +679,12 @@ ConvertedTexture convert_texture(u32 format, uint32_t width, uint32_t height, ui
   bool hasArbitraryMips = false;
   if (!is_pc_texture_format(format) && wgpuFormat == wgpu::TextureFormat::RGBA8Unorm && mips > 1) {
     hasArbitraryMips = arb_mip_check(width, height, mips, converted);
+  }
+  // Tallied unconditionally, for the same reason as the pool peaks: the debug overlay reads this every frame.
+  if (format < 64) {
+    g_texTally[format].count.fetch_add(1);
+    g_texTally[format].srcBytes.fetch_add(data.size());
+    g_texTally[format].dstBytes.fetch_add(converted.size());
   }
   return {
       .format = wgpuFormat,

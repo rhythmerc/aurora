@@ -64,7 +64,11 @@ constexpr u32 MaxTevSwap = GX_MAX_TEVSWAP;
 constexpr u32 MaxIndStages = GX_MAX_INDTEXSTAGE;
 constexpr u32 MaxIndTexMtxs = 3;
 constexpr u32 MaxVtxFmt = GX_MAX_VTXFMT;
-constexpr u32 MaxPnMtx = (GX_PNMTX9 / 3) + 1;
+// smstrikers-port: 13, not the 10 GX_PNMTX0..9 names. Matrix memory is one
+// 64-row block and PNMTXIDX may point anywhere in it, so this game parks bone
+// matrices as high as row 36; its texture matrices sit at 54 and 57, well clear.
+// This moves texMtxs[0] to uniform slot MaxPnMtx, which texgen must follow.
+constexpr u32 MaxPnMtx = 13;
 constexpr u32 MaxIndexAttr = 12; // VA_POS -> VA_TEX7
 constexpr u32 MaxUniformSize = 3840;
 constexpr u32 XfRegCount = 0x58; // 0x1000-0x1057

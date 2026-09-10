@@ -9,6 +9,7 @@
 #include "../gfx/pipeline_cache.hpp"
 #include "../gfx/recording.hpp"
 #include "../internal.hpp"
+#include "fifo.hpp" // smstrikers-port: display list provenance
 #include "dolphin/gd/GDGeometry.h"
 #include "dolphin/gx/GXAurora.h"
 #include "gx.hpp"
@@ -21,10 +22,12 @@
 #include <xxhash.h>
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstdint>
 #include <span>
 #include <unordered_map>
+#include <string>
 #include <vector>
 
 namespace aurora::gx::fifo {
@@ -213,6 +216,55 @@ gfx::Range push_fog_range_lut(const FogRangeLutKey& key) {
   return gfx::push_storage(reinterpret_cast<const u8*>(lut.data()), lut.size() * sizeof(f32));
 }
 
+// smstrikers-port: state for report_prim_desync. By the time prepare_idx_buffer
+// aborts, nothing on the stack remembers which byte was rejected. Touched only
+// from the FIFO processor, under the buffer mutex.
+struct CmdTrace {
+  size_t offset;
+  u8 cmd;
+};
+constexpr size_t kCmdTraceLen = 12;
+std::array<CmdTrace, kCmdTraceLen> sCmdTrace{};
+size_t sCmdTraceCount = 0;
+
+struct LastDrawTrace {
+  size_t cmdOffset;
+  size_t payloadStart;
+  u32 vtxCount;
+  u32 vtxSize;
+  u8 prim;
+  u8 fmt;
+  bool valid;
+};
+LastDrawTrace sLastDraw{};
+
+// The opcodes prepare_idx_buffer can build indices for. 0x88 (GX_QUADS2) is a
+// real GX opcode that is not among them, so this is not "is a draw command".
+bool is_supported_prim(const u8 opcode) noexcept {
+  switch (opcode) {
+  case GX_DRAW_QUADS:
+  case GX_DRAW_TRIANGLES:
+  case GX_DRAW_TRIANGLE_STRIP:
+  case GX_DRAW_TRIANGLE_FAN:
+  case GX_DRAW_LINES:
+  case GX_DRAW_LINE_STRIP:
+  case GX_DRAW_POINTS:
+    return true;
+  default:
+    return false;
+  }
+}
+
+std::string hex_window(const u8* data, size_t size, size_t centre, size_t before, size_t after) {
+  const size_t start = centre > before ? centre - before : 0;
+  const size_t end = std::min(size, centre + after);
+  std::string hex;
+  for (size_t i = start; i < end; ++i) {
+    hex += i == centre ? fmt::format("[{:02x}]", data[i]) : fmt::format(" {:02x}", data[i]);
+  }
+  return fmt::format("({}-{}){}", start, end == 0 ? 0 : end - 1, hex);
+}
+
 u8 line_mode_for_prim(GXPrimitive prim) noexcept {
   switch (prim) {
   case GX_LINES:
@@ -232,14 +284,22 @@ static uint32_t sLinkTag = 0; // AURORA_XR_LINK_STATS: the game's GX link + 1 ("
 
 static void handle_draw(u8 cmd, ByteReader& reader) noexcept;
 static void handle_aurora(ByteReader& reader) noexcept;
+// smstrikers-port: see report_prim_desync.
+[[noreturn]] static void report_prim_desync(u8 cmd, const ByteReader& reader, uint64_t streamPos) noexcept;
 
-ProcessResult process(const u8* data, u32 size) noexcept {
+ProcessResult process(const u8* data, u32 size, uint64_t streamPos) noexcept {
   ZoneScoped;
   ByteReader reader{{data, size}};
 
+  // smstrikers-port: offsets are chunk-relative, so the trace is too.
+  sCmdTraceCount = 0;
+  sLastDraw = {};
+
   while (!reader.empty()) {
+    const size_t cmdOffset = reader.offset();
     const u8 cmd = reader.read<u8>();
     u8 opcode = cmd & CP_OPCODE_MASK;
+    sCmdTrace[sCmdTraceCount++ % kCmdTraceLen] = {cmdOffset, cmd}; // smstrikers-port
 
     switch (opcode) {
     case CP_CMD_NOP:
@@ -331,6 +391,11 @@ ProcessResult process(const u8* data, u32 size) noexcept {
     default:
       // Check if it's a draw command (0x80-0xBF range)
       if (cmd >= 0x80) {
+        // smstrikers-port: prepare_idx_buffer aborts on an opcode it cannot
+        // build indices for, with the Reader already past the evidence. Reject
+        // it here, where the byte's offset is still in hand.
+        if (!is_supported_prim(opcode))
+          UNLIKELY { report_prim_desync(cmd, reader, streamPos); }
         handle_draw(cmd, reader);
       } else {
         // Hex dump surrounding bytes for debugging
@@ -1373,6 +1438,133 @@ static gfx::PipelineRef xr_solid_pipeline() noexcept {
 }
 #endif
 
+// smstrikers-port: where the rejected byte sits inside the display list it came
+// from. Mid-payload means the reader desynced, and the offset over the vertex
+// count is the stride the data really had. Diagnostic only, on an aborting path.
+[[noreturn]] static void report_prim_desync(const u8 cmd, const ByteReader& reader, const uint64_t streamPos) noexcept {
+  const u8* data = reader.data();
+  const size_t size = reader.size();
+  const size_t pos = reader.offset() - 1; // the rejected byte itself
+  const uint64_t absPos = streamPos + pos;
+
+  Log.error("[prim248] rejected opcode 0x{:02X} (primitive {}, vat {}) at chunk offset {} of {}, stream position {}",
+            cmd, static_cast<u32>(cmd & CP_OPCODE_MASK), static_cast<u32>(cmd & CP_VAT_MASK), pos, size, absPos);
+
+  // Where the byte came from.
+  const auto* splice = find_display_list(absPos);
+  size_t listOffset = 0;
+  const u8* listData = nullptr;
+  u32 listCount = 0;
+  if (splice == nullptr) {
+    Log.error("[prim248] not inside any called display list: this is the immediate-mode stream");
+  } else {
+    listOffset = static_cast<size_t>(absPos - splice->streamPos);
+    Log.error("[prim248] display list src={} size={} -> offset {} within it, {} bytes before its end", fmt::ptr(splice->src),
+              splice->size, listOffset, splice->size - listOffset);
+    // Prefer the copy in the FIFO: it is the bytes actually being read. Fall
+    // back to the caller's buffer when the list began in an earlier chunk.
+    if (splice->streamPos >= streamPos && splice->streamPos - streamPos + 3 <= size) {
+      listData = data + (splice->streamPos - streamPos);
+    } else {
+      listData = static_cast<const u8*>(splice->src);
+    }
+  }
+
+  // The list's own header, which is what dlMakeDisplayList committed to.
+  if (listData != nullptr) {
+    const u8 hdr = listData[0];
+    listCount = static_cast<u32>(listData[1]) << 8 | listData[2];
+    Log.error("[prim248] list header: opcode 0x{:02X} (primitive {}, vat {}), {} vertices", hdr,
+              static_cast<u32>(hdr & CP_OPCODE_MASK), static_cast<u32>(hdr & CP_VAT_MASK), listCount);
+    if (listCount != 0 && listOffset > 3) {
+      const size_t payload = listOffset - 3;
+      Log.error("[prim248] payload consumed {} bytes over {} vertices -> implied stride {}, remainder {}", payload,
+                listCount, payload / listCount, payload % listCount);
+      Log.error("[prim248] list size {} implies a written stride of about {} (padded to 32)", splice->size,
+                (splice->size - 3) / listCount);
+    }
+  }
+
+  // What the reader believed the vertices looked like.
+  if (sLastDraw.valid) {
+    Log.error("[prim248] last draw: primitive {} vat {}, {} vertices x {} bytes = {}, payload at chunk offset {}..{}",
+              static_cast<u32>(sLastDraw.prim), static_cast<u32>(sLastDraw.fmt), sLastDraw.vtxCount, sLastDraw.vtxSize,
+              sLastDraw.vtxCount * sLastDraw.vtxSize, sLastDraw.payloadStart,
+              sLastDraw.payloadStart + sLastDraw.vtxCount * sLastDraw.vtxSize);
+  } else {
+    Log.error("[prim248] no draw has been read in this chunk");
+  }
+  {
+    std::string desc;
+    u32 stride = 0;
+    const auto& vtxFmt = g_gxState.vtxFmts[sLastDraw.valid ? static_cast<GXVtxFmt>(sLastDraw.fmt) : g_gxState.lastVtxFmt];
+    for (int i = GX_VA_PNMTXIDX; i <= GX_VA_TEX7; ++i) {
+      const auto attr = static_cast<GXAttr>(i);
+      u32 sz = 0;
+      const char* mode = nullptr;
+      switch (g_gxState.vtxDesc[i]) {
+      case GX_NONE:
+        continue;
+      case GX_DIRECT:
+        mode = "direct";
+        sz = comp_type_size(attr, vtxFmt.attrs[i].type) * comp_cnt_count(attr, vtxFmt.attrs[i].cnt);
+        break;
+      case GX_INDEX8:
+        mode = "idx8";
+        sz = i == GX_VA_NRM && vtxFmt.attrs[i].cnt == GX_NRM_NBT3 ? 3 : 1;
+        break;
+      case GX_INDEX16:
+        mode = "idx16";
+        sz = i == GX_VA_NRM && vtxFmt.attrs[i].cnt == GX_NRM_NBT3 ? 6 : 2;
+        break;
+      default:
+        mode = "?";
+        break;
+      }
+      desc += fmt::format(" attr{}={}({})", i, mode, sz);
+      stride += sz;
+    }
+    Log.error("[prim248] descriptor stride {}:{}", stride, desc);
+    Log.error("[prim248] PNMTXIDX is {}; a list built for the other answer desyncs one byte per vertex",
+              g_gxState.vtxDesc[GX_VA_PNMTXIDX] == GX_DIRECT ? "direct (stitched)" : "absent (unstitched)");
+  }
+
+  // The commands immediately before it, oldest first.
+  {
+    const size_t seen = std::min(sCmdTraceCount, kCmdTraceLen);
+    std::string trace;
+    for (size_t i = seen; i-- > 1;) {
+      const auto& entry = sCmdTrace[(sCmdTraceCount - 1 - i) % kCmdTraceLen];
+      trace += splice != nullptr
+                   ? fmt::format(" 0x{:02X}@{}(list+{})", entry.cmd, entry.offset,
+                                 static_cast<int64_t>(streamPos + entry.offset) - static_cast<int64_t>(splice->streamPos))
+                   : fmt::format(" 0x{:02X}@{}", entry.cmd, entry.offset);
+    }
+    Log.error("[prim248] preceding commands (oldest first):{}", trace);
+  }
+
+  Log.error("[prim248] hex around the rejected byte {}", hex_window(data, size, pos, 32, 32));
+  if (listData != nullptr && listData >= data && listData < data + size) {
+    Log.error("[prim248] hex at the list header {}", hex_window(data, size, static_cast<size_t>(listData - data), 0, 32));
+  }
+
+  // Last, because it dereferences a pointer the game owns and may have freed.
+  // Both model loaders patch indices into their lists in place, so a difference
+  // here is late mutation rather than corruption.
+  if (splice != nullptr && splice->src != nullptr && listData != nullptr && listData != splice->src) {
+    const auto* src = static_cast<const u8*>(splice->src);
+    u32 differing = 0;
+    for (u32 i = 0; i < splice->size; ++i) {
+      if (src[i] != listData[i]) {
+        ++differing;
+      }
+    }
+    Log.error("[prim248] {} of {} bytes differ between the FIFO copy and the caller's list", differing, splice->size);
+  }
+
+  FATAL("unsupported primitive type {}", static_cast<u32>(cmd & CP_OPCODE_MASK));
+}
+
 static void push_gx_draw(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, gfx::Range vertRange, gfx::Range idxRange,
                          u32 numIndices, const u8* raw) noexcept {
   auto& state = g_gxState;
@@ -1759,6 +1951,64 @@ static void handle_draw_unmerged(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, g
   push_gx_draw(prim, fmt, vtxCount, vertRange, idxRange, numIndices, raw);
 }
 
+
+// smstrikers-port: report indexed reads that fall outside their array. Console
+// GXSetArray takes no length, so an index past what Aurora copied to the GPU
+// reads the rest of the storage buffer and only the positions are wrong.
+// AURORA_DIAG_IDX=1 names the first two dozen.
+static void diag_check_indices(const uint8_t* verts, u32 vtxCount, GXVtxFmt fmt, u32 vtxSize) noexcept {
+  static const bool enabled = getenv("AURORA_DIAG_IDX") != nullptr;
+  static int reported = 0;
+  if (!enabled || vtxCount == 0 || verts == nullptr || reported >= 24) {
+    return;
+  }
+  const auto& vtxFmt = g_gxState.vtxFmts[fmt];
+  u32 off = 0;
+  for (int i = GX_VA_PNMTXIDX; i <= GX_VA_TEX7; ++i) {
+    const auto attr = static_cast<GXAttr>(i);
+    const auto& attrFmt = vtxFmt.attrs[i];
+    const auto type = g_gxState.vtxDesc[i];
+    u32 sz = 0;
+    bool idx8 = false;
+    bool idx16 = false;
+    switch (type) {
+    case GX_NONE:
+      continue;
+    case GX_DIRECT:
+      sz = comp_type_size(attr, attrFmt.type) * comp_cnt_count(attr, attrFmt.cnt);
+      break;
+    case GX_INDEX8:
+      sz = (i == GX_VA_NRM && attrFmt.cnt == GX_NRM_NBT3) ? 3 : 1;
+      idx8 = true;
+      break;
+    case GX_INDEX16:
+      sz = (i == GX_VA_NRM && attrFmt.cnt == GX_NRM_NBT3) ? 6 : 2;
+      idx16 = true;
+      break;
+    default:
+      return;
+    }
+    if ((idx8 || idx16) && i >= GX_VA_POS) {
+      const auto& array = g_gxState.arrays[i];
+      u32 maxIdx = 0;
+      for (u32 v = 0; v < vtxCount; ++v) {
+        const uint8_t* p = verts + static_cast<size_t>(v) * vtxSize + off;
+        const u32 val = idx16 ? (static_cast<u32>(p[0]) << 8 | p[1]) : p[0];
+        if (val > maxIdx) {
+          maxIdx = val;
+        }
+      }
+      const u32 capacity = array.stride != 0 ? array.size / array.stride : 0;
+      if (maxIdx >= capacity) {
+        ++reported;
+        Log.error("[idxdiag] attr {} maxIdx {} >= capacity {} (array size {} stride {}, {} vertices)", i, maxIdx,
+                  capacity, array.size, array.stride, vtxCount);
+      }
+    }
+    off += sz;
+  }
+}
+
 static void draw_prim(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, ByteReader& reader) noexcept {
   ZoneScoped;
   u32 vtxSize;
@@ -1768,6 +2018,14 @@ static void draw_prim(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, ByteReader& 
     UNLIKELY { vtxSize = calc_vtx_size(fmt); }
 
   u32 totalVtxBytes = vtxCount * vtxSize;
+  // smstrikers-port: see report_prim_desync.
+  sLastDraw = {.cmdOffset = reader.offset() >= 3 ? reader.offset() - 3 : 0,
+               .payloadStart = reader.offset(),
+               .vtxCount = vtxCount,
+               .vtxSize = vtxSize,
+               .prim = static_cast<u8>(prim),
+               .fmt = static_cast<u8>(fmt),
+               .valid = true};
   if (totalVtxBytes > reader.remaining())
     UNLIKELY { handle_draw_overrun(totalVtxBytes, reader); }
 
@@ -1833,6 +2091,7 @@ static void draw_prim(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, ByteReader& 
       }
     }
   }
+  diag_check_indices(vertexData.data(), vtxCount, fmt, vtxSize);   // smstrikers-port
   gfx::Range vertRange = gfx::push_verts(vertexData.data(), vertexData.size(), canMerge ? 0 : 4);
 
   // Try to merge with previous draw call
@@ -2096,6 +2355,7 @@ void handle_aurora(ByteReader& reader) noexcept {
     }
     const u32 totalVtxBytes = vtxCount * vtxSize;
     const auto vertexData = reader.take(totalVtxBytes);
+    diag_check_indices(vertexData.data(), vtxCount, fmt, vtxSize);   // smstrikers-port
     const gfx::Range vertRange = gfx::push_verts(vertexData.data(), vertexData.size(), 4);
     if (indexCount != 0) {
       push_gx_draw(prim, fmt, vtxCount, vertRange, idxRange, indexCount, vertexData.data());

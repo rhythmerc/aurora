@@ -16,7 +16,9 @@ extern "C" {
 GXFifoObj* GXInit(void* base, u32 size) {
   GXRenderModeObj* rmode;
   f32 identity_mtx[3][4];
-  GXColor clear = {64, 64, 64, 255};
+  // smstrikers-port: black, not Aurora's grey. Any region no scissor ever covers
+  // keeps this for the rest of the run.
+  GXColor clear = {0, 0, 0, 255};
   GXColor black = {0, 0, 0, 0};
   GXColor white = {255, 255, 255, 255};
   u32 i;

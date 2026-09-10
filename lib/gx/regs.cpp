@@ -1022,12 +1022,21 @@ bool copy_xf_data(u32 addr, const u8* data, u32 len, std::endian e) noexcept {
     for (u32 i = 0; i < len; i++) {
       changed |= store_xf_f32(flat[i], read_bits<u32>(data + i * 4, e));
     }
+    // smstrikers-port: rows 30+ are texture matrix memory and addressable as
+    // position matrices, so mirror the write. See MaxPnMtx.
+    const u32 pnIdx = addr / 12;
+    if (len == 12 && pnIdx < MaxPnMtx) {
+      f32* pnFlat = reinterpret_cast<f32*>(&g_gxState.pnMtx[pnIdx].pos);
+      for (u32 i = 0; i < len; i++) {
+        changed |= store_xf_f32(pnFlat[i], read_bits<u32>(data + i * 4, e));
+      }
+    }
     if (changed) {
       g_gxState.dirty |= DirtyUniform;
     }
     return true;
   }
-  if (addr >= 0x400 && addr < 0x45A) {
+  if (addr >= 0x400 && addr < 0x400 + MaxPnMtx * 9) {
     // Normal matrices (0x400-0x459)
     u32 nrmBase = addr - 0x400;
     u32 mtxIdx = nrmBase / 9;

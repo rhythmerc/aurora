@@ -196,6 +196,22 @@ void emit_frame(Slot& slot) {
     frameEnd = ts[FrameEndQuery];
   }
   if (frameBegin == 0 || frameEnd <= frameBegin) {
+    // smstrikers-port: say why, once. This return drops the frame silently, so
+    // enabled-and-emitting-nothing reads the same as switched off.
+    static bool s_said = false;
+    if (!s_said) {
+      s_said = true;
+      size_t nonZero = 0;
+      for (size_t i = 0; i < QueryCount; ++i) {
+        if (ts[i] != 0) {
+          ++nonZero;
+        }
+      }
+      Log.warn("no GPU frame emitted: {} events, {}/{} timestamps non-zero, "
+               "frameBegin={} frameEnd={} (ts[0]={} ts[1]={} frameBeginQuery={})",
+               slot.events.size(), nonZero, size_t{QueryCount}, frameBegin, frameEnd,
+               ts[0], ts[1], ts[FrameBeginQuery]);
+    }
     return;
   }
 

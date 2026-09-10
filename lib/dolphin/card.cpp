@@ -1,5 +1,6 @@
 #include "dolphin/card.h"
 
+#include <array>
 #include <cstring>
 #include <filesystem>
 
@@ -52,6 +53,50 @@ static void (*CallbackDispatch)(CARDCallback, s32, s32) = nullptr;
 extern "C" void aurora_card_set_callback_dispatch(void (*dispatch)(CARDCallback, s32, s32)) {
   CallbackDispatch = dispatch;
 }
+CARDFileType SelectedFileType = CARD_GCIFOLDER;
+bool UseFastMode = false;
+
+/* smstrikers-port: a completion callback must not run inside a card call that another completion made; the outermost call is the one draining, so it still runs its own completion before returning. */
+constexpr size_t MaxPendingCallbacks = 32;
+
+struct PendingCallback {
+  CARDCallback fn;
+  s32 chan;
+  s32 result;
+};
+
+std::array<PendingCallback, MaxPendingCallbacks> PendingCallbacks{};
+size_t PendingHead = 0;  /* monotonic; index with % MaxPendingCallbacks */
+size_t PendingTail = 0;
+bool RunningCallbacks = false;
+
+/* Queue `fn`, then, unless an outer call is already draining, run everything queued. */
+s32 FinishAsync(const CARDCallback fn, const s32 chan, const s32 result) {
+  if (fn != nullptr) {
+    if (PendingTail - PendingHead >= MaxPendingCallbacks) {
+      /* Unreachable with the game's own chains, which are three deep. */
+      Log.error("card completion queue full ({}); running one inline", MaxPendingCallbacks);
+      fn(chan, result);
+    } else {
+      PendingCallbacks[PendingTail % MaxPendingCallbacks] = {fn, chan, result};
+      ++PendingTail;
+    }
+  }
+
+  if (!RunningCallbacks) {
+    RunningCallbacks = true;
+    while (PendingHead != PendingTail) {
+      const PendingCallback next = PendingCallbacks[PendingHead % MaxPendingCallbacks];
+      ++PendingHead;
+      next.fn(next.chan, next.result);
+    }
+    RunningCallbacks = false;
+  }
+  return result;
+}
+
+/* Without a dispatcher, completions run through FinishAsync's queue: still
+ * before the CARD*Async call returns, but never nested inside another one. */
 static void complete(CARDCallback callback, s32 chan, s32 result) {
   if (callback == nullptr) {
     return;
@@ -59,11 +104,9 @@ static void complete(CARDCallback callback, s32 chan, s32 result) {
   if (CallbackDispatch != nullptr) {
     CallbackDispatch(callback, chan, result);
   } else {
-    callback(chan, result);
+    FinishAsync(callback, chan, result);
   }
 }
-CARDFileType SelectedFileType = CARD_GCIFOLDER;
-bool UseFastMode = false;
 
 void CopyKabuFileHandleToDolphin(const s32 chan, const aurora::card::FileHandle& handle, CARDFileInfo* fileInfo) {
   fileInfo->chan = chan;
@@ -679,7 +722,9 @@ s32 CARDMount(const s32 chan, void* workArea [[maybe_unused]], CARDCallback deta
 s32 CARDMountAsync(const s32 chan, void* workArea, const CARDCallback detachCallback,
                    const CARDCallback attachCallback) {
   const s32 res = CARDMount(chan, workArea, detachCallback);
-  if (res == CARD_RESULT_READY) {
+  // smstrikers-port: the attach callback hears about a missing card too; the
+  // game waits on it either way.
+  if (res == CARD_RESULT_READY || res == CARD_RESULT_NOCARD) {
     complete(attachCallback, chan, res);
   }
   return res;

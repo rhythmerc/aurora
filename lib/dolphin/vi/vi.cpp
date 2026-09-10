@@ -31,6 +31,13 @@ void configure(const GXRenderModeObj* rm) noexcept {
 Vec2<uint32_t> configured_fb_size() noexcept {
   return render_mode_size();
 }
+
+// smstrikers-port: VILockAspectRatio, which dolphin/vi.h declares and nothing
+// defined. A GameCube framebuffer's pixels are not square: 640x448 is a 1.4286
+// rectangle of pixels a television showed as 4:3, 7% wider than the shape wanted.
+float g_lockedAspect = 0.f;
+
+float locked_aspect() noexcept { return g_lockedAspect; }
 } // namespace aurora::vi
 
 extern "C" {
@@ -52,4 +59,17 @@ void VISetWindowSize(uint32_t width, uint32_t height) { aurora::window::set_wind
 void VISetWindowPosition(uint32_t x, uint32_t y) { aurora::window::set_window_position(x, y); }
 void VICenterWindow() { aurora::window::center_window(); }
 void VISetFrameBufferScale(float scale) { aurora::window::set_frame_buffer_scale(scale); }
+
+// smstrikers-port
+void VILockAspectRatio(int width, int height) {
+  const float aspect = (width > 0 && height > 0) ? static_cast<float>(width) / static_cast<float>(height) : 0.f;
+  if (aspect == aurora::vi::g_lockedAspect) {
+    return;
+  }
+  aurora::vi::g_lockedAspect = aspect;
+  aurora::window::request_frame_buffer_resize();
+}
+
+// smstrikers-port
+void VIUnlockAspectRatio() { VILockAspectRatio(0, 0); }
 }

@@ -58,6 +58,9 @@ void GXCallDisplayList(const void* data, u32 nbytes) {
   }
 
   // Write display list contents to the FIFO
+  // smstrikers-port: record where they land first, because once copied nothing
+  // downstream can tell this list's bytes from the surrounding stream.
+  aurora::gx::fifo::note_display_list(data, nbytes);
   aurora::gx::fifo::write_data(data, nbytes);
   aurora::gx::fifo::publish();
 }
