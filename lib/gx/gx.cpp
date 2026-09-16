@@ -875,6 +875,12 @@ void shutdown() noexcept {
   sBrowserPipelines.clear();
 #endif
   // TODO we should probably store this all in g_state.gx instead
+  // smstrikers-port: released while the device lives; by static destruction a Vulkan layer may be gone.
+  g_emptyTextureBindGroup = {};
+  sEmptyTextureView = {};
+  sEmptyTexture = {};
+  sEmptySampler = {};
+  sPipelineLayout = {};
   sSamplerBindGroupLayout = {};
   sTextureBindGroupLayout = {};
   {

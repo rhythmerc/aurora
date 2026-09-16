@@ -203,6 +203,8 @@ void new_frame(const AuroraWindowSize& size) noexcept {
   ImGui::NewFrame();
 }
 
+bool DrawData::empty() const noexcept { return !m_impl || m_impl->drawData.CmdListsCount == 0; }
+
 DrawData freeze() noexcept {
   ZoneScoped;
   ImGui::Render();

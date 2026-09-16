@@ -36,11 +36,13 @@ constexpr Module Log{"aurora::gx::fifo"};
 
 // Triangle indices for a draw, written straight into the buffer: appending
 // them one u16 at a time made each a capacity check and a memcpy call.
-u16 prepare_idx_buffer(ByteBuffer& buf, GXPrimitive prim, u16 vtxStart, u16 vtxCount) noexcept {
-  u16 numIndices = 0;
+// smstrikers-port: the count is u32, since a strip, fan or quad draw of a u16
+// vertex count can need more than 65,535 indices.
+u32 prepare_idx_buffer(ByteBuffer& buf, GXPrimitive prim, u16 vtxStart, u16 vtxCount) noexcept {
+  u32 numIndices = 0;
   if (prim == GX_QUADS) {
     // As before, a partial last quad still makes its two triangles.
-    numIndices = static_cast<u16>(((vtxCount + 3) / 4) * 6);
+    numIndices = ((u32(vtxCount) + 3) / 4) * 6;
     auto* out = reinterpret_cast<u16*>(buf.append_uninit(numIndices * sizeof(u16)));
     for (u16 v = 0; v < vtxCount; v += 4) {
       const u16 i0 = vtxStart + v;
@@ -58,7 +60,7 @@ u16 prepare_idx_buffer(ByteBuffer& buf, GXPrimitive prim, u16 vtxStart, u16 vtxC
       out[v] = vtxStart + v;
   } else if (prim == GX_TRIANGLEFAN || prim == GX_TRIANGLESTRIP) {
     const bool fan = prim == GX_TRIANGLEFAN;
-    numIndices = vtxCount < 3 ? vtxCount : static_cast<u16>((vtxCount - 3) * 3 + 3);
+    numIndices = vtxCount < 3 ? vtxCount : (u32(vtxCount) - 3) * 3 + 3;
     auto* out = reinterpret_cast<u16*>(buf.append_uninit(numIndices * sizeof(u16)));
     for (u16 v = 0; v < vtxCount; ++v) {
       const u16 idx = vtxStart + v;

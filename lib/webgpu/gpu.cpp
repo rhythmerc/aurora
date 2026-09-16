@@ -1,6 +1,7 @@
 #include "gpu.hpp"
 
 #include <algorithm>
+#include <cstdlib>
 #include <atomic>
 #include <array>
 #include <cmath>
@@ -719,6 +720,10 @@ const TextureWithSampler& resample_present_source(const wgpu::CommandEncoder& en
   const auto& source = present_source();
   const uint32_t width = viewport_extent(viewport.width);
   const uint32_t height = viewport_extent(viewport.height);
+  // smstrikers-port: at 1:1 the resample is an identity copy, so the blit reads the frame buffer directly.
+  if (source.size.width == width && source.size.height == height) {
+    return source;
+  }
   if (!g_resampledFrameBuffer.view || g_resampledFrameBuffer.size.width != width ||
       g_resampledFrameBuffer.size.height != height || g_resampledFrameBuffer.format != source.format) {
     g_resampledFrameBuffer = create_render_texture(width, height, false);
@@ -1057,11 +1062,16 @@ bool initialize(AuroraBackend auroraBackend, bool allowCpu) {
         }
         requiredFeatures.push_back(feature);
       }
-#ifdef TRACY_ENABLE
+      // smstrikers-port: also requested without Tracy when AURORA_GPU_PROF_LOG is set.
       if (feature == wgpu::FeatureName::TimestampQuery) {
-        requiredFeatures.push_back(feature);
-      }
+#ifndef TRACY_ENABLE
+        const char* prof = std::getenv("AURORA_GPU_PROF_LOG");
+        if (prof != nullptr && *prof != '\0')
 #endif
+        {
+          requiredFeatures.push_back(feature);
+        }
+      }
     }
 #ifdef AURORA_ENABLE_OPENXR
     xr::add_required_features(g_adapter, requiredFeatures);

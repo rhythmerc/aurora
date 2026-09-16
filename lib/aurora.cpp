@@ -12,6 +12,7 @@
 #include "gfx/frame.hpp"
 #include "gfx/recording.hpp"
 #include "gfx/render_worker.hpp"
+#include "gfx/texture.hpp"
 #include "gx/command_processor.hpp"
 #include "gx/fifo.hpp"
 #include "gx/gx.hpp"
@@ -461,7 +462,12 @@ void end_frame() noexcept {
   ZoneScoped;
 #ifdef AURORA_ENABLE_GX
   gfx::mark_game_frame_done();
+  // smstrikers-port: how long this thread waits for the FIFO worker, for AURORA_TEX_LOG.
+  const uint64_t drainStart = gfx::tex_log_enabled() ? gfx::tex_log_now_ns() : 0;
   gx::fifo::drain();
+  if (drainStart != 0) {
+    gx::texture::note_drain_wait(gfx::tex_log_now_ns() - drainStart);
+  }
   gx::fifo::end_frame();
   gx::texture::end_frame();
   gfx::finish();
@@ -588,7 +594,8 @@ void end_frame() noexcept {
         }
         pass.End();
       }
-      {
+      // smstrikers-port: an empty ImGui pass still opens a Load/Store render pass on the swapchain image.
+      if (!imguiDrawData.empty()) {
         const std::array attachments{
             wgpu::RenderPassColorAttachment{
                 .view = currentView,
