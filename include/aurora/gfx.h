@@ -29,6 +29,8 @@ typedef struct {
 } AuroraStats;
 
 const AuroraStats* aurora_get_stats();
+/* smstrikers-port: the pipeline counters from AuroraStats, read atomically; the struct's own fields race the compile threads. */
+void aurora_get_pipeline_counts(uint32_t* queued, uint32_t* created);
 float aurora_get_fps();
 
 void aurora_enable_vsync(bool enabled);

@@ -1108,4 +1108,15 @@ float calculate_fps() noexcept {
 } // namespace aurora::gfx
 
 const AuroraStats* aurora_get_stats() { return &aurora::gfx::detail::resources().stats; }
+void aurora_get_pipeline_counts(uint32_t* queued, uint32_t* created) {
+  uint32_t q = 0;
+  uint32_t c = 0;
+  aurora::gfx::get_pipeline_counts(q, c);
+  if (queued != nullptr) {
+    *queued = q;
+  }
+  if (created != nullptr) {
+    *created = c;
+  }
+}
 float aurora_get_fps() { return aurora::gfx::calculate_fps(); }

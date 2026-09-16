@@ -45,4 +45,6 @@ void precompile_stop();
 // leaves such frames out of its costs).
 uint32_t pipelines_created() noexcept;
 
+void get_pipeline_counts(uint32_t& queued, uint32_t& created);
+
 } // namespace aurora::gfx

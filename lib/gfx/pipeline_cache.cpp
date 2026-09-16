@@ -153,6 +153,10 @@ static unsigned pipeline_job_count() {
   if (const char* v = std::getenv("MELEE_PIPELINE_JOBS"); v != nullptr && *v != '\0') {
     return static_cast<unsigned>(std::clamp(std::strtoul(v, nullptr, 10), 1ul, 32ul));
   }
+  // smstrikers-port: AuroraConfig::pipelineJobs, when the game sets it.
+  if (g_config.pipelineJobs != 0) {
+    return std::clamp(g_config.pipelineJobs, 1u, 16u);
+  }
 #if defined(__ANDROID__)
   /* One, not half the cores: several workers flooded mobile drivers (Adreno
    * libllvm-qglc.so) with concurrent vkCreateGraphicsPipelines until they
@@ -430,6 +434,7 @@ struct AtomicStatRef {
     __atomic_store_n(&ref, val, __ATOMIC_RELAXED);
     return val;
   }
+  uint32_t load() const { return __atomic_load_n(&ref, __ATOMIC_RELAXED); }
 };
 static AtomicStatRef queuedPipelines{detail::resources().stats.queuedPipelines};
 static AtomicStatRef createdPipelines{detail::resources().stats.createdPipelines};
@@ -1416,6 +1421,12 @@ static size_t load_pipeline_cache_entries(ShaderType type, uint32_t configVersio
     if (config.version != configVersion) {
       continue;
     }
+    if constexpr (requires { config.msaaSamples; }) {
+      // smstrikers-port: a row for another sample count compiles a pipeline this run cannot use; it stays for one that can.
+      if (config.msaaSamples != webgpu::g_graphicsConfig.msaaSamples) {
+        continue;
+      }
+    }
 
     remember_pipeline_config(type, config, firstFrameUsed, false);
     if constexpr (DeviceBuiltRowsOnly) {
@@ -1867,6 +1878,11 @@ void end_pipeline_frame() {
   if (!g_hasPipelineThread) {
     pipeline_worker();
   }
+}
+
+void get_pipeline_counts(uint32_t& queued, uint32_t& created) {
+  queued = queuedPipelines.load();
+  created = createdPipelines.load();
 }
 
 bool get_pipeline(PipelineRef ref, wgpu::RenderPipeline& pipeline) {
