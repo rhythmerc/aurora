@@ -1364,3 +1364,14 @@ bool aurora_vsync_enabled(void) {
 #endif
   return aurora::webgpu::vsync_enabled();
 }
+
+bool aurora_present_waits_for_vblank() {
+#ifdef AURORA_ENABLE_OPENXR
+  // As aurora_vsync_enabled: nothing waits on the window's vblank while XR presents.
+  if (aurora::xr::active()) {
+    return false;
+  }
+#endif
+  const auto mode = aurora::webgpu::g_graphicsConfig.surfaceConfiguration.presentMode;
+  return mode == wgpu::PresentMode::Fifo || mode == wgpu::PresentMode::FifoRelaxed;
+}

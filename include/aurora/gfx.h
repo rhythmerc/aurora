@@ -49,6 +49,8 @@ uint32_t aurora_wait_pipelines(uint32_t max_wait_ms);
  * stopping it (the game is starting and needs the CPU). */
 uint32_t aurora_precompile_pending(void);
 void aurora_precompile_stop(void);
+/* smstrikers-port: whether the selected present mode waits for the vblank; vsync off still gets Fifo on a surface without Mailbox or Immediate. */
+bool aurora_present_waits_for_vblank();
 
 #ifdef __cplusplus
 }
