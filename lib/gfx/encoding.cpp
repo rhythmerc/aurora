@@ -517,7 +517,15 @@ constexpr uint64_t StorageStagingOffset = IndexStagingOffset + IndexBufferSize;
 constexpr uint64_t TextureUploadStagingOffset = StorageStagingOffset + StorageBufferSize;
 #endif
 
-constexpr uint32_t align_down_copy_offset(uint32_t value) noexcept { return value & ~3u; }
+// smstrikers-port: staging copies on 64 KiB boundaries (hasvk runs vkCmdCopyBuffer as a blorp blit; off-page copies corrupt vertex data and the extent search burns CPU).
+// Not on Android: no hasvk there, and the Quest's early eyes copy each pool several times a frame.
+#if defined(__ANDROID__)
+constexpr uint32_t StagingCopyAlign = 4;
+#else
+constexpr uint32_t StagingCopyAlign = 64 * 1024;
+#endif
+
+constexpr uint32_t align_down_copy_offset(uint32_t value) noexcept { return value & ~(StagingCopyAlign - 1); }
 
 // smstrikers-port: STRIKERS_LOG_GPUMEM prints each fixed pool's per-frame peak
 // against what resources.hpp reserved for it, which nothing else reports.
@@ -603,13 +611,14 @@ extern "C" void aurora_gfx_pool_stats(uint32_t* peakBytes, uint32_t* reservedByt
 
 #ifndef __EMSCRIPTEN__
 void copy_staging_buffer_range(wgpu::CommandEncoder& cmd, const FramePacket& frame, uint32_t& copied,
-                               uint32_t highWater, uint64_t stagingOffset, const wgpu::Buffer& dst,
+                               uint32_t highWater, uint64_t stagingOffset, uint64_t poolSize, const wgpu::Buffer& dst,
                                uint32_t split) {
   if (highWater <= copied) {
     return;
   }
   const uint32_t copyStart = align_down_copy_offset(copied);
-  const uint32_t copyEnd = AURORA_ALIGN(highWater, 4);
+  const uint32_t copyEnd =
+      static_cast<uint32_t>(std::min<uint64_t>(AURORA_ALIGN(uint64_t{highWater}, StagingCopyAlign), poolSize));
   if (frame.stagingBuffer2 != SIZE_MAX && copyEnd > split) {
     // XR early eyes: from `split` on (4-aligned), the second staging buffer.
     if (copyStart < split)
@@ -653,14 +662,14 @@ void copy_staging_to_high_water(wgpu::CommandEncoder& cmd, FramePacket& frame, c
   frame.copied.storage = highWater.storage;
 #else
   const auto& split = frame.stagingSplit;
-  copy_staging_buffer_range(cmd, frame, frame.copied.verts, highWater.verts, VertexStagingOffset, res.vertexBuffer,
-                            split.verts);
+  copy_staging_buffer_range(cmd, frame, frame.copied.verts, highWater.verts, VertexStagingOffset, VertexBufferSize,
+                            res.vertexBuffer, split.verts);
   copy_staging_buffer_range(cmd, frame, frame.copied.uniforms, highWater.uniforms, UniformStagingOffset,
-                            res.uniformBuffer, split.uniforms);
-  copy_staging_buffer_range(cmd, frame, frame.copied.indices, highWater.indices, IndexStagingOffset, res.indexBuffer,
-                            split.indices);
+                            UniformBufferSize, res.uniformBuffer, split.uniforms);
+  copy_staging_buffer_range(cmd, frame, frame.copied.indices, highWater.indices, IndexStagingOffset, IndexBufferSize,
+                            res.indexBuffer, split.indices);
   copy_staging_buffer_range(cmd, frame, frame.copied.storage, highWater.storage, StorageStagingOffset,
-                            res.storageBuffer, split.storage);
+                            StorageBufferSize, res.storageBuffer, split.storage);
 #endif
 
   if constexpr (UseTextureBuffer) {
