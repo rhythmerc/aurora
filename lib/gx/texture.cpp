@@ -393,6 +393,7 @@ struct Job {
 
 struct Parked {
   ByteBuffer data;
+  wgpu::TextureFormat format = wgpu::TextureFormat::Undefined;
   bool hasArbitraryMips = false;
   Clock::time_point parkedAt;
   std::list<TextureContentKey>::iterator lru;
@@ -400,6 +401,7 @@ struct Parked {
 
 struct Taken {
   ByteBuffer data;
+  wgpu::TextureFormat format = wgpu::TextureFormat::Undefined;
   bool hasArbitraryMips = false;
 };
 
@@ -529,6 +531,7 @@ void worker(std::stop_token) {
     st.parkedBytes += converted.data.size();
     st.parked.emplace(key, Parked{
                                .data = std::move(converted.data),
+                               .format = converted.format,
                                .hasArbitraryMips = converted.hasArbitraryMips,
                                .parkedAt = Clock::now(),
                                .lru = st.parkedLru.begin(),
@@ -546,7 +549,9 @@ std::optional<Taken> take(const TextureContentKey& key) noexcept {
   if (it == st.parked.end()) {
     return std::nullopt;
   }
-  Taken taken{.data = std::move(it->second.data), .hasArbitraryMips = it->second.hasArbitraryMips};
+  Taken taken{.data = std::move(it->second.data),
+              .format = it->second.format,
+              .hasArbitraryMips = it->second.hasArbitraryMips};
   st.parkedBytes -= taken.data.size();
   st.parkedLru.erase(it->second.lru);
   st.parked.erase(it);
@@ -1051,6 +1056,7 @@ gfx::TextureHandle resolve_static_texture(const GXTexObj_& obj) {
       const size_t sourceBytes = texture_source_size(obj.format(), obj.width(), obj.height(), obj.mip_count());
       if (auto preconverted = pre::enabled() ? pre::take(keys->contentKey) : std::nullopt) {
         handle = gfx::new_static_texture_2d_converted(obj.width(), obj.height(), obj.mip_count(), obj.format(),
+                                                      preconverted->format,
                                                       {preconverted->data.data(), preconverted->data.size()},
                                                       preconverted->hasArbitraryMips, nameStr);
       } else {

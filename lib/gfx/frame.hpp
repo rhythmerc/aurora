@@ -8,7 +8,12 @@
 
 namespace aurora::gfx::detail {
 
+#ifdef __SWITCH__
+// smstrikers-port: a third slot lets the game thread record while the GPU finishes two frames.
+inline constexpr size_t FrameSlotCount = 3;
+#else
 inline constexpr size_t FrameSlotCount = 2;
+#endif
 #ifdef __EMSCRIPTEN__
 // The browser renderer submits inline and yields between VI ticks. One mapped
 // staging set bounds GPU work in flight and avoids five 87 MiB allocations.

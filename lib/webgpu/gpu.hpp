@@ -61,6 +61,8 @@ extern std::string g_adapterName;
 extern std::string g_adapterDriver;
 extern bool g_hasCoreFeatures;
 extern bool g_bcTexturesSupported;
+// smstrikers-port: upload eligible CMPR textures as BC1 instead of RGBA8.
+extern bool g_cmprAsBc1;
 extern bool g_astcTexturesSupported;
 extern bool g_textureComponentSwizzleSupported;
 

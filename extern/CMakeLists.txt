@@ -196,6 +196,7 @@ if (AURORA_ENABLE_GX)
     message(STATUS "aurora: Using existing libpng")
   endif ()
 
+  if (NOT NX)
   aurora_find_package_global(Freetype QUIET)
   if (NOT TARGET Freetype::Freetype)
     find_package(PkgConfig)
@@ -222,6 +223,7 @@ if (AURORA_ENABLE_GX)
   else ()
     message(STATUS "aurora: Using existing Freetype")
   endif ()
+  endif ()
 
   if (NOT TARGET imgui)
     message(STATUS "aurora: Fetching imgui")
@@ -243,11 +245,15 @@ if (AURORA_ENABLE_GX)
     )
     target_include_directories(imgui PUBLIC ${imgui_SOURCE_DIR})
 
-    add_library(imgui_backends STATIC
-      ${imgui_SOURCE_DIR}/backends/imgui_impl_sdl3.cpp
-      ${imgui_SOURCE_DIR}/backends/imgui_impl_sdlrenderer3.cpp
-      ${imgui_SOURCE_DIR}/backends/imgui_impl_wgpu.cpp
-    )
+    set(AURORA_IMGUI_BACKEND_SOURCES ${imgui_SOURCE_DIR}/backends/imgui_impl_wgpu.cpp)
+    if (NOT NX)
+      # sdl3on2 lacks parts of the SDL3 API these backends call.
+      list(APPEND AURORA_IMGUI_BACKEND_SOURCES
+        ${imgui_SOURCE_DIR}/backends/imgui_impl_sdl3.cpp
+        ${imgui_SOURCE_DIR}/backends/imgui_impl_sdlrenderer3.cpp
+      )
+    endif ()
+    add_library(imgui_backends STATIC ${AURORA_IMGUI_BACKEND_SOURCES})
     target_compile_definitions(imgui_backends PRIVATE IMGUI_IMPL_WEBGPU_BACKEND_DAWN)
     if(EMSCRIPTEN)
       # Emdawnwebgpu uses modern Dawn headers, unlike the legacy Emscripten API.

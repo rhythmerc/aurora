@@ -93,8 +93,8 @@ TextureHandle new_static_texture_2d(uint32_t width, uint32_t height, uint32_t mi
 }
 
 TextureHandle new_static_texture_2d_converted(uint32_t width, uint32_t height, uint32_t mips, u32 gxFormat,
-                                              ArrayRef<uint8_t> converted, bool hasArbitraryMips,
-                                              const char* label) noexcept {
+                                              wgpu::TextureFormat wgpuFormat, ArrayRef<uint8_t> converted,
+                                              bool hasArbitraryMips, const char* label) noexcept {
   ++s_convertedAllocations;
   auto handle = gx::testing::make_texture_handle(width, height, gxFormat);
   handle->mipCount = mips;

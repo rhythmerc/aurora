@@ -909,6 +909,14 @@ u32 PADRead(PADStatus* status) {
           status[i].button |= PAD_TRIGGER_R;
         }
       }
+#if defined(__SWITCH__)
+      // smstrikers-port: L also presses GameCube L, as in the Switch 2 release, unless L is remapped.
+      if (std::ranges::none_of(controller->m_buttonMapping,
+                               [](const auto& m) { return m.nativeButton == SDL_GAMEPAD_BUTTON_LEFT_SHOULDER; }) &&
+          SDL_GetGamepadButton(controller->m_controller, SDL_GAMEPAD_BUTTON_LEFT_SHOULDER)) {
+        status[i].button |= PAD_TRIGGER_L;
+      }
+#endif
       tl /= 128;
       tr /= 128;
 

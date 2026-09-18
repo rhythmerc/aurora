@@ -117,6 +117,9 @@ uint64_t tex_log_now_ns() noexcept {
           .count());
 }
 
+static TextureHandle create_texture_2d(uint32_t width, uint32_t height, uint32_t mips, u32 gxFormat,
+                                       wgpu::TextureFormat wgpuFormat, const char* label) noexcept;
+
 // smstrikers-port: the upload half of new_static_texture_2d, shared with new_static_texture_2d_converted.
 static void queue_static_texture_upload(TextureRef& ref, uint32_t mips, ArrayRef<uint8_t> data, const char* label,
                                         bool timing, uint64_t t0) noexcept {
@@ -166,26 +169,17 @@ TextureHandle new_static_texture_2d(uint32_t width, uint32_t height, uint32_t mi
 
   const bool timing = tex_log_enabled();
   uint64_t t0 = timing ? tex_log_now_ns() : 0;
-  auto handle = new_dynamic_texture_2d(width, height, mips, format, label);
-  auto& ref = *handle;
-  if (timing) {
-    const uint64_t t = tex_log_now_ns();
-    g_texLoadTiming.createNs += t - t0;
-    t0 = t;
-  }
-
-  ConvertedTexture converted;
-  if (ref.gxFormat != InvalidTextureFormat) {
+  ConvertedTexture converted{};
+  if (format != InvalidTextureFormat) {
     if (tlut) {
-      CHECK(ref.size.height == 1, "new_static_texture_2d[{}]: expected tlut height 1, got {}", label, ref.size.height);
-      CHECK(ref.mipCount == 1, "new_static_texture_2d[{}]: expected tlut mipCount 1, got {}", label, ref.mipCount);
-      converted = convert_tlut(ref.gxFormat, ref.size.width, data);
+      CHECK(height == 1, "new_static_texture_2d[{}]: expected tlut height 1, got {}", label, height);
+      CHECK(mips == 1, "new_static_texture_2d[{}]: expected tlut mipCount 1, got {}", label, mips);
+      converted = convert_tlut(format, width, data);
     } else {
-      converted = convert_texture(ref.gxFormat, ref.size.width, ref.size.height, ref.mipCount, data);
+      converted = convert_texture(format, width, height, mips, data);
     }
     if (!converted.data.empty()) {
       data = converted.data;
-      ref.hasArbitraryMips = converted.hasArbitraryMips;
     }
   }
   if (timing) {
@@ -194,17 +188,27 @@ TextureHandle new_static_texture_2d(uint32_t width, uint32_t height, uint32_t mi
     t0 = t;
   }
 
+  const auto wgpuFormat = converted.format != wgpu::TextureFormat::Undefined ? converted.format : to_wgpu(format);
+  auto handle = create_texture_2d(width, height, mips, format, wgpuFormat, label);
+  auto& ref = *handle;
+  ref.hasArbitraryMips = converted.hasArbitraryMips;
+  if (timing) {
+    const uint64_t t = tex_log_now_ns();
+    g_texLoadTiming.createNs += t - t0;
+    t0 = t;
+  }
+
   queue_static_texture_upload(ref, mips, data, label, timing, t0);
   return handle;
 }
 
 TextureHandle new_static_texture_2d_converted(uint32_t width, uint32_t height, uint32_t mips, u32 format,
-                                              ArrayRef<uint8_t> converted, bool hasArbitraryMips,
-                                              const char* label) noexcept {
+                                              wgpu::TextureFormat wgpuFormat, ArrayRef<uint8_t> converted,
+                                              bool hasArbitraryMips, const char* label) noexcept {
   ZoneScoped;
   const bool timing = tex_log_enabled();
   uint64_t t0 = timing ? tex_log_now_ns() : 0;
-  auto handle = new_dynamic_texture_2d(width, height, mips, format, label);
+  auto handle = create_texture_2d(width, height, mips, format, wgpuFormat, label);
   auto& ref = *handle;
   ref.hasArbitraryMips = hasArbitraryMips;
   if (timing) {
@@ -220,7 +224,12 @@ TextureHandle new_static_texture_2d_converted(uint32_t width, uint32_t height, u
 TextureHandle new_dynamic_texture_2d(uint32_t width, uint32_t height, uint32_t mips, u32 gxFormat,
                                      const char* label) noexcept {
   ZoneScopedS(3);
-  const auto wgpuFormat = to_wgpu(gxFormat);
+  return create_texture_2d(width, height, mips, gxFormat, to_wgpu(gxFormat), label);
+}
+
+// smstrikers-port: takes the GPU format, since CMPR content decides between BC1 and RGBA8.
+static TextureHandle create_texture_2d(uint32_t width, uint32_t height, uint32_t mips, u32 gxFormat,
+                                       wgpu::TextureFormat wgpuFormat, const char* label) noexcept {
   const wgpu::Extent3D size{
       .width = width,
       .height = height,
@@ -333,7 +342,7 @@ TextureHandle new_conv_texture(uint32_t width, uint32_t height, u32 gxFormat, co
 void write_texture(TextureRef& ref, ArrayRef<uint8_t> data) noexcept {
   ZoneScoped;
 
-  ConvertedTexture converted;
+  ConvertedTexture converted{};
   if (ref.gxFormat != InvalidTextureFormat) {
     converted = convert_texture(ref.gxFormat, ref.size.width, ref.size.height, ref.mipCount, data);
     ref.hasArbitraryMips = converted.hasArbitraryMips;

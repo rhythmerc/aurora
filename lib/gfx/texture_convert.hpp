@@ -39,6 +39,9 @@ inline wgpu::TextureFormat to_wgpu(u32 gxFormat) noexcept {
   }
 }
 
+// smstrikers-port: true if this CMPR texture uploads as BC1 instead of RGBA8.
+bool cmpr_uses_bc1(uint32_t width, uint32_t height, uint32_t mips, ArrayRef<uint8_t> data) noexcept;
+
 struct ConvertedTexture {
   wgpu::TextureFormat format;
   uint32_t width;

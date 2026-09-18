@@ -74,7 +74,8 @@ TextureHandle new_static_texture_2d(uint32_t width, uint32_t height, uint32_t mi
                                     ArrayRef<uint8_t> data, bool tlut, const char* label) noexcept;
 // smstrikers-port: new_static_texture_2d for data convert_texture already produced from this exact texture.
 TextureHandle new_static_texture_2d_converted(uint32_t width, uint32_t height, uint32_t mips, u32 gxFormat,
-                                              ArrayRef<uint8_t> converted, bool hasArbitraryMips,
+                                              wgpu::TextureFormat wgpuFormat, ArrayRef<uint8_t> converted,
+                                              bool hasArbitraryMips,
                                               const char* label) noexcept;
 TextureHandle new_dynamic_texture_2d(uint32_t width, uint32_t height, uint32_t mips, u32 gxFormat,
                                      const char* label) noexcept;
