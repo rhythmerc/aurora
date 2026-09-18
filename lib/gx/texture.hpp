@@ -43,6 +43,9 @@ size_t tlut_source_size(u16 numEntries) noexcept;
 void invalidate_bindings() noexcept;
 uint64_t current_bind_generation() noexcept;
 void invalidate_replacement(uint64_t replacementId) noexcept;
+// smstrikers-port: the last frame a texture drawn with this replacement was bound in, 0 for none.
+uint64_t replacement_last_used_frame(uint64_t replacementId) noexcept;
+uint64_t current_frame() noexcept;
 void end_frame() noexcept;
 // smstrikers-port: the main thread's last FIFO drain wait, reported by AURORA_TEX_LOG.
 void note_drain_wait(uint64_t ns) noexcept;

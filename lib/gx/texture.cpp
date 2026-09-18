@@ -1016,6 +1016,22 @@ struct SlowTextureTimer {
   }
 };
 
+uint64_t replacement_last_used_frame(uint64_t replacementId) noexcept {
+  const auto users = s_replacementUsers.find(replacementId);
+  if (users == s_replacementUsers.end()) {
+    return 0;
+  }
+  uint64_t last = 0;
+  for (const u32 texObjId : users->second) {
+    if (const auto it = s_textureObjectCaches.find(texObjId); it != s_textureObjectCaches.end()) {
+      last = std::max(last, it->second.lastUsedFrame);
+    }
+  }
+  return last;
+}
+
+uint64_t current_frame() noexcept { return s_frameCount; }
+
 gfx::TextureHandle resolve_static_texture(const GXTexObj_& obj) {
   ZoneScoped;
 

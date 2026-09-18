@@ -45,6 +45,10 @@ constexpr Module Log{"aurora::texture"};
 
 // smstrikers-port: set_replacement_cache_budget changes it.
 uint64_t s_replacementCacheBudgetBytes = 4294967296; // 4GB
+// smstrikers-port: a replacement drawn this recently is on screen and is never evicted.
+constexpr uint64_t kInUseFrames = 60;
+// smstrikers-port: how long a replacement the budget turned away keeps its original texture.
+constexpr uint64_t kDeniedFrames = 600;
 constexpr uint64_t kReplacementWildcardTextureHash = kWildcardTextureHash;
 constexpr uint64_t kReplacementWildcardTlutHash = kWildcardTlutHash;
 
@@ -140,6 +144,8 @@ absl::flat_hash_set<uint64_t> s_failedIds;
 absl::flat_hash_set<TextureSourceKey, SourceKeyHash> s_reportedMisses;
 std::list<ReplacementKey> s_replacementLru;
 uint64_t s_replacementCacheBytes = 0;
+absl::flat_hash_map<uint64_t, uint64_t> s_deniedUntilFrame;
+bool s_warnedOverBudget = false;
 uint64_t s_nextRegistrationId = 1;
 uint64_t s_nextSequence = 1;
 uint32_t s_sourceEntryCount = 0;
@@ -1035,23 +1041,36 @@ void touch_cached_replacement(decltype(s_cacheByKey)::iterator it) noexcept {
   }
 }
 
-void evict_replacement_cache_if_needed() noexcept {
-  while (s_replacementCacheBytes > s_replacementCacheBudgetBytes && !s_replacementLru.empty()) {
-    const auto key = s_replacementLru.back();
-    const auto cache = s_cacheByKey.find(key);
-    const uint64_t id = cache == s_cacheByKey.end() ? 0 : cache->second.id;
-    erase_cache_locked(key);
-    if (id != 0) {
-      gx::texture::invalidate_replacement(id);
-      gx::texture::invalidate_bindings();
+// smstrikers-port: evicts only replacements off screen, oldest first, and says whether the cache fits.
+bool evict_replacement_cache_if_needed(const ReplacementKey* keep = nullptr) noexcept {
+  const uint64_t now = gx::texture::current_frame();
+  std::vector<ReplacementKey> cold;
+  uint64_t freed = 0;
+  for (auto it = s_replacementLru.rbegin();
+       it != s_replacementLru.rend() && s_replacementCacheBytes - freed > s_replacementCacheBudgetBytes; ++it) {
+    const auto cache = s_cacheByKey.find(*it);
+    if ((keep != nullptr && *it == *keep) || cache == s_cacheByKey.end() ||
+        gx::texture::replacement_last_used_frame(cache->second.id) + kInUseFrames > now) {
+      continue;
     }
+    freed += cache->second.bytes;
+    cold.push_back(*it);
   }
+  for (const auto& key : cold) {
+    const uint64_t id = s_cacheByKey.find(key)->second.id;
+    erase_cache_locked(key);
+    gx::texture::invalidate_replacement(id);
+  }
+  if (!cold.empty()) {
+    gx::texture::invalidate_bindings();
+  }
+  return s_replacementCacheBytes <= s_replacementCacheBudgetBytes;
 }
 
-void cache_replacement_locked(const ReplacementKey& key, uint64_t id, gfx::TextureHandle handle, Tier tier) noexcept {
+bool cache_replacement_locked(const ReplacementKey& key, uint64_t id, gfx::TextureHandle handle, Tier tier) noexcept {
   erase_cache_locked(key);
   if (!handle) {
-    return;
+    return false;
   }
   const uint64_t replacementBytes =
       gfx::calc_texture_size(handle->format, handle->size.width, handle->size.height, handle->mipCount);
@@ -1064,7 +1083,18 @@ void cache_replacement_locked(const ReplacementKey& key, uint64_t id, gfx::Textu
                                 .tier = tier,
                             });
   s_replacementCacheBytes += replacementBytes;
-  evict_replacement_cache_if_needed();
+  if (evict_replacement_cache_if_needed(&key)) {
+    return true;
+  }
+  // smstrikers-port: everything else cached is on screen, so this one keeps its original for now.
+  erase_cache_locked(key);
+  s_deniedUntilFrame[id] = gx::texture::current_frame() + kDeniedFrames;
+  if (!s_warnedOverBudget) {
+    s_warnedOverBudget = true;
+    Log.warn("texture replacements on screen fill the {} MB budget; the rest keep their original textures",
+             s_replacementCacheBudgetBytes >> 20);
+  }
+  return false;
 }
 
 const ReplacementEntry* select_entry(const std::vector<ReplacementEntry>& entries) noexcept {
@@ -1162,6 +1192,12 @@ find_replacement_for_key_locked(const ReplacementKey& key) noexcept {
   }
 
   erase_cache_locked(key);
+  if (const auto denied = s_deniedUntilFrame.find(entry->id); denied != s_deniedUntilFrame.end()) {
+    if (gx::texture::current_frame() < denied->second) {
+      return gfx::texture_replacement::ReplacementResult{.id = entry->id};
+    }
+    s_deniedUntilFrame.erase(denied);
+  }
   if constexpr (gx::texture::AsyncTextureReplacements) {
     // Raw entry data is borrowed, so they must take the synchronous path.
     if (entry->kind != EntryKind::Raw) {
@@ -1173,7 +1209,9 @@ find_replacement_for_key_locked(const ReplacementKey& key) noexcept {
         const auto snapshot = snapshot_entry(key, *entry);
         thumbnailHandle = create_converted_texture_handle(snapshot, *entry->thumbnail);
         tier = entry->thumbnailIncludesBase ? Tier::Full : Tier::Thumbnail;
-        cache_replacement_locked(key, entry->id, thumbnailHandle, tier);
+        if (!cache_replacement_locked(key, entry->id, thumbnailHandle, tier)) {
+          return gfx::texture_replacement::ReplacementResult{.id = entry->id};
+        }
       }
       if (tier != Tier::Full && !s_failedIds.contains(entry->id)) {
         queue_full_load(snapshot_entry(key, *entry));
@@ -1186,7 +1224,9 @@ find_replacement_for_key_locked(const ReplacementKey& key) noexcept {
   if (!handle) {
     return gfx::texture_replacement::ReplacementResult{.id = entry->id};
   }
-  cache_replacement_locked(key, entry->id, handle, Tier::Full);
+  if (!cache_replacement_locked(key, entry->id, handle, Tier::Full)) {
+    return gfx::texture_replacement::ReplacementResult{.id = entry->id};
+  }
   return gfx::texture_replacement::ReplacementResult{.handle = std::move(handle), .id = entry->id};
 }
 
@@ -1347,6 +1387,7 @@ void clear_replacement_runtime_state_locked(std::vector<std::shared_ptr<VirtualR
   s_reportedMisses.clear();
   s_replacementLru.clear();
   s_replacementCacheBytes = 0;
+  s_deniedUntilFrame.clear();
   s_sourceEntryCount = 0;
 }
 
@@ -1775,6 +1816,27 @@ StreamingStats process_streaming() noexcept {
     return {};
   }
 
+  // smstrikers-port: a turned-away replacement gets another try once its wait is over.
+  std::vector<uint64_t> retry;
+  {
+    std::lock_guard lock{s_registryMutex};
+    const uint64_t now = gx::texture::current_frame();
+    for (auto it = s_deniedUntilFrame.begin(); it != s_deniedUntilFrame.end();) {
+      if (now < it->second) {
+        ++it;
+        continue;
+      }
+      retry.push_back(it->first);
+      s_deniedUntilFrame.erase(it++);
+    }
+  }
+  for (const uint64_t id : retry) {
+    gx::texture::invalidate_replacement(id);
+  }
+  if (!retry.empty()) {
+    gx::texture::invalidate_bindings();
+  }
+
   std::vector<LoadCompletion> thumbnails;
   {
     std::lock_guard lock{s_jobMutex};
@@ -1850,8 +1912,8 @@ StreamingStats process_streaming() noexcept {
     {
       std::lock_guard lock{s_registryMutex};
       const auto* entry = find_selected_entry_locked(completion.entry.key);
-      if (entry != nullptr && entry->id == completion.entry.id) {
-        cache_replacement_locked(completion.entry.key, completion.entry.id, handle, Tier::Full);
+      if (entry != nullptr && entry->id == completion.entry.id &&
+          cache_replacement_locked(completion.entry.key, completion.entry.id, handle, Tier::Full)) {
         s_failedIds.erase(completion.entry.id);
         published = true;
       }
