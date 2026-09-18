@@ -878,4 +878,53 @@ ConvertedTexture convert_texture_palette(u32 textureFormat, uint32_t width, uint
       .hasArbitraryMips = hasArbitraryMips,
   };
 }
+
+ByteBuffer decode_rgba8(u32 format, uint32_t width, uint32_t height, ArrayRef<uint8_t> data, GXTlutFmt tlutFormat,
+                        uint16_t tlutEntries, ArrayRef<uint8_t> tlutData) {
+  ByteBuffer indices;
+  switch (format) {
+  default:
+    return {};
+  case GX_TF_I4:
+    return DecodeTiled<TextureDecoderI4>(width, height, 1, data);
+  case GX_TF_I8:
+    return DecodeTiled<TextureDecoderI8>(width, height, 1, data);
+  case GX_TF_IA4:
+    return DecodeTiled<TextureDecoderIA4>(width, height, 1, data);
+  case GX_TF_IA8:
+    return DecodeTiled<TextureDecoderIA8>(width, height, 1, data);
+  case GX_TF_RGB565:
+    return DecodeTiled<TextureDecoderRGB565>(width, height, 1, data);
+  case GX_TF_RGB5A3:
+    return DecodeTiled<TextureDecoderRGB5A3>(width, height, 1, data);
+  case GX_TF_RGBA8:
+    return BuildRGBA8FromGCN(width, height, 1, data);
+  case GX_TF_CMPR:
+    return BuildRGBA8FromCMPR(width, height, 1, data);
+  case GX_TF_C4:
+    indices = DecodeTiled<TextureDecoderC4>(width, height, 1, data);
+    break;
+  case GX_TF_C8:
+    indices = DecodeTiled<TextureDecoderC8>(width, height, 1, data);
+    break;
+  case GX_TF_C14X2:
+    indices = DecodeTiled<TextureDecoderC14X2>(width, height, 1, data);
+    break;
+  }
+
+  const auto palette = convert_tlut(tlut_texture_format(tlutFormat), tlutEntries, tlutData);
+  if (indices.empty() || palette.data.empty()) {
+    return {};
+  }
+  const size_t pixelCount = static_cast<size_t>(width) * height;
+  const auto* indexData = reinterpret_cast<const u16*>(indices.data());
+  ByteBuffer pixels;
+  pixels.reserve_extra(pixelCount * 4);
+  for (size_t i = 0; i < pixelCount; ++i) {
+    const u32 index = indexData[i];
+    constexpr uint8_t transparent[4] = {0, 0, 0, 0};
+    pixels.append(index < tlutEntries ? palette.data.data() + static_cast<size_t>(index) * 4 : transparent, 4);
+  }
+  return pixels;
+}
 } // namespace aurora::gfx

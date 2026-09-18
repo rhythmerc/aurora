@@ -97,6 +97,14 @@ void reload_replacement_directory(const std::filesystem::path& root, Replacement
 
 bool has_replacement(const GXTexObj* obj, const GXTlutObj* tlut = nullptr);
 
+/// smstrikers-port: bytes of loaded replacements kept before LRU eviction; 4 GB by default.
+void set_replacement_cache_budget(uint64_t bytes);
+
+enum class DumpResult { Written, Exists, Failed };
+
+/// smstrikers-port: writes `obj`'s base level to `dir` as a PNG under Dolphin's dump name, unless it exists.
+DumpResult dump_texture(const GXTexObj* obj, const GXTlutObj* tlut, const std::filesystem::path& dir);
+
 } // namespace aurora::texture
 
 #endif

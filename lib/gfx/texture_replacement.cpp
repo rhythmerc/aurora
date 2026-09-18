@@ -10,6 +10,7 @@
 #include "png_io.hpp"
 #include "texture_convert.hpp"
 
+#include <aurora/replacement.h>
 #include <aurora/texture.hpp>
 #include <fmt/format.h>
 #include <tracy/Tracy.hpp>
@@ -42,7 +43,8 @@ namespace aurora::texture {
 namespace {
 constexpr Module Log{"aurora::texture"};
 
-constexpr uint64_t kReplacementCacheBudgetBytes = 4294967296; // 4GB
+// smstrikers-port: set_replacement_cache_budget changes it.
+uint64_t s_replacementCacheBudgetBytes = 4294967296; // 4GB
 constexpr uint64_t kReplacementWildcardTextureHash = kWildcardTextureHash;
 constexpr uint64_t kReplacementWildcardTlutHash = kWildcardTlutHash;
 
@@ -1034,7 +1036,7 @@ void touch_cached_replacement(decltype(s_cacheByKey)::iterator it) noexcept {
 }
 
 void evict_replacement_cache_if_needed() noexcept {
-  while (s_replacementCacheBytes > kReplacementCacheBudgetBytes && !s_replacementLru.empty()) {
+  while (s_replacementCacheBytes > s_replacementCacheBudgetBytes && !s_replacementLru.empty()) {
     const auto key = s_replacementLru.back();
     const auto cache = s_cacheByKey.find(key);
     const uint64_t id = cache == s_cacheByKey.end() ? 0 : cache->second.id;
@@ -1696,7 +1698,69 @@ bool has_replacement(const GXTexObj* obj, const GXTlutObj* tlut) {
   }
   return gfx::texture_replacement::has_replacement(*obj_);
 }
+
+DumpResult dump_texture(const GXTexObj* obj, const GXTlutObj* tlut, const std::filesystem::path& dir) {
+  const auto& obj_ = *reinterpret_cast<const GXTexObj_*>(obj);
+  const auto* tlut_ = reinterpret_cast<const GXTlutObj_*>(tlut);
+  const bool palette = gx::is_palette_format(obj_.format());
+  if (!obj_.has_data() || (palette && (tlut_ == nullptr || tlut_->data == nullptr))) {
+    return DumpResult::Failed;
+  }
+
+  const auto key = palette ? build_source_key(obj_, *tlut_) : build_source_key_base(obj_);
+  // Dolphin adds _m when the min filter samples mips.
+  const bool mipmapped = (GXTexObj_::get_bits(obj_.mode0, 3, 5) & 3) != 0;
+  std::string name = fmt::format("tex1_{}x{}{}_{:016x}", key.width, key.height, mipmapped ? "_m" : "", key.textureHash);
+  if (key.hasTlut) {
+    name += fmt::format("_{:016x}", key.tlutHash);
+  }
+  name += fmt::format("_{}.png", key.format);
+
+  const auto path = dir / name;
+  std::error_code ec;
+  if (std::filesystem::exists(path, ec)) {
+    return DumpResult::Exists;
+  }
+  const auto pixels = gfx::decode_rgba8(obj_.format(), key.width, key.height,
+                                        {static_cast<const uint8_t*>(obj_.data), texture_base_level_size(obj_)},
+                                        palette ? tlut_->format : GX_TL_IA8, palette ? tlut_->numEntries : 0,
+                                        palette ? tlut_bytes(*tlut_) : ArrayRef<uint8_t>{});
+  if (pixels.empty() || !io::create_directories(dir) ||
+      !gfx::png::write_rgba8_png(path, key.width, key.height, {pixels.data(), pixels.size()})) {
+    return DumpResult::Failed;
+  }
+  return DumpResult::Written;
+}
+
+void set_replacement_cache_budget(uint64_t bytes) {
+  std::lock_guard lk(s_registryMutex);
+  s_replacementCacheBudgetBytes = bytes;
+  evict_replacement_cache_if_needed();
+}
 } // namespace aurora::texture
+
+extern "C" uint32_t aurora_replacement_load(const char* root, int32_t priority) {
+  const auto group = aurora::texture::load_replacement_directory(aurora::io::fs_path_from_string(root),
+                                                                 {.priority = priority});
+  return static_cast<uint32_t>(group.registrations.size());
+}
+
+extern "C" void aurora_replacement_clear() { aurora::texture::clear_replacements(); }
+
+extern "C" void aurora_replacement_set_cache_budget(uint64_t bytes) {
+  aurora::texture::set_replacement_cache_budget(bytes);
+}
+
+extern "C" int aurora_replacement_dump(const GXTexObj* obj, const GXTlutObj* tlut, const char* dir) {
+  switch (aurora::texture::dump_texture(obj, tlut, aurora::io::fs_path_from_string(dir))) {
+  case aurora::texture::DumpResult::Written:
+    return 1;
+  case aurora::texture::DumpResult::Exists:
+    return 0;
+  default:
+    return -1;
+  }
+}
 
 namespace aurora::gfx::texture_replacement {
 using namespace aurora::texture;
