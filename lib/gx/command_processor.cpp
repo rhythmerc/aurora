@@ -18,6 +18,7 @@
 #include "shader_info.hpp"
 #include "texture.hpp"
 
+#include <absl/container/flat_hash_map.h>
 #include <tracy/Tracy.hpp>
 #include <xxhash.h>
 
@@ -165,6 +166,13 @@ struct DrawCache {
   GXVtxFmt lastDrawFmt = GX_MAX_VTXFMT;
 };
 DrawCache sDrawCache;
+
+// smstrikers-port: both results depend only on the config, so each config is analysed and looked up once.
+struct PipelineMemo {
+  ShaderInfo shaderInfo;
+  gfx::PipelineRef pipelineRef;
+};
+absl::flat_hash_map<HashType, PipelineMemo> sPipelineMemo;
 
 FogRangeLutKey fog_range_lut_key() noexcept {
   const auto& state = g_gxState.fog;
@@ -1593,8 +1601,18 @@ static void push_gx_draw(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, gfx::Rang
     const auto prevSampledTextures = cache.shaderInfo.sampledTextures;
     const auto prevSampledIndTextures = cache.shaderInfo.sampledIndTextures;
     populate_pipeline_config(cache.config, prim, fmt);
-    cache.shaderInfo = build_shader_info(cache.config.shaderConfig);
-    cache.pipelineRef = gfx::pipeline_ref(cache.config);
+    // smstrikers-port: both results depend only on the config and, through
+    // pipeline_ref, the render target layout, so each pair is analysed and
+    // looked up once.
+    const HashType memoKey = xxh3_hash(cache.config, targetLayoutKey);
+    if (const auto it = sPipelineMemo.find(memoKey); it != sPipelineMemo.end()) {
+      cache.shaderInfo = it->second.shaderInfo;
+      cache.pipelineRef = it->second.pipelineRef;
+    } else {
+      cache.shaderInfo = build_shader_info(cache.config.shaderConfig);
+      cache.pipelineRef = gfx::pipeline_ref(cache.config);
+      sPipelineMemo.emplace(memoKey, PipelineMemo{cache.shaderInfo, cache.pipelineRef});
+    }
     cache.targetLayoutKey = targetLayoutKey;
     cache.fmt = fmt;
     cache.lineMode = lineMode;
@@ -2384,6 +2402,10 @@ void handle_aurora(ByteReader& reader) noexcept {
 }
 
 void clear_draw_cache() noexcept {
+  // smstrikers-port: capped, as nothing else evicts from the memo.
+  if (sPipelineMemo.size() > 8192) {
+    sPipelineMemo.clear();
+  }
   sDrawCache.bindGeneration = 0;
   sDrawCache.uniformRange = {};
   sDrawCache.fogRange = {};
