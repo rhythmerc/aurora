@@ -477,6 +477,79 @@ bool remove_mipmaps(gfx::ConvertedTexture& texture) noexcept {
   return true;
 }
 
+// smstrikers-port: Dolphin names a dump `tex1_<w>x<h>_m_...` when the game gave the texture mipmaps.
+bool names_mipmapped_texture(std::string_view path) noexcept {
+  const size_t slash = path.find_last_of("/\\");
+  const std::string_view name = slash == std::string_view::npos ? path : path.substr(slash + 1);
+  constexpr std::string_view prefix = "tex1_";
+  if (!name.starts_with(prefix)) {
+    return false;
+  }
+  const size_t dims = name.find('_', prefix.size());
+  return dims != std::string_view::npos && name.substr(dims + 1).starts_with("m_");
+}
+
+// smstrikers-port: box-filtered mips for a pack that left them out, colour weighted by alpha to keep cut-outs clean.
+std::optional<gfx::ConvertedTexture> generate_mipmaps(const gfx::ConvertedTexture& base) noexcept {
+  if (base.format != wgpu::TextureFormat::RGBA8Unorm || base.mips != 1 || base.width == 0 || base.height == 0 ||
+      base.data.size() < static_cast<uint64_t>(base.width) * base.height * 4) {
+    return std::nullopt;
+  }
+  uint32_t mips = 1;
+  for (uint32_t w = base.width, h = base.height; w > 1 || h > 1; ++mips) {
+    w = std::max(w >> 1, 1u);
+    h = std::max(h >> 1, 1u);
+  }
+  const uint64_t n = gfx::calc_texture_size(base.format, base.width, base.height, mips);
+  if (n == 0) {
+    return std::nullopt;
+  }
+
+  ByteBuffer blob{n};
+  const uint64_t baseSize = static_cast<uint64_t>(base.width) * base.height * 4;
+  std::memcpy(blob.data(), base.data.data(), baseSize);
+  const uint8_t* src = blob.data();
+  uint8_t* dst = blob.data() + baseSize;
+  for (uint32_t mip = 1, sw = base.width, sh = base.height; mip < mips; ++mip) {
+    const uint32_t dw = std::max(sw >> 1, 1u);
+    const uint32_t dh = std::max(sh >> 1, 1u);
+    for (uint32_t y = 0; y < dh; ++y) {
+      const uint8_t* row0 = src + static_cast<size_t>(std::min(2 * y, sh - 1)) * sw * 4;
+      const uint8_t* row1 = src + static_cast<size_t>(std::min(2 * y + 1, sh - 1)) * sw * 4;
+      for (uint32_t x = 0; x < dw; ++x) {
+        const size_t x0 = static_cast<size_t>(std::min(2 * x, sw - 1)) * 4;
+        const size_t x1 = static_cast<size_t>(std::min(2 * x + 1, sw - 1)) * 4;
+        const uint8_t* t[4] = {row0 + x0, row0 + x1, row1 + x0, row1 + x1};
+        const uint32_t alpha = t[0][3] + t[1][3] + t[2][3] + t[3][3];
+        uint8_t* out = dst + (static_cast<size_t>(y) * dw + x) * 4;
+        for (int c = 0; c < 3; ++c) {
+          if (alpha != 0) {
+            const uint32_t sum = t[0][c] * t[0][3] + t[1][c] * t[1][3] + t[2][c] * t[2][3] + t[3][c] * t[3][3];
+            out[c] = static_cast<uint8_t>((sum + alpha / 2) / alpha);
+          } else {
+            out[c] = static_cast<uint8_t>((t[0][c] + t[1][c] + t[2][c] + t[3][c] + 2) / 4);
+          }
+        }
+        out[3] = static_cast<uint8_t>((alpha + 2) / 4);
+      }
+    }
+    src = dst;
+    dst += static_cast<size_t>(dw) * dh * 4;
+    sw = dw;
+    sh = dh;
+  }
+  if (static_cast<uint64_t>(dst - blob.data()) != n) {
+    return std::nullopt;
+  }
+  return gfx::ConvertedTexture{
+      .format = base.format,
+      .width = base.width,
+      .height = base.height,
+      .mips = mips,
+      .data = std::move(blob),
+  };
+}
+
 constexpr bool is_unsupported_texture_format(wgpu::TextureFormat format) {
   switch (format) {
   case wgpu::TextureFormat::BC1RGBAUnorm:
@@ -684,6 +757,12 @@ std::optional<gfx::ConvertedTexture> load_encoded_replacement(Source&& src) noex
   }
 
   if (more.empty()) {
+    // smstrikers-port: without its mipmaps a texture the game mipmapped shimmers in the distance.
+    if (names_mipmapped_texture(src.name())) {
+      if (auto chained = generate_mipmaps(*base)) {
+        return chained;
+      }
+    }
     return base;
   }
 
