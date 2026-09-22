@@ -339,7 +339,7 @@ TextureHandle new_conv_texture(uint32_t width, uint32_t height, u32 gxFormat, co
                                       std::move(attachmentTextureView), size, wgpuFormat, 1, gxFormat);
 }
 
-void write_texture(TextureRef& ref, ArrayRef<uint8_t> data) noexcept {
+bool write_texture(TextureRef& ref, ArrayRef<uint8_t> data) noexcept {
   ZoneScoped;
 
   ConvertedTexture converted{};
@@ -371,7 +371,10 @@ void write_texture(TextureRef& ref, ArrayRef<uint8_t> data) noexcept {
         .mipLevel = mip,
     };
     if constexpr (UseTextureBuffer) {
-      queue_texture_upload_data(data.data() + offset, bytesPerRow, heightBlocks, std::move(dstView), physicalSize);
+      if (!queue_texture_upload_data(data.data() + offset, bytesPerRow, heightBlocks, std::move(dstView),
+                                     physicalSize)) {
+        return false;
+      }
     } else {
       const wgpu::TexelCopyBufferLayout dataLayout{
           .bytesPerRow = bytesPerRow,
@@ -384,6 +387,7 @@ void write_texture(TextureRef& ref, ArrayRef<uint8_t> data) noexcept {
   if (data.size() != UINT32_MAX && offset < data.size()) {
     Log.warn("write_texture: texture used {} bytes, but given {} bytes", offset, data.size());
   }
+  return true;
 }
 
 wgpu::SamplerDescriptor TextureBind::get_descriptor() const noexcept {

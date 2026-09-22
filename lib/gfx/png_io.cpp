@@ -81,6 +81,11 @@ std::optional<ConvertedTexture> parse_png_bytes(ArrayRef<uint8_t> bytes) noexcep
   rowPointers.resize(height);
 
   imageData.append_zeroes(rowBytes * height);
+  // smstrikers-port: the allocation can fail on the Switch, where a large texture pack fills the heap.
+  if (imageData.data() == nullptr) {
+    Log.error("out of memory for a {}x{} PNG", width, height);
+    return std::nullopt;
+  }
 
   for (i = 0; i < height; i++) {
     rowPointers[i] = imageData.data() + i * rowBytes;

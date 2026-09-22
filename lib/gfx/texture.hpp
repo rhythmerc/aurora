@@ -34,7 +34,8 @@ bool tex_log_enabled() noexcept;
 uint64_t tex_log_now_ns() noexcept;
 
 void queue_texture_upload(TextureUpload upload);
-void queue_texture_upload_data(const uint8_t* data, uint32_t bytesPerRow, uint32_t rowsPerImage,
+// smstrikers-port: false when there was no memory to stage it; nothing is queued then.
+bool queue_texture_upload_data(const uint8_t* data, uint32_t bytesPerRow, uint32_t rowsPerImage,
                                wgpu::TexelCopyTextureInfo tex, wgpu::Extent3D size);
 
 struct TextureFormatInfo {
@@ -81,7 +82,8 @@ TextureHandle new_dynamic_texture_2d(uint32_t width, uint32_t height, uint32_t m
                                      const char* label) noexcept;
 TextureHandle new_render_texture(uint32_t width, uint32_t height, u32 gxFormat, const char* label) noexcept;
 TextureHandle new_conv_texture(uint32_t width, uint32_t height, u32 gxFormat, const char* label) noexcept;
-void write_texture(TextureRef& ref, ArrayRef<uint8_t> data) noexcept;
+// smstrikers-port: false when a level could not be staged for upload.
+bool write_texture(TextureRef& ref, ArrayRef<uint8_t> data) noexcept;
 }; // namespace aurora::gfx
 
 struct GXTexObj_ {
