@@ -262,8 +262,12 @@ f32 PSVECDistance(const Vec* a, const Vec* b);
 #define PSVECAdd VECAdd
 #define PSVECSubtract VECSubtract
 #define PSVECScale VECScale
-#define PSVECDotProduct VECDotProduct
-#define PSVECCrossProduct VECCrossProduct
+/* The game's own PS calls compute as the disc's paired-single code does
+ * (lib/dolphin/mtx/vec.c), fused where the C versions are not. */
+f32 PC_PSVECDotProduct(const Vec* a, const Vec* b);
+void PC_PSVECCrossProduct(const Vec* a, const Vec* b, Vec* axb);
+#define PSVECDotProduct PC_PSVECDotProduct
+#define PSVECCrossProduct PC_PSVECCrossProduct
 #endif
 
 #if defined(MTX_USE_PS)

@@ -124,12 +124,46 @@ static inline double frsqrte(double val) {
     return result.f;
 }
 
-// One Newton-Raphson step
+// Gekko's single-precision ops as Dolphin computes them: in double, then
+// rounded to single. A multiply's second operand (frC) held in double
+// precision goes in rounded to the 25 bits the hardware's multiplier uses
+// (Dolphin's Force25Bit); a single-precision value passes unchanged. The
+// fused ops round the sum to double, then to single (an fma in double,
+// then ForceSingle; with single inputs the product is exact in double).
+// Where the JIT and the hardware part (the sign of a zero), the JIT's.
+static inline double ppc_force25(double d) {
+    union c64 b;
+    b.f = d;
+    b.u = (b.u & 0xFFFFFFFFF8000000ULL) + (b.u & 0x8000000ULL);
+    return b.f;
+}
+static inline float ppc_fmadds(float a, float c, float b) { // a*c + b
+    return (float)((double)a * (double)c + (double)b);
+}
+static inline float ppc_fmsubs(float a, float c, float b) { // a*c - b
+    return (float)((double)a * (double)c - (double)b);
+}
+static inline float ppc_fnmadds(float a, float c, float b) { // -(a*c + b)
+    return (float)-((double)a * (double)c + (double)b);
+}
+// -(a*c - b), computed as b - a*c: what Dolphin's JIT does (x86's fnmadd,
+// AArch64's fmsub), which a Slippi peer runs. The two part only in the
+// sign of a zero (0 - 0*k is +0 here, -(0*k - 0) is -0 on the hardware), and
+// replays show Dolphin's: an airborne knockback y of 0 stays +0 as it
+// decays, so atan2f of it later sees +0.
+static inline float ppc_fnmsubs(float a, float c, float b) {
+    return (float)((double)b - (double)a * (double)c);
+}
+
+// The SDK's reciprocal square root (PSVECNormalize, PSVECMag): frsqrte and
+// one Newton-Raphson step, as the disc's code has it (0x80342DD4..DE4):
+// fmuls e*e (frC = e, the estimate, in double), fmuls e*0.5, fnmsubs
+// 3 - e^2*x, fmuls.
 static inline float ppc_rsqrte(float x) {
     double rsqrt_d = frsqrte((double)x);
-    float nwork0 = (float)(rsqrt_d * rsqrt_d);
+    float nwork0 = (float)(rsqrt_d * ppc_force25(rsqrt_d));
     float nwork1 = (float)(rsqrt_d * 0.5);
-    nwork0 = fmaf(-nwork0, x, 3.0f);
+    nwork0 = ppc_fnmsubs(nwork0, x, 3.0f);
     return nwork0 * nwork1;
 }
 

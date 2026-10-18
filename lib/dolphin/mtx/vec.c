@@ -51,7 +51,8 @@ void PSVECNormalize(const Vec* src, Vec* unit) {
   assert(src && "VECNormalize():  NULL VecPtr 'src' ");
   assert(unit && "VECNormalize():  NULL VecPtr 'unit' ");
 
-  sqsum = (src->z * src->z + src->x * src->x) + src->y * src->y;
+  /* ps_madd z*z onto x*x, then ps_sum0 adds y*y (0x80342DCC, 0x80342DD0) */
+  sqsum = ppc_fmadds(src->z, src->z, src->x * src->x) + src->y * src->y;
   assert(0.0f != sqsum && "VECNormalize():  zero magnitude vector ");
 
   rsqrt = ppc_rsqrte(sqsum);
@@ -76,10 +77,11 @@ f32 PSVECSquareMag(const Vec* v) {
 
   assert(v && "VECMag():  NULL VecPtr 'v' ");
 
+  /* as PSVECMag computes it (0x80342E00..E10) */
   xx = v->x * v->x;
   yy = v->y * v->y;
-  xx_zz = fmaf(v->z, v->z, xx);
-  return fmaf(xx_zz, 1.0f, yy);
+  xx_zz = ppc_fmadds(v->z, v->z, xx);
+  return xx_zz + yy;
 }
 
 f32 C_VECMag(const Vec* v) {
@@ -196,4 +198,22 @@ f32 PSVECDistance(const Vec* a, const Vec* b) {
     return 0.0f;
   }
   return sqdist * ppc_rsqrte(sqdist);
+}
+
+/* The paired-single dot and cross products as the disc's code computes
+ * them (PSVECDotProduct 0x80342E38, PSVECCrossProduct 0x80342E58): each
+ * ps_madd / ps_msub fused, as the C versions are not. */
+f32 PC_PSVECDotProduct(const Vec* a, const Vec* b) {
+  /* ps_mul (y*y', z*z'), ps_madd x*x' onto y*y', ps_sum0 adds z*z' */
+  return ppc_fmadds(a->x, b->x, a->y * b->y) + a->z * b->z;
+}
+
+void PC_PSVECCrossProduct(const Vec* a, const Vec* b, Vec* axb) {
+  const f32 bx_az = b->x * a->z, by_az = b->y * a->z; /* ps_mul */
+  const f32 by_ax = b->y * a->x;                      /* ps_muls0 */
+  Vec r;
+  r.x = ppc_fmsubs(a->y, b->z, by_az);   /* ps_msub, lane 1 */
+  r.y = -ppc_fmsubs(a->x, b->z, bx_az);  /* ps_msub lane 0, ps_neg */
+  r.z = -ppc_fmsubs(a->y, b->x, by_ax);  /* ps_msub lane 1, ps_neg */
+  *axb = r;
 }
