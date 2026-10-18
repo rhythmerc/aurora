@@ -155,6 +155,13 @@ static inline float ppc_fnmsubs(float a, float c, float b) {
     return (float)((double)b - (double)a * (double)c);
 }
 
+// The double-precision ones (fmadd, fmsub, fnmadd, fnmsub) are one fma:
+// Dolphin computes them so, rounding once to double.
+static inline double ppc_fmadd(double a, double c, double b) { return fma(a, c, b); }
+static inline double ppc_fmsub(double a, double c, double b) { return fma(a, c, -b); }
+static inline double ppc_fnmadd(double a, double c, double b) { return -fma(a, c, b); }
+static inline double ppc_fnmsub(double a, double c, double b) { return -fma(a, c, -b); }
+
 // The SDK's reciprocal square root (PSVECNormalize, PSVECMag): frsqrte and
 // one Newton-Raphson step, as the disc's code has it (0x80342DD4..DE4):
 // fmuls e*e (frC = e, the estimate, in double), fmuls e*0.5, fnmsubs
