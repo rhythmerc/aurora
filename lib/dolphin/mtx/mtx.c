@@ -1,3 +1,4 @@
+#include <dolphin/ppc_math.h>
 #include <dolphin/mtx.h>
 
 #include <assert.h>
@@ -615,4 +616,25 @@ void C_MTXLightOrtho(Mtx m, f32 t, f32 b, f32 l, f32 r, f32 scaleS, f32 scaleT, 
   m[2][1] = 0;
   m[2][2] = 0;
   m[2][3] = 1;
+}
+
+/* PSMTXConcat as the paired-single code on the disc computes it
+ * (0x80342204): each element of ab's row i a ps_muls0 then two ps_madds
+ * (fused) down b's column, a*b ordered as the instructions have them, and
+ * the translation column adding a's own last (a ps_madds1 by 1.0: a plain
+ * add). All of a and b is read before ab is written, so ab may alias
+ * either. */
+void PC_PSMTXConcat(const Mtx a, const Mtx b, Mtx ab) {
+  Mtx r;
+  for (int i = 0; i < 3; i++) {
+    for (int j = 0; j < 4; j++) {
+      const f32 t = ppc_fmadds(b[2][j], a[i][2], ppc_fmadds(b[1][j], a[i][1], b[0][j] * a[i][0]));
+      /* the last ps_madds1 runs over columns 2 and 3 by (0.0, 1.0): 0 *
+       * a[i][3] onto column 2 (which can only change a zero's sign) */
+      r[i][j] = j == 3 ? a[i][3] + t : j == 2 ? ppc_fmadds(0.0f, a[i][3], t) : t;
+    }
+  }
+  for (int i = 0; i < 3; i++)
+    for (int j = 0; j < 4; j++)
+      ab[i][j] = r[i][j];
 }

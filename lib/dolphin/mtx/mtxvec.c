@@ -1,3 +1,4 @@
+#include <dolphin/ppc_math.h>
 #include <assert.h>
 #include <dolphin/mtx.h>
 
@@ -92,4 +93,27 @@ void C_MTXROMultVecArray(const ROMtx m, const Vec *srcBase, Vec *dstBase, u32 co
     srcBase++;
     dstBase++;
   }
+}
+
+/* PSMTXMultVec as the disc computes it (0x80342AA8): per row, ps_mul
+ * (m0*x, m1*y), ps_madd (m2*z fused onto m0*x, m3*1 onto m1*y: a plain
+ * add), then ps_sum0 adds the two halves. */
+void PC_PSMTXMultVec(const Mtx m, const Vec* src, Vec* dst) {
+  const f32 x = src->x, y = src->y, z = src->z;
+  Vec r;
+  r.x = ppc_fmadds(m[0][2], z, m[0][0] * x) + (m[0][3] + m[0][1] * y);
+  r.y = ppc_fmadds(m[1][2], z, m[1][0] * x) + (m[1][3] + m[1][1] * y);
+  r.z = ppc_fmadds(m[2][2], z, m[2][0] * x) + (m[2][3] + m[2][1] * y);
+  *dst = r;
+}
+
+/* PSMTXMultVecSR (0x80342AFC): ps_mul (m0*x, m1*y), ps_sum0 adds them, then
+ * ps_madd fuses m2*z onto the sum. */
+void PC_PSMTXMultVecSR(const Mtx m, const Vec* src, Vec* dst) {
+  const f32 x = src->x, y = src->y, z = src->z;
+  Vec r;
+  r.x = ppc_fmadds(m[0][2], z, m[0][0] * x + m[0][1] * y);
+  r.y = ppc_fmadds(m[1][2], z, m[1][0] * x + m[1][1] * y);
+  r.z = ppc_fmadds(m[2][2], z, m[2][0] * x + m[2][1] * y);
+  *dst = r;
 }
