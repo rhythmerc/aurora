@@ -164,6 +164,8 @@ if (AURORA_ENABLE_GX)
   target_link_libraries(render_worker_tests PRIVATE
     gtest
     gtest_main
+    fmt::fmt
+    xxHash::xxhash
     Tracy::TracyClient
     ${AURORA_SDL3_TARGET}
   )
