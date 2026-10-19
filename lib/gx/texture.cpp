@@ -170,6 +170,7 @@ struct HashMemoEntry {
   uint64_t fingerprint;
   uint64_t checkedFrame; // s_frameCount when last checked
   uint64_t checkedGen;   // s_hashMemoGen when last checked
+  uint64_t checkedVersion; // the caller's version when last checked (TLUT loads)
 };
 absl::flat_hash_map<HashMemoKey, HashMemoEntry> s_hashMemo;
 uint64_t s_hashMemoMismatches = 0;
@@ -187,7 +188,11 @@ uint64_t texture_fingerprint(const void* data, size_t bytes) {
   return XXH3_64bits_withSeed(gathered.data(), gathered.size(), bytes);
 }
 
-XXH128_hash_t memo_hash(const void* data, size_t bytes) {
+// `version`: a caller's own change counter for the data (a TLUT's
+// tlutDataVersion, bumped by every GXLoadTlut). A new one rechecks the entry
+// even within a frame: a palette rewritten and reloaded mid-frame kept its
+// old hash.
+XXH128_hash_t memo_hash(const void* data, size_t bytes, uint64_t version = 0) {
   static const bool on = [] {
     const char* v = std::getenv("AURORA_TEX_HASH_MEMO");
     return v == nullptr || *v != '0';
@@ -202,7 +207,7 @@ XXH128_hash_t memo_hash(const void* data, size_t bytes) {
   auto it = s_hashMemo.find(key);
   if (it != s_hashMemo.end()) {
     auto& e = it->second;
-    if (e.checkedFrame != s_frameCount || e.checkedGen != s_hashMemoGen) {
+    if (e.checkedFrame != s_frameCount || e.checkedGen != s_hashMemoGen || e.checkedVersion != version) {
       const uint64_t fp = texture_fingerprint(data, bytes);
       if (fp != e.fingerprint) {
         e.hash = XXH3_128bits(data, bytes);
@@ -211,13 +216,14 @@ XXH128_hash_t memo_hash(const void* data, size_t bytes) {
       }
       e.checkedFrame = s_frameCount;
       e.checkedGen = s_hashMemoGen;
+      e.checkedVersion = version;
     }
     if (check && !XXH128_isEqual(e.hash, XXH3_128bits(data, bytes)) && ++s_hashMemoMismatches <= 8)
       Log.warn("Texture hash memo: stale entry ({} bytes)", bytes);
     return e.hash;
   }
   const XXH128_hash_t h = XXH3_128bits(data, bytes);
-  s_hashMemo.emplace(key, HashMemoEntry{h, texture_fingerprint(data, bytes), s_frameCount, s_hashMemoGen});
+  s_hashMemo.emplace(key, HashMemoEntry{h, texture_fingerprint(data, bytes), s_frameCount, s_hashMemoGen, version});
   s_stats.hashedBytes += bytes;
   return h;
 }
@@ -744,7 +750,7 @@ TextureKeys hash_texture_source_impl(const GXTexObj_& obj, const GXTlutObj_* tlu
   if (tlut != nullptr) {
     const size_t tlutBytes = texture::tlut_source_size(tlut->numEntries);
     CHECK(tlut->data != nullptr && tlutBytes != 0, "invalid TLUT source for content hash");
-    keys.contentKey.tlutHash = memo_hash(tlut->data, tlutBytes);
+    keys.contentKey.tlutHash = memo_hash(tlut->data, tlutBytes, tlut->tlutDataVersion);
     keys.contentKey.tlutFormat = static_cast<u32>(tlut->format);
     keys.contentKey.tlutEntries = tlut->numEntries;
 
