@@ -1,4 +1,3 @@
-#include <dolphin/ppc_math.h>
 #include <dolphin/mtx.h>
 
 #include <assert.h>
@@ -616,72 +615,4 @@ void C_MTXLightOrtho(Mtx m, f32 t, f32 b, f32 l, f32 r, f32 scaleS, f32 scaleT, 
   m[2][1] = 0;
   m[2][2] = 0;
   m[2][3] = 1;
-}
-
-/* PSMTXConcat as the paired-single code on the disc computes it
- * (0x80342204): each element of ab's row i a ps_muls0 then two ps_madds
- * (fused) down b's column, a*b ordered as the instructions have them, and
- * the translation column adding a's own last (a ps_madds1 by 1.0: a plain
- * add). All of a and b is read before ab is written, so ab may alias
- * either. */
-void PC_PSMTXConcat(const Mtx a, const Mtx b, Mtx ab) {
-  Mtx r;
-  for (int i = 0; i < 3; i++) {
-    for (int j = 0; j < 4; j++) {
-      const f32 t = ppc_fmadds(b[2][j], a[i][2], ppc_fmadds(b[1][j], a[i][1], b[0][j] * a[i][0]));
-      /* the last ps_madds1 runs over columns 2 and 3 by (0.0, 1.0): 0 *
-       * a[i][3] onto column 2 (which can only change a zero's sign) */
-      r[i][j] = j == 3 ? a[i][3] + t : j == 2 ? ppc_fmadds(0.0f, a[i][3], t) : t;
-    }
-  }
-  for (int i = 0; i < 3; i++)
-    for (int j = 0; j < 4; j++)
-      ab[i][j] = r[i][j];
-}
-
-/* PSMTXQuat as the paired-single code on the disc computes it (0x80342690):
- * 2/|q|^2 from fres and one Newton step (not a division), the sums paired
- * as the instructions pair them. Each line is one instruction, both slots
- * of a register written out; ps_ fused ops round once (Dolphin's). */
-void PC_PSMTXQuat(Mtx m, const Quaternion* q) {
-  const f32 x = q->x, y = q->y, z = q->z, w = q->w;
-  /* f6 = ps_mul q.xy*q.xy; f9 = merge10 (y, x) */
-  const f32 f6a = x * x, f6b = y * y;
-  /* f8 = ps_madd q.zw*q.zw + f6 */
-  f32 f8a = ppc_fmadds(z, z, f6a), f8b = ppc_fmadds(w, w, f6b);
-  /* f7 = ps_mul q.zw*q.zw */
-  f32 f7a = z * z;
-  /* f3 = ps_sum0 f8: |q|^2 */
-  const f32 n = f8a + f8b;
-  /* f10 = ps_muls1 (y, x) * w */
-  const f32 f10a = y * w, f10b = x * w;
-  /* f11 = fres n; f8 = ps_sum1 (f8a, f7a + f6b) */
-  const f32 est = (f32)ppc_fres(n);
-  f8b = f7a + f6b;
-  /* f3 = ps_nmsub -(n*est - 2); f3 = est * f3; f3 = fmuls f3 * 2 */
-  const f32 s = (est * ppc_fnmsubs(n, est, 2.0f)) * 2.0f;
-  /* f7 = ps_muls1 (z, w) * w */
-  const f32 f7a2 = z * w, f7b2 = w * w;
-  /* f6 = ps_sum0: xx + yy */
-  const f32 f6s = f6a + f6b;
-  /* f11 = ps_madd (x, y)*(y, x) + f7; f7 = ps_msub likewise */
-  const f32 f11a = ppc_fmadds(x, y, f7a2), f11b = ppc_fmadds(y, x, f7b2);
-  const f32 f7ma = ppc_fmsubs(x, y, f7a2), f7mb = ppc_fmsubs(y, x, f7b2);
-  /* f6 = ps_nmsub -(f6*s - 1); f8 likewise */
-  const f32 m22 = ppc_fnmsubs(f6s, s, 1.0f);
-  const f32 m11 = ppc_fnmsubs(f8a, s, 1.0f), m00 = ppc_fnmsubs(f8b, s, 1.0f);
-  (void)f11b;
-  /* f11 = ps_mul f11*s; f7 = ps_mul f7*s */
-  const f32 m10 = f11a * s, m01 = f7ma * s;
-  (void)f7mb;
-  /* f9 = ps_madds0 (x, y)*z + f10 */
-  const f32 f9a = ppc_fmadds(x, z, f10a), f9b = ppc_fmadds(y, z, f10b);
-  /* f10 = ps_nmsub -(f10*2 - f9) */
-  const f32 f10na = ppc_fnmsubs(f10a, 2.0f, f9a), f10nb = ppc_fnmsubs(f10b, 2.0f, f9b);
-  /* f9 = ps_mul f9*s; f10 = ps_mul f10*s */
-  const f32 m02 = f9a * s, m21 = f9b * s;
-  const f32 m20 = f10na * s, m12 = f10nb * s;
-  m[0][0] = m00; m[0][1] = m01; m[0][2] = m02; m[0][3] = 0.0f;
-  m[1][0] = m10; m[1][1] = m11; m[1][2] = m12; m[1][3] = 0.0f;
-  m[2][0] = m20; m[2][1] = m21; m[2][2] = m22; m[2][3] = 0.0f;
 }

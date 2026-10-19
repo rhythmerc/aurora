@@ -35,10 +35,6 @@ typedef struct {
 void C_MTXIdentity(Mtx m);
 void C_MTXCopy(const Mtx src, Mtx dst);
 void C_MTXConcat(const Mtx a, const Mtx b, Mtx ab);
-/* PSMTXConcat as the disc computes it (0x80342204), on every platform. */
-void PC_PSMTXConcat(const Mtx a, const Mtx b, Mtx ab);
-/* PSMTXQuat as the disc computes it (0x80342690), on every platform. */
-void PC_PSMTXQuat(Mtx m, const Quaternion* q);
 void C_MTXConcatArray(const Mtx a, const Mtx* srcBase, Mtx* dstBase, u32 count);
 void C_MTXTranspose(const Mtx src, Mtx xPose);
 u32 C_MTXInverse(const Mtx src, Mtx inv);
@@ -73,7 +69,7 @@ u32 PSMTXInvXpose(const Mtx src, Mtx invX);
 #else
 #define MTXIdentity C_MTXIdentity
 #define MTXCopy C_MTXCopy
-#define MTXConcat PC_PSMTXConcat
+#define MTXConcat C_MTXConcat
 #define MTXConcatArray C_MTXConcatArray
 #define MTXTranspose C_MTXTranspose
 #define MTXInverse C_MTXInverse
@@ -81,10 +77,6 @@ u32 PSMTXInvXpose(const Mtx src, Mtx invX);
 #endif
 
 void C_MTXMultVec(const Mtx m, const Vec* src, Vec* dst);
-/* PSMTXMultVec and PSMTXMultVecSR as the disc computes them (0x80342AA8,
- * 0x80342AFC), on every platform. */
-void PC_PSMTXMultVec(const Mtx m, const Vec* src, Vec* dst);
-void PC_PSMTXMultVecSR(const Mtx m, const Vec* src, Vec* dst);
 void C_MTXMultVecArray(const Mtx m, const Vec* srcBase, Vec* dstBase, u32 count);
 void C_MTXMultVecSR(const Mtx m, const Vec* src, Vec* dst);
 void C_MTXMultVecArraySR(const Mtx m, const Vec* srcBase, Vec* dstBase, u32 count);
@@ -124,12 +116,9 @@ void PSMTXROMultS16VecArray(const ROMtx m, const S16Vec* srcBase, Vec* dstBase, 
 #define MTXROSkin2VecArray PSMTXROSkin2VecArray
 #define MTXROMultS16VecArray PSMTXROMultS16VecArray
 #else // MTX_USE_C
-/* The game's calls compute as the disc's paired-single code does
- * (lib/dolphin/mtx/mtx.c, mtxvec.c, vec.c): its release build maps these
- * names to the PS versions, which a Slippi peer runs in Dolphin. */
-#define MTXMultVec PC_PSMTXMultVec
+#define MTXMultVec C_MTXMultVec
 #define MTXMultVecArray C_MTXMultVecArray
-#define MTXMultVecSR PC_PSMTXMultVecSR
+#define MTXMultVecSR C_MTXMultVecSR
 #define MTXMultVecArraySR C_MTXMultVecArraySR
 
 #define MTXROMultVecArray C_MTXROMultVecArray
@@ -197,7 +186,7 @@ void PSMTXReorder(const Mtx src, ROMtx dest);
 #define MTXReorder C_MTXReorder
 
 #else // MTX_USE_C
-#define MTXQuat PC_PSMTXQuat
+#define MTXQuat C_MTXQuat
 #define MTXReflect C_MTXReflect
 #define MTXTrans C_MTXTrans
 #define MTXTransApply C_MTXTransApply
@@ -273,12 +262,8 @@ f32 PSVECDistance(const Vec* a, const Vec* b);
 #define PSVECAdd VECAdd
 #define PSVECSubtract VECSubtract
 #define PSVECScale VECScale
-/* The game's own PS calls compute as the disc's paired-single code does
- * (lib/dolphin/mtx/vec.c), fused where the C versions are not. */
-f32 PC_PSVECDotProduct(const Vec* a, const Vec* b);
-void PC_PSVECCrossProduct(const Vec* a, const Vec* b, Vec* axb);
-#define PSVECDotProduct PC_PSVECDotProduct
-#define PSVECCrossProduct PC_PSVECCrossProduct
+#define PSVECDotProduct VECDotProduct
+#define PSVECCrossProduct VECCrossProduct
 #endif
 
 #if defined(MTX_USE_PS)
@@ -293,15 +278,14 @@ void PC_PSVECCrossProduct(const Vec* a, const Vec* b, Vec* axb);
 #define VECSquareDistance PSVECSquareDistance
 #define VECDistance PSVECDistance
 #else // MTX_USE_C
-/* As the matrix ones above: the PS computations, as on the disc. */
 #define VECAdd C_VECAdd
 #define VECSubtract C_VECSubtract
 #define VECScale C_VECScale
-#define VECNormalize PSVECNormalize
-#define VECSquareMag PSVECSquareMag
-#define VECMag PSVECMag
-#define VECDotProduct PC_PSVECDotProduct
-#define VECCrossProduct PC_PSVECCrossProduct
+#define VECNormalize C_VECNormalize
+#define VECSquareMag C_VECSquareMag
+#define VECMag C_VECMag
+#define VECDotProduct C_VECDotProduct
+#define VECCrossProduct C_VECCrossProduct
 #define VECSquareDistance C_VECSquareDistance
 #define VECDistance C_VECDistance
 #endif
