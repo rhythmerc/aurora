@@ -37,6 +37,8 @@ void C_MTXCopy(const Mtx src, Mtx dst);
 void C_MTXConcat(const Mtx a, const Mtx b, Mtx ab);
 /* PSMTXConcat as the disc computes it (0x80342204), on every platform. */
 void PC_PSMTXConcat(const Mtx a, const Mtx b, Mtx ab);
+/* PSMTXQuat as the disc computes it (0x80342690), on every platform. */
+void PC_PSMTXQuat(Mtx m, const Quaternion* q);
 void C_MTXConcatArray(const Mtx a, const Mtx* srcBase, Mtx* dstBase, u32 count);
 void C_MTXTranspose(const Mtx src, Mtx xPose);
 u32 C_MTXInverse(const Mtx src, Mtx inv);
@@ -195,7 +197,7 @@ void PSMTXReorder(const Mtx src, ROMtx dest);
 #define MTXReorder C_MTXReorder
 
 #else // MTX_USE_C
-#define MTXQuat C_MTXQuat
+#define MTXQuat PC_PSMTXQuat
 #define MTXReflect C_MTXReflect
 #define MTXTrans C_MTXTrans
 #define MTXTransApply C_MTXTransApply
