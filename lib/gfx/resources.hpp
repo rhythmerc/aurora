@@ -7,14 +7,17 @@ inline constexpr bool UseTextureBuffer = true;
 /* These pools are non-owning views onto the mapped staging buffer, so
  * overflowing one is a hard abort, not a realloc. */
 #if defined(__ANDROID__)
-// melee-pc's Quest sizes, kept until Strikers is measured there
-// (STRIKERS_LOG_GPUMEM). The XR eye replay and SpaceWarp's motion pass add
-// uniforms and decoded vertices on top of the flat frame's: Melee's busiest
-// frames reached 24 MiB of uniforms, 1 MiB of indices and 4 MiB of storage.
+// melee-pc's Quest sizes, but storage. The XR eye replay and SpaceWarp's motion
+// pass add uniforms and decoded vertices on top of the flat frame's: Melee's
+// busiest frames reached 24 MiB of uniforms, 1 MiB of indices and 4 MiB of
+// storage. Strikers' first match frames need 16.8 MiB of storage on the Quest
+// even flat (the CPU vertex decode Android turns on: 11.8 MiB with it on
+// desktop against 7.5 without), an abort at 16, so 32. Only the used part is
+// copied each frame; the rest costs host memory, 4 staging slots of it.
 inline constexpr uint64_t UniformBufferSize = 25165824; // 24 MiB
 inline constexpr uint64_t VertexBufferSize = 4194304;   // 4 MiB
 inline constexpr uint64_t IndexBufferSize = 4194304;    // 4 MiB
-inline constexpr uint64_t StorageBufferSize = 16777216; // 16 MiB
+inline constexpr uint64_t StorageBufferSize = 33554432; // 32 MiB
 inline constexpr uint64_t TextureUploadSize = 12582912; // 12 MiB
 #else
 // smstrikers-port: sized from this game's measured peaks rather than upstream's
