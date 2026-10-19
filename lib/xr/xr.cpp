@@ -8616,6 +8616,13 @@ void dynres_predict(const std::array<DynresCost, kDynresLevels>& costs, uint64_t
     out[i] = sw > 0 ? w * costs[i].ns + (1 - w) * fit : 0;
   }
 }
+
+// The GPU time one display frame leaves a frame of ours, for a game drawing every display frame.
+double display_frame_budget_ns(double headroomNs) {
+  const float hz = g_displayHz > 0.f ? g_displayHz.load() : 90.f;
+  const float compositorMs = g_compositorGpuMs > 0.f ? g_compositorGpuMs.load() : 2.3f;
+  return 1.0e9 / hz - compositorMs * 1.0e6 - headroomNs;
+}
 } // namespace
 
 void update_dynamic_resolution(bool missed) {
@@ -8694,12 +8701,19 @@ void update_dynamic_resolution(bool missed) {
           const float compositorMs = g_compositorGpuMs > 0.f ? g_compositorGpuMs.load() : 2.4f;
           const double budget = 1.0e9 / 60.0 - compositorMs * 1.0e6 * refresh / 60.0 - dr.headroomNs;
           dr.targetNs = std::clamp(std::min(dr.targetNs, budget), 3.0e6, 20.0e6);
+        } else if (g_displayPerGameFrame == 0) {
+          // A game on its own timer, drawing a frame per display frame (smstrikers-port at 72 or
+          // 90 Hz): the span is how late frames have been coming, so a slow stretch would raise
+          // its own budget. The budget is a display frame less the compositor's share.
+          dr.targetNs = std::clamp(std::min(dr.targetNs, display_frame_budget_ns(dr.headroomNs)), 3.0e6, 20.0e6);
         }
       } else if (dr.spanNs == 0) {
         // Until margins come in: what a game frame leaves us on the GPU.
         const float hz = g_displayHz > 0.f ? g_displayHz.load() : 120.f;
         const float compositorMs = g_compositorGpuMs > 0.f ? g_compositorGpuMs.load() : 2.3f;
-        dr.targetNs = std::clamp(1.0e9 / 60.0 - compositorMs * 1.0e6 * hz / 60.0 - dr.headroomNs, 5.0e6, 16.0e6);
+        dr.targetNs = g_displayPerGameFrame == 0
+                          ? std::clamp(display_frame_budget_ns(dr.headroomNs), 3.0e6, 16.0e6)
+                          : std::clamp(1.0e9 / 60.0 - compositorMs * 1.0e6 * hz / 60.0 - dr.headroomNs, 5.0e6, 16.0e6);
       }
     }
     // Shaders compiling (a stage's first fight of the session) stall the
@@ -8908,8 +8922,11 @@ void update_dynamic_resolution(bool missed) {
     }
     if (next > dr.level && !back)
       next = std::min(next, std::max(ceiling, dr.level));
-    // Below 1.0 only while SpaceWarp is on (see minScale).
-    const int floor = appsw_on() ? 0 : std::max(static_cast<int>((1.f - dr.minScale) / kDynresStep + 0.5f), 0);
+    // Below 1.0 only while SpaceWarp is on (see minScale), or for a game drawing every display
+    // frame on its own timer, which has no repeated frame to fall back on: less resolution is its
+    // only way to keep up.
+    const bool belowNative = appsw_on() || g_displayPerGameFrame == 0;
+    const int floor = belowNative ? 0 : std::max(static_cast<int>((1.f - dr.minScale) / kDynresStep + 0.5f), 0);
     next = std::clamp(next, std::min(floor, levels - 1), levels - 1);
     if (next != dr.level) {
       dr.level = next;
