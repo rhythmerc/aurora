@@ -8915,7 +8915,10 @@ void update_dynamic_resolution(bool missed) {
             next = i;
             break;
           }
-      } else if (++dr.sinceStep >= kDynresUpDwell && dr.level + 1 < levels && (dr.haveMargin || dr.fixedTarget) &&
+      } else if (++dr.sinceStep >= kDynresUpDwell && dr.level + 1 < levels &&
+                 // The margins come from lock-step pacing's probe; a game on its own timer has none,
+                 // and its target is a display frame's budget from the start.
+                 (dr.haveMargin || dr.fixedTarget || g_displayPerGameFrame == 0) &&
                  predicted[dr.level + 1] <= dr.targetNs) {
         next = dr.level + 1;
       }
