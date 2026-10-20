@@ -2632,6 +2632,50 @@ fn fs_main(in: VertexOutput) -> {10} {{{6}{5}{11}
                                   "    return (f32(m) + 0.5) / 16.0;\n}\n\n");
         }
       }
+      // Fog in the eyes, from the game camera's depth as the flat frame has it
+      // (in.pos.z there), not the eye's: the eye's depth runs from a near
+      // plane in metres to infinity, so the game's fog constants gave nothing
+      // like its fog (smstrikers-port's stadiums). Range adjustment indexed
+      // its table by the fragment's column, which in an eye is the eye's
+      // (wider than the table, reading past it): the eyes go without it.
+      if (motion == 0 && (shaderSource.find("// Perspective fog") != std::string::npos ||
+                          shaderSource.find("// Orthographic fog") != std::string::npos)) {
+        const std::string vsHead = "struct VertexOutput {";
+        const auto v0 = shaderSource.find(vsHead);
+        const auto v1 = v0 == std::string::npos ? v0 : shaderSource.find("};", v0);
+        const auto vsAt = shaderSource.find("fn vs_main(");
+        const auto retAt = vsAt == std::string::npos ? vsAt : shaderSource.find("return out;", vsAt);
+        int loc = -1;
+        if (v1 != std::string::npos)
+          for (size_t at = shaderSource.find("@location(", v0); at != std::string::npos && at < v1;
+               at = shaderSource.find("@location(", at + 1))
+            loc = std::max(loc, std::atoi(shaderSource.c_str() + at + 10));
+        if (v1 == std::string::npos || retAt == std::string::npos || loc + 1 >= 16) {
+          static bool warned = false;
+          if (!warned) {
+            warned = true;
+            Log.warn("XR fog: no room for the game camera's depth (anchors {}, last location {}); eye depth used",
+                     v1 != std::string::npos && retAt != std::string::npos, loc);
+          }
+        } else {
+          const std::string_view eyeDepth = UseReversedZ ? "(1.0 - in.pos.z)" : "in.pos.z";
+          const std::string_view gameDepth = UseReversedZ ? "(1.0 - in.xr_fogz)" : "in.xr_fogz";
+          const auto f0 = shaderSource.find("fn fs_main(");
+          for (size_t at = shaderSource.find(eyeDepth, f0); f0 != std::string::npos && at != std::string::npos;
+               at = shaderSource.find(eyeDepth, at)) {
+            shaderSource.replace(at, eyeDepth.size(), gameDepth);
+            at += gameDepth.size();
+          }
+          const std::string_view range = "\n        fogBase *= bitcast<f32>(abuf[imm.fog_range_base + u32(in.pos.x)]);";
+          if (const auto at = shaderSource.find(range); at != std::string::npos)
+            shaderSource.erase(at, range.size());
+          shaderSource.insert(retAt, "out.xr_fogz = xr_game_z(xr_cam);\n    ");
+          shaderSource.insert(v1, fmt::format("    @location({}) xr_fogz: f32,\n", loc + 1));
+          shaderSource.insert(v0, "fn xr_game_z(p: vec3f) -> f32 {\n"
+                                  "    let c = vec4f(p, 1.0) * ubuf.proj;\n"
+                                  "    return c.z / c.w;\n}\n\n");
+        }
+      }
       // Application SpaceWarp motion vectors: the position as last frame's
       // matrices put it next to this frame's, both clip space, divided per
       // fragment; the fragment stage is replaced by one that writes their
@@ -2810,26 +2854,32 @@ fn fs_main(in: VertexOutput) -> {10} {{{6}{5}{11}
                             "\n    xr_uword = xr_batch[xr_r + 16u];"
                             "\n    let vidx = xr_vi - xr_vbase;");
         shaderSource.replace(shaderSource.find(vtxParam), vtxParam.size(), "@builtin(vertex_index) xr_vi: u32");
-        // Position matrices are the first 10 of postex_mtx (word 20 of the
-        // uniform: viewport sizes and proj before them), normal ones follow
-        // all 20 postex matrices (word 260); texture matrices are shared.
+        // Position matrices are the first MaxPnMtx of postex_mtx (word 20 of
+        // the uniform: viewport sizes and proj before them), normal ones
+        // follow all MaxPnMtx + MaxTexMtx postex matrices; texture matrices
+        // are shared. From the constants, not Melee's 10 and 20: Strikers
+        // has 13 position matrices, and a normal matrix read from texture
+        // matrix words lit Mario Stadium's pitch navy.
+        constexpr uint32_t kNrmWord = 20 + (MaxPnMtx + MaxTexMtx) * 12;
         shaderSource.replace(shaderSource.find(immDecl), immDecl.size(),
-                             "struct XrBatchImm { table: u32, count: u32, fog_range_base: u32, _pad: u32 };"
+                             fmt::format(
+                             "struct XrBatchImm {{ table: u32, count: u32, fog_range_base: u32, _pad: u32 }};"
                              "\nvar<immediate> xr_bimm: XrBatchImm;"
                              "\nvar<private> imm: Immediate;"
                              "\nvar<private> xr_uword: u32;"
                              "\n@group(0) @binding(2)\nvar<storage, read> xr_batch: array<u32>;"
                              "\n@group(0) @binding(3)\nvar<storage, read> xr_ubufs: array<u32>;"
-                             "\nfn xr_mtx(w: u32) -> mat3x4f {"
+                             "\nfn xr_mtx(w: u32) -> mat3x4f {{"
                              "\n    return mat3x4f(bitcast<vec4f>(vec4u(xr_ubufs[w], xr_ubufs[w + 1u], xr_ubufs[w + 2u], xr_ubufs[w + 3u])),"
                              "\n                   bitcast<vec4f>(vec4u(xr_ubufs[w + 4u], xr_ubufs[w + 5u], xr_ubufs[w + 6u], xr_ubufs[w + 7u])),"
                              "\n                   bitcast<vec4f>(vec4u(xr_ubufs[w + 8u], xr_ubufs[w + 9u], xr_ubufs[w + 10u], xr_ubufs[w + 11u])));"
-                             "\n}"
-                             "\nfn xr_postex(i: u32) -> mat3x4f {"
-                             "\n    if (i < 10u) { return xr_mtx(xr_uword + 20u + i * 12u); }"
+                             "\n}}"
+                             "\nfn xr_postex(i: u32) -> mat3x4f {{"
+                             "\n    if (i < {0}u) {{ return xr_mtx(xr_uword + 20u + i * 12u); }}"
                              "\n    return ubuf.postex_mtx[i];"
-                             "\n}"
-                             "\nfn xr_nrm(i: u32) -> mat3x4f { return xr_mtx(xr_uword + 260u + i * 12u); }");
+                             "\n}}"
+                             "\nfn xr_nrm(i: u32) -> mat3x4f {{ return xr_mtx(xr_uword + {1}u + i * 12u); }}",
+                             MaxPnMtx, kNrmWord));
       }
     }
     for (const std::string_view var : {"mv_pos_a", "mv_pos_b", "mv_pos"}) {
