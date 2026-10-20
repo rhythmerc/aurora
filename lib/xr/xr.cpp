@@ -404,9 +404,6 @@ Footprint g_footprint;
 // Set by the game every fight frame (aurora_xr_set_paused): the fight is
 // paused, so the controllers point and grab instead of playing.
 std::atomic<bool> g_fightPaused{false};
-// Set by the game (aurora_xr_set_menus): it is in its menus, with no fight
-// loaded, so the dev tools panel shows beside the screen.
-std::atomic<bool> g_inMenus{false};
 // Set by the game (aurora_xr_set_placing): the fight is held before it
 // starts for placing the stage. 0 no; 1 with the legend; 2 with the cards.
 std::atomic<int> g_placing{0};
@@ -2785,10 +2782,18 @@ void set_arena_pose(const ArenaPose& a) {
 }
 
 // What the lasers can grab, in game units around the arena center (the game
-// point placed at the arena position, aurora_xr_set_stage): wider and
-// taller than any stage's main platform, so pointing near it is enough.
+// point placed at the arena position, aurora_xr_set_stage): by default
+// wider and taller than any of Melee's main platforms, so pointing near it
+// is enough; the game's own for the stage (aurora_xr_set_grab_box), which a
+// hand inside it touches instead of pointing. Under g_arenaMutex.
 constexpr XrVector3f kGrabBoxMin{-120.f, -80.f, -60.f};
 constexpr XrVector3f kGrabBoxMax{120.f, 100.f, 60.f};
+XrVector3f g_grabBoxMin = kGrabBoxMin, g_grabBoxMax = kGrabBoxMax;
+
+std::pair<XrVector3f, XrVector3f> grab_box() {
+  std::lock_guard lock{g_arenaMutex};
+  return {g_grabBoxMin, g_grabBoxMax};
+}
 // Meters per game unit: Final Destination from about 25 cm to 8.5 m wide.
 constexpr float kMinArenaScale = 0.0015f, kMaxArenaScale = 0.05f;
 
@@ -2799,8 +2804,8 @@ XrVector3f to_game(const ArenaPose& a, XrVector3f p) { return rot_y(p - a.pos, -
 
 bool in_grab_box(const ArenaPose& a, XrVector3f p) {
   const XrVector3f g = to_game(a, p);
-  return g.x >= kGrabBoxMin.x && g.x <= kGrabBoxMax.x && g.y >= kGrabBoxMin.y && g.y <= kGrabBoxMax.y &&
-         g.z >= kGrabBoxMin.z && g.z <= kGrabBoxMax.z;
+  const auto [lo, hi] = grab_box();
+  return g.x >= lo.x && g.x <= hi.x && g.y >= lo.y && g.y <= hi.y && g.z >= lo.z && g.z <= hi.z;
 }
 
 // Distance along the ray (meters) to the arena's grab box, or -1 for a miss.
@@ -2808,8 +2813,9 @@ float hit_arena(const ArenaPose& a, XrVector3f origin, XrVector3f dir) {
   const XrVector3f o = to_game(a, origin);
   const XrVector3f d = rot_y(dir, -a.yaw) * (1.f / a.scale);
   const float os[3] = {o.x, o.y, o.z}, ds[3] = {d.x, d.y, d.z};
-  const float lo[3] = {kGrabBoxMin.x, kGrabBoxMin.y, kGrabBoxMin.z};
-  const float hi[3] = {kGrabBoxMax.x, kGrabBoxMax.y, kGrabBoxMax.z};
+  const auto [boxLo, boxHi] = grab_box();
+  const float lo[3] = {boxLo.x, boxLo.y, boxLo.z};
+  const float hi[3] = {boxHi.x, boxHi.y, boxHi.z};
   float t0 = -1e30f, t1 = 1e30f;
   for (int i = 0; i < 3; ++i) {
     if (std::abs(ds[i]) < 1e-9f) {
@@ -3691,19 +3697,22 @@ void add_screen_bar(PointerLayers& out) {
 }
 
 // `onTargetOnly`: skip the hands that neither point at the target nor hold
-// it. Adds to what `out` has.
-void build_pointer_layers(PointerLayers& out, bool onTargetOnly = false) {
+// it; `panelOnly`: skip all but those on the dev tools panel. Adds to what
+// `out` has.
+void build_pointer_layers(PointerLayers& out, bool onTargetOnly = false, bool panelOnly = false) {
   if (!B.beamSwapchain || !B.dotSwapchain)
     return;
   for (int h = 0; h < 2; ++h) {
     const Hand& hand = G.hands[h];
-    if (!hand.valid || (onTargetOnly && !hand.engaged && !hand.clicking && !hand.inside && hand.hit < 0.f))
+    if (!hand.valid || (onTargetOnly && !hand.engaged && !hand.clicking && !hand.inside && hand.hit < 0.f) ||
+        (panelOnly && !hand.onPanel))
       continue;
     const XrColor4f color = hand.engaged                     ? XrColor4f{1.f, 0.8f, 0.3f, 1.f}
                             : hand.clicking                  ? XrColor4f{1.f, 1.f, 1.f, 1.f}
                             : hand.inside || hand.hit >= 0.f ? XrColor4f{0.45f, 0.85f, 1.f, 1.f}
                                                              : XrColor4f{0.85f, 0.9f, 1.f, 0.5f};
-    if (hand.engaged ? hand.direct : hand.inside) {
+    // A laser on the panel shows, though the hand is in the arena's box.
+    if (!hand.onPanel && (hand.engaged ? hand.direct : hand.inside)) {
       // In the box: a dot at the touch point, facing the head.
       const XrVector3f dz = vnorm(B.head - hand.touch);
       const XrVector3f dx = vnorm(vcross({0.f, 1.f, 0.f}, dz));
@@ -5883,12 +5892,12 @@ void build_placing_layers(PlacingLayers& out, int mode) {
 
 // ---------------------------------------------------------------- XR thread: the dev tools panel
 //
-// For tuning and A/Bs on the headset (AURORA_XR_DEV_TOOLS=1, a debug aid):
-// while a fight is paused, in 3D or on the virtual screen, and in the game's
-// menus (aurora_xr_set_menus), a panel floats beside the screen or, in 3D,
-// to the right of where the head looked as it opened, with a page per tab.
-// A laser on the panel and the trigger (a pinch for a tracked hand) pick a
-// tab or a choice and drag a slider; Reset gives the page's settings back as
+// For tuning and A/Bs on the headset (AURORA_XR_DEV_TOOLS=1, a debug aid): a
+// panel floats beside the screen (or, if it first shows with a fight in 3D,
+// right of where the head looked), with a page per tab, always there. A
+// laser on it shows, in play too, and the trigger (a pinch for a tracked
+// hand) picks a tab or a choice and drags a slider, instead of pressing L
+// or R; Reset gives the page's settings back as
 // they were without it. It moves as the screen does: a controller's grip
 // with its laser on it, or the bar under it pointed at or touched and held
 // with a grip, trigger or pinch; the other hand pressing on it as well
@@ -6115,18 +6124,22 @@ struct DevMix {
 } g_devMix;
 std::atomic<bool> g_devMixListening{false}; // the panel shows its Stage page
 
-// The Game page's options (aurora_xr_dev_option_add); each one's choice, which
-// the game reads (aurora_xr_dev_option), apart for a cheap read.
+// The Game page's rows: options (aurora_xr_dev_option_add) and sliders
+// (aurora_xr_dev_slider_add); each one's value (a choice's index, or the
+// slider's), which the game reads (aurora_xr_dev_option, _slider), apart for
+// a cheap read.
 struct DevOption {
   std::string name;
-  std::vector<std::string> choices;
-  int initial = 0;
+  std::vector<std::string> choices; // none: a slider
+  float initial = 0.f;
+  float min = 0.f, max = 1.f, step = 0.f;
+  bool slider() const { return choices.empty(); }
 };
 struct DevOptions {
   std::mutex mutex;
   std::vector<DevOption> options;
 } g_devOptions;
-std::array<std::atomic<int>, AURORA_XR_DEV_OPTIONS> g_devOptionValue{};
+std::array<std::atomic<float>, AURORA_XR_DEV_OPTIONS> g_devOptionValue{};
 std::atomic<bool> g_devOptionsAdded{false}; // since the panel last looked: it draws again
 
 bool dev_tools_wanted() {
@@ -6320,10 +6333,24 @@ void draw_game(Canvas& c) {
     c.text(18, kAudioRowY0 + 10, 3, "NOTHING ON THE PANEL YET.", dim);
     return;
   }
+  const Rgba lit{120, 200, 255, 255};
   for (int row = 0; row < static_cast<int>(options.size()); ++row) {
+    const DevOption& o = options[row];
     const int y = kAudioRowY0 + row * kAudioRowStep;
-    c.text(18, y + 4, 3, options[row].name, P.hover == kOption + row ? text : dim);
-    draw_choices(c, y, options[row].choices, g_devOptionValue[row].load(std::memory_order_relaxed));
+    const int target = kOption + row;
+    const float v = g_devOptionValue[row].load(std::memory_order_relaxed);
+    c.text(18, y + 4, 3, o.name, target == P.active ? lit : target == P.hover ? text : dim);
+    if (!o.slider()) {
+      draw_choices(c, y, o.choices, static_cast<int>(v));
+      continue;
+    }
+    const float t = std::clamp((v - o.min) / (o.max - o.min), 0.f, 1.f);
+    const int kx = kTrackX0 + static_cast<int>(std::lround(t * (kTrackX1 - kTrackX0)));
+    c.fill(kTrackX0, y + 10, kTrackX1, y + kTrackH - 10, {52, 56, 68, 255});
+    c.fill(kTrackX0, y + 10, kx, y + kTrackH - 10, {70, 110, 150, 255});
+    c.fill(kx - 6, y - 9, kx + 6, y + kTrackH + 9, {10, 10, 12, 255});
+    c.fill(kx - 3, y - 6, kx + 3, y + kTrackH + 6, target == P.active ? lit : Rgba{250, 250, 250, 255});
+    c.text(kTrackX1 + 22, y + 4, 3, fmt::format("{:.2f}", v), text);
   }
 }
 
@@ -6625,8 +6652,33 @@ void audio_choose(int row, float px) {
 void option_log(int option) {
   std::lock_guard lock{g_devOptions.mutex};
   const DevOption& o = g_devOptions.options[option];
-  const int v = g_devOptionValue[option].load(std::memory_order_relaxed);
-  Log.info("Dev tools: {} = {}", o.name, o.choices[v]);
+  const float v = g_devOptionValue[option].load(std::memory_order_relaxed);
+  if (o.slider())
+    Log.info("Dev tools: {} = {:.2f}", o.name, v);
+  else
+    Log.info("Dev tools: {} = {}", o.name, o.choices[static_cast<int>(v)]);
+}
+
+bool option_is_slider(int option) {
+  std::lock_guard lock{g_devOptions.mutex};
+  return option >= 0 && option < static_cast<int>(g_devOptions.options.size()) &&
+         g_devOptions.options[option].slider();
+}
+
+// Dragging a Game slider to px.
+void option_drag(int option, float px) {
+  std::lock_guard lock{g_devOptions.mutex};
+  if (option >= static_cast<int>(g_devOptions.options.size()))
+    return;
+  const DevOption& o = g_devOptions.options[option];
+  const float t = std::clamp((px - kTrackX0) / static_cast<float>(kTrackX1 - kTrackX0), 0.f, 1.f);
+  float v = o.min + t * (o.max - o.min);
+  if (o.step > 0.f)
+    v = std::clamp(o.min + std::round((v - o.min) / o.step) * o.step, o.min, o.max);
+  if (v != g_devOptionValue[option].load(std::memory_order_relaxed)) {
+    g_devOptionValue[option].store(v, std::memory_order_relaxed);
+    P.dirty = true;
+  }
 }
 
 // A press on a Game option's row at px: picks the choice under it.
@@ -6637,8 +6689,9 @@ void option_choose(int option, float px) {
       return;
     const int n = static_cast<int>(g_devOptions.options[option].choices.size());
     const int w = (kChoiceX1 - kTrackX0) / n;
-    g_devOptionValue[option].store(std::clamp(static_cast<int>((px - kTrackX0) / static_cast<float>(w)), 0, n - 1),
-                                   std::memory_order_relaxed);
+    g_devOptionValue[option].store(
+        static_cast<float>(std::clamp(static_cast<int>((px - kTrackX0) / static_cast<float>(w)), 0, n - 1)),
+        std::memory_order_relaxed);
   }
   P.dirty = true;
   option_log(option);
@@ -6694,6 +6747,10 @@ void mix_drag(int target, float px, float py) {
 void panel_drag(int target, float px, float py) {
   if (target == kMixLevel || target == kMixGraph || target == kMixQ) {
     mix_drag(target, px, py);
+    return;
+  }
+  if (target >= kOption && target < kOption + AURORA_XR_DEV_OPTIONS) {
+    option_drag(target - kOption, px);
     return;
   }
   const float t = std::clamp((px - kTrackX0) / static_cast<float>(kTrackX1 - kTrackX0), 0.f, 1.f);
@@ -6763,6 +6820,8 @@ void panel_released() {
     audio_log();
   else if (P.active == kMixLevel || P.active == kMixGraph || P.active == kMixQ)
     mix_log();
+  else if (P.active >= kOption && P.active < kOption + AURORA_XR_DEV_OPTIONS)
+    option_log(P.active - kOption);
 }
 
 // The bar under the panel, in its frame (meters), as the screen's.
@@ -7009,14 +7068,16 @@ void update_dev_panel(bool show, bool tintUsable, bool besideScreen) {
       P.dirty = true;
     } else if (panel_pressed(hand) && target == kAudio + kSpatial) {
       audio_choose(target - kAudio, px);
-    } else if (panel_pressed(hand) && target >= kOption && target < kOption + AURORA_XR_DEV_OPTIONS) {
+    } else if (panel_pressed(hand) && target >= kOption && target < kOption + AURORA_XR_DEV_OPTIONS &&
+               !option_is_slider(target - kOption)) {
       option_choose(target - kOption, px);
     } else if (panel_pressed(hand) && target >= kMixChan && target < kMixChan + AURORA_XR_MIX_CHANNELS) {
       P.mixChannel = target - kMixChan;
       P.dirty = true;
     } else if (panel_pressed(hand) &&
                (target == kAudio + kMusic || target == kMixLevel || target == kMixGraph || target == kMixQ ||
-                (target >= 0 && target < kSliders)) &&
+                (target >= 0 && target < kSliders) ||
+                (target >= kOption && target < kOption + AURORA_XR_DEV_OPTIONS)) &&
                P.active < 0) {
       if (target == kMixGraph)
         mix_grab(px, py);
@@ -7409,11 +7470,9 @@ bool render_xr_frame() {
   const bool pointing = fight && held && B.focused;
   const bool screenPointing = screenShown && B.focused;
   locate_hands(fs.predictedDisplayTime);
-  // The dev tools panel, in a paused fight, in 3D or on the screen, and in
-  // the menus.
+  // The dev tools panel, whatever shows, but for the hold before a fight.
   const bool roomWanted = B.passthroughLayer && B.passthroughRunning && g_passthroughWanted;
-  update_dev_panel(dev_tools_wanted() && placing == 0 && B.focused &&
-                       ((g_fightPaused && (fight || screenShown)) || (g_inMenus && screenShown)),
+  update_dev_panel(dev_tools_wanted() && placing == 0 && B.focused && (fight || screenShown),
                    roomWanted && B.hasColorLutExt, screenShown);
   update_grab(fight ? Target::Arena : Target::Screen, pointing || screenPointing);
   if (const int h = dev_panel_reel_hand(); h >= 0)
@@ -7574,7 +7633,7 @@ bool render_xr_frame() {
       add_panel_bar(pointers);
     }
     if (pointing || onPanel) {
-      build_pointer_layers(pointers);
+      build_pointer_layers(pointers, false, !pointing);
       for (uint32_t i = 0; i < pointers.count; ++i)
         layers[layerCount++] = reinterpret_cast<const XrCompositionLayerBaseHeader*>(&pointers.quads[i]);
     }
@@ -10354,7 +10413,6 @@ extern "C" bool aurora_xr_screen_back(void) {
 }
 
 extern "C" void aurora_xr_set_paused(bool paused) { aurora::xr::g_fightPaused = paused; }
-extern "C" void aurora_xr_set_menus(bool menus) { aurora::xr::g_inMenus = menus; }
 
 extern "C" void aurora_xr_set_placing(int mode) { aurora::xr::g_placing = mode; }
 
@@ -10465,29 +10523,65 @@ extern "C" bool aurora_xr_dev_audio(AuroraXrDevAudio* audio) {
   return true;
 }
 
-extern "C" int aurora_xr_dev_option_add(const char* name, int count, const char* const choices[], int initial) {
-  using namespace aurora::xr;
-  if (!dev_tools_wanted() || count < 1)
+namespace aurora::xr {
+int add_dev_option(DevOption o) {
+  if (!dev_tools_wanted())
     return -1;
   std::lock_guard lock{g_devOptions.mutex};
   const int option = static_cast<int>(g_devOptions.options.size());
   if (option >= AURORA_XR_DEV_OPTIONS)
     return -1;
-  DevOption o;
-  o.name = name;
-  for (int i = 0; i < std::min(count, static_cast<int>(AURORA_XR_DEV_CHOICES)); ++i)
-    o.choices.emplace_back(choices[i]);
-  o.initial = std::clamp(initial, 0, static_cast<int>(o.choices.size()) - 1);
   g_devOptionValue[option].store(o.initial, std::memory_order_relaxed);
   g_devOptions.options.push_back(std::move(o));
   g_devOptionsAdded.store(true, std::memory_order_relaxed);
   return option;
 }
+} // namespace aurora::xr
+
+extern "C" int aurora_xr_dev_option_add(const char* name, int count, const char* const choices[], int initial) {
+  using namespace aurora::xr;
+  if (count < 1)
+    return -1;
+  DevOption o;
+  o.name = name;
+  for (int i = 0; i < std::min(count, static_cast<int>(AURORA_XR_DEV_CHOICES)); ++i)
+    o.choices.emplace_back(choices[i]);
+  o.initial = static_cast<float>(std::clamp(initial, 0, static_cast<int>(o.choices.size()) - 1));
+  return add_dev_option(std::move(o));
+}
+
+extern "C" int aurora_xr_dev_slider_add(const char* name, float min, float max, float step, float initial) {
+  using namespace aurora::xr;
+  if (!(max > min))
+    return -1;
+  DevOption o;
+  o.name = name;
+  o.min = min;
+  o.max = max;
+  o.step = std::max(step, 0.f);
+  o.initial = std::clamp(initial, min, max);
+  return add_dev_option(std::move(o));
+}
 
 extern "C" int aurora_xr_dev_option(int option) {
   if (option < 0 || option >= AURORA_XR_DEV_OPTIONS)
     return -1;
+  return static_cast<int>(aurora::xr::g_devOptionValue[option].load(std::memory_order_relaxed));
+}
+
+extern "C" float aurora_xr_dev_slider(int option, float fallback) {
+  if (option < 0 || option >= AURORA_XR_DEV_OPTIONS)
+    return fallback;
   return aurora::xr::g_devOptionValue[option].load(std::memory_order_relaxed);
+}
+
+extern "C" void aurora_xr_set_grab_box(float xmin, float xmax, float ymin, float ymax, float zmin, float zmax) {
+  using namespace aurora::xr;
+  std::lock_guard lock{g_arenaMutex};
+  // From the stage's game coordinates to the box's, around the arena center.
+  const XrVector3f c{g_arenaCenter[0], g_arenaCenter[1], g_arenaCenter[2]};
+  g_grabBoxMin = XrVector3f{xmin, ymin, zmin} - c;
+  g_grabBoxMax = XrVector3f{xmax, ymax, zmax} - c;
 }
 
 extern "C" void aurora_xr_dev_mix_stage(int stage, int count, const char* const names[],
@@ -10549,6 +10643,8 @@ extern "C" void aurora_xr_set_stage(int stage, float x, float y, float z, float 
   g_stageZoom = 1.f;
   g_hudOnTop = false;
   g_footprint = {};
+  g_grabBoxMin = kGrabBoxMin;
+  g_grabBoxMax = kGrabBoxMax;
   init_arena();
   if (const auto it = g_stageArenas.find(stage); it != g_stageArenas.end()) {
     g_arena = it->second;

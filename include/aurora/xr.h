@@ -69,11 +69,6 @@ bool aurora_xr_pace_until(uint64_t count);
  * arena to move, turn and scale it instead of pressing Z. */
 void aurora_xr_set_paused(bool paused);
 
-/* Whether the game is in its menus, with no fight loaded. With dev tools
- * (AURORA_XR_DEV_TOOLS=1), their panel shows beside the screen there, for
- * settings to pick before a fight. Any thread; call whenever it changes. */
-void aurora_xr_set_menus(bool menus);
-
 /* The fight is held before it starts so the player can place the stage:
  * the hands grab the arena as in a pause. 0: not held; 1: held, showing
  * the button legend; 2: held, showing the how-to cards and the legend.
@@ -144,6 +139,11 @@ void aurora_xr_set_stage_top(float y);
  * any cuts). xmin >= xmax: none (a stage whose course slides through the
  * arena). aurora_xr_set_stage clears it. Any thread. */
 void aurora_xr_set_stage_footprint(float xmin, float xmax, float zmin, float zmax, float ybottom);
+/* The box the hands grab the current stage by, in its game units (as the
+ * footprint): a hand in it touches the stage rather than pointing, and a
+ * laser on it takes hold. Call after aurora_xr_set_stage; without it, a box
+ * sized for Melee's stages around the arena center. Any thread. */
+void aurora_xr_set_grab_box(float xmin, float xmax, float ymin, float ymax, float zmin, float zmax);
 
 /* The room's colour grade for the current stage's fights in mixed reality:
  * passthrough tinted toward the stage's palette, a gain per channel (linear
@@ -213,6 +213,13 @@ int aurora_xr_dev_option_add(const char* name, int count, const char* const choi
 /* The game: the choice picked for `option`, or -1 for -1. Any thread;
  * cheap. */
 int aurora_xr_dev_option(int option);
+/* A slider row on the Game page, from `min` to `max` in steps of `step`
+ * (0: smooth), `initial` at first and after Reset. Returns the row, for
+ * aurora_xr_dev_slider, or -1 as aurora_xr_dev_option_add. Any thread; once
+ * a slider. */
+int aurora_xr_dev_slider_add(const char* name, float min, float max, float step, float initial);
+/* The game: the slider's value, or `fallback` for -1. Any thread; cheap. */
+float aurora_xr_dev_slider(int option, float fallback);
 
 /* True while an OpenXR session is presenting the game. Any thread. */
 bool aurora_xr_active(void);
