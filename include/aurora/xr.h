@@ -198,6 +198,17 @@ bool aurora_xr_dev_mix(int stage, int channel, AuroraXrMixChannel* out);
  * duck what's being mixed. Any thread; cheap. */
 bool aurora_xr_dev_mix_listening(void);
 
+/* Dev tools' Game page: the game's own options, a row each, a name and up
+ * to AURORA_XR_DEV_CHOICES choices (upper case, short), `initial` picked
+ * at first and after Reset. Returns the option, for aurora_xr_dev_option;
+ * -1 without dev tools or past AURORA_XR_DEV_OPTIONS. Any thread; once an
+ * option. */
+enum { AURORA_XR_DEV_OPTIONS = 5, AURORA_XR_DEV_CHOICES = 4 };
+int aurora_xr_dev_option_add(const char* name, int count, const char* const choices[], int initial);
+/* The game: the choice picked for `option`, or -1 for -1. Any thread;
+ * cheap. */
+int aurora_xr_dev_option(int option);
+
 /* True while an OpenXR session is presenting the game. Any thread. */
 bool aurora_xr_active(void);
 /* For positional audio: the transform from the current stage's game world

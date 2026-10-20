@@ -3226,7 +3226,8 @@ void update_screen(bool active) {
     hand.on = Hand::On::None;
     float t;
     XrVector3f l;
-    if (hand.valid && !hand.inside && hit_screen_plane(screen, hand.origin, hand.dir, t, l)) {
+    // A laser on the dev tools panel is on it, not on the screen behind.
+    if (hand.valid && !hand.inside && !hand.onPanel && hit_screen_plane(screen, hand.origin, hand.dir, t, l)) {
       if (std::abs(l.x) <= hw && std::abs(l.y) <= hh) {
         hand.on = Hand::On::Picture;
         hand.u = l.x / (2.f * hw) + 0.5f;
@@ -5879,10 +5880,16 @@ void build_placing_layers(PlacingLayers& out, int mode) {
 // ---------------------------------------------------------------- XR thread: the dev tools panel
 //
 // For tuning and A/Bs on the headset (AURORA_XR_DEV_TOOLS=1, a debug aid):
-// while a fight is paused, a panel floats to the right of where the head
-// looked as the pause began, with a page per tab. A laser on the panel and
-// the trigger (a pinch for a tracked hand) pick a tab or a choice and drag
-// a slider; Reset gives the page's settings back as they were without it.
+// while a fight is paused, in 3D or on the virtual screen, a panel floats to
+// the right of where the head looked as the pause began, with a page per
+// tab. A laser on the panel and the trigger (a pinch for a tracked hand)
+// pick a tab or a choice and drag a slider; Reset gives the page's settings
+// back as they were without it. A page shows only with something on it: the
+// game's options, the room's grade on, audio settings or a stage's mixer
+// from the game.
+//
+// Game, the game's own options (aurora_xr_dev_option_add), a row of
+// choices each, which the game reads (aurora_xr_dev_option).
 //
 // Tint, in mixed reality with the room's grade on (AURORA_XR_GRADE=1): the
 // tint as a colour in HSL (hue, tint: its saturation, light: its lightness;
@@ -6020,8 +6027,8 @@ constexpr std::array<const char*, kSliders> kSliderNames{"HUE", "TINT", "LIGHT",
 constexpr std::array<float, kSliders> kSliderMax{360.f, 1.f, 1.f, 1.5f};
 
 // The pages, as tabs left of Reset.
-enum { kPageTint, kPageAudio, kPageMix, kPages };
-constexpr std::array<const char*, kPages> kPageNames{"TINT", "AUDIO", "STAGE"};
+enum { kPageGame, kPageTint, kPageAudio, kPageMix, kPages };
+constexpr std::array<const char*, kPages> kPageNames{"GAME", "TINT", "AUDIO", "STAGE"};
 constexpr int kTabX0 = 10, kTabW = 150, kTabGap = 10;
 
 // The Audio page: choices, a row each.
@@ -6044,14 +6051,15 @@ constexpr std::array<Rgba, AURORA_XR_MIX_BANDS> kBandColors{Rgba{255, 170, 80, 2
 
 // What's under a laser: a tint slider (kHue..kSat), an Audio row (kAudio +
 // row), a tab (kTab + page), Reset, a Stage channel (kMixChan + channel),
-// its level, its graph or its Q, or -1.
-constexpr int kAudio = 10, kTab = 20, kReset = 30, kMixChan = 40, kMixLevel = 50, kMixGraph = 51, kMixQ = 52;
+// its level, its graph or its Q, a Game option (kOption + option), or -1.
+constexpr int kAudio = 10, kTab = 20, kReset = 30, kMixChan = 40, kMixLevel = 50, kMixGraph = 51, kMixQ = 52,
+              kOption = 60;
 
 struct DevPanel {
   bool shown = false;
   XrPosef pose{{0.f, 0.f, 0.f, 1.f}, {}};
   float width = 0.36f;
-  int page = -1; // kPageTint or kPageAudio; -1 until first opened
+  int page = -1; // a kPage; -1 until first opened
   bool tintUsable = false; // the grade is on and the room shows
   int stage = -1;
   std::array<float, kSliders> value{0.f, 0.f, 1.f, 1.f};
@@ -6089,6 +6097,20 @@ struct DevMix {
   std::map<int, DevMixStage> stages;
 } g_devMix;
 std::atomic<bool> g_devMixListening{false}; // the panel shows its Stage page
+
+// The Game page's options (aurora_xr_dev_option_add); each one's choice, which
+// the game reads (aurora_xr_dev_option), apart for a cheap read.
+struct DevOption {
+  std::string name;
+  std::vector<std::string> choices;
+  int initial = 0;
+};
+struct DevOptions {
+  std::mutex mutex;
+  std::vector<DevOption> options;
+} g_devOptions;
+std::array<std::atomic<int>, AURORA_XR_DEV_OPTIONS> g_devOptionValue{};
+std::atomic<bool> g_devOptionsAdded{false}; // since the panel last looked: it draws again
 
 bool dev_tools_wanted() {
   static const bool on = [] {
@@ -6130,18 +6152,47 @@ void audio_log() {
   Log.info("Dev tools: audio: spatial {}, music {:.0f}%", a.spatial ? "on" : "off", a.music * 100.f);
 }
 
+// The pages with something on them, in tab order; the Game page when none
+// has, to say so.
+std::vector<int> shown_pages() {
+  std::vector<int> pages;
+  {
+    std::lock_guard lock{g_devOptions.mutex};
+    if (!g_devOptions.options.empty())
+      pages.push_back(kPageGame);
+  }
+  if (P.tintUsable)
+    pages.push_back(kPageTint);
+  {
+    std::lock_guard lock{g_devAudio.mutex};
+    if (g_devAudio.have)
+      pages.push_back(kPageAudio);
+  }
+  {
+    std::lock_guard lock{g_devMix.mutex};
+    if (!g_devMix.stages.empty())
+      pages.push_back(kPageMix);
+  }
+  if (pages.empty())
+    pages.push_back(kPageGame);
+  return pages;
+}
+
 void draw_header(Canvas& c) {
   const Rgba text{232, 236, 242, 255}, dim{150, 156, 168, 255};
-  for (int i = 0; i < kPages; ++i) {
-    const int x0 = kTabX0 + i * (kTabW + kTabGap);
-    const bool on = P.page == i;
+  const std::vector<int> pages = shown_pages();
+  for (size_t i = 0; i < pages.size(); ++i) {
+    const int page = pages[i];
+    const int x0 = kTabX0 + static_cast<int>(i) * (kTabW + kTabGap);
+    const bool on = P.page == page;
     c.fill(x0, kResetY0, x0 + kTabW, kResetY1,
-           on ? Rgba{70, 110, 150, 255} : P.hover == kTab + i ? Rgba{60, 66, 80, 255} : Rgba{36, 40, 50, 255});
-    const int w = static_cast<int>(std::strlen(kPageNames[i])) * 18 - 3;
-    c.text(x0 + (kTabW - w) / 2, kResetY0 + 11, 3, kPageNames[i], on ? text : dim);
+           on ? Rgba{70, 110, 150, 255} : P.hover == kTab + page ? Rgba{60, 66, 80, 255} : Rgba{36, 40, 50, 255});
+    const int w = static_cast<int>(std::strlen(kPageNames[page])) * 18 - 3;
+    c.text(x0 + (kTabW - w) / 2, kResetY0 + 11, 3, kPageNames[page], on ? text : dim);
   }
-  if (P.page == kPageTint)
-    c.text(kTabX0 + kPages * (kTabW + kTabGap) + 8, kResetY0 + 11, 3, fmt::format("0x{:02X}", P.stage), dim);
+  if (P.page == kPageTint && pages.size() <= 3)
+    c.text(kTabX0 + static_cast<int>(pages.size()) * (kTabW + kTabGap) + 8, kResetY0 + 11, 3,
+           fmt::format("0x{:02X}", P.stage), dim);
   c.fill(kResetX0, kResetY0, kResetX1, kResetY1, P.hover == kReset ? Rgba{70, 110, 150, 255} : Rgba{52, 56, 68, 255});
   c.text(kResetX0 + (kResetX1 - kResetX0 - 87) / 2, kResetY0 + 11, 3, "RESET", text);
 }
@@ -6226,6 +6277,37 @@ void draw_audio(Canvas& c) {
   }
   c.text(18, kAudioRowY0 + kAudioRows * kAudioRowStep + 10, 3, "SPATIAL OFF: EVERY SOUND PLAIN STEREO.", dim);
   c.text(18, kAudioRowY0 + kAudioRows * kAudioRowStep + 50, 3, "MUSIC: PERCENT OF ITS USUAL LEVEL.", dim);
+}
+
+// A row of choices at y from kTrackX0 to kChoiceX1, `chosen` lit.
+void draw_choices(Canvas& c, int y, const std::vector<std::string>& names, int chosen) {
+  const Rgba text{232, 236, 242, 255}, dim{150, 156, 168, 255};
+  const int n = std::max(static_cast<int>(names.size()), 1);
+  const int w = (kChoiceX1 - kTrackX0) / n;
+  for (int i = 0; i < static_cast<int>(names.size()); ++i) {
+    const int x0 = kTrackX0 + i * w;
+    c.fill(x0 + 2, y - 4, x0 + w - 2, y + kTrackH + 4, i == chosen ? Rgba{70, 110, 150, 255} : Rgba{36, 40, 50, 255});
+    const int tw = static_cast<int>(names[i].size()) * 18 - 3;
+    c.text(x0 + (w - tw) / 2, y + 4, 3, names[i], i == chosen ? text : dim);
+  }
+}
+
+void draw_game(Canvas& c) {
+  const Rgba text{232, 236, 242, 255}, dim{150, 156, 168, 255};
+  std::vector<DevOption> options;
+  {
+    std::lock_guard lock{g_devOptions.mutex};
+    options = g_devOptions.options;
+  }
+  if (options.empty()) {
+    c.text(18, kAudioRowY0 + 10, 3, "NOTHING ON THE PANEL YET.", dim);
+    return;
+  }
+  for (int row = 0; row < static_cast<int>(options.size()); ++row) {
+    const int y = kAudioRowY0 + row * kAudioRowStep;
+    c.text(18, y + 4, 3, options[row].name, P.hover == kOption + row ? text : dim);
+    draw_choices(c, y, options[row].choices, g_devOptionValue[row].load(std::memory_order_relaxed));
+  }
 }
 
 // The Stage page's scales.
@@ -6415,7 +6497,9 @@ void draw_panel(Canvas& c) {
   c.fill(0, 0, kPanelW, kPanelH, {18, 20, 26, 225});
   c.fill(0, 0, kPanelW, 3, {90, 96, 110, 255});
   draw_header(c);
-  if (P.page == kPageTint)
+  if (P.page == kPageGame)
+    draw_game(c);
+  else if (P.page == kPageTint)
     draw_tint(c);
   else if (P.page == kPageAudio)
     draw_audio(c);
@@ -6447,10 +6531,24 @@ int panel_target(float px, float py) {
   if (py >= kResetY0 && py < kResetY1) {
     if (px >= kResetX0 && px < kResetX1)
       return kReset;
-    for (int i = 0; i < kPages; ++i) {
-      const float x0 = static_cast<float>(kTabX0 + i * (kTabW + kTabGap));
+    const std::vector<int> pages = shown_pages();
+    for (size_t i = 0; i < pages.size(); ++i) {
+      const float x0 = static_cast<float>(kTabX0 + static_cast<int>(i) * (kTabW + kTabGap));
       if (px >= x0 && px < x0 + kTabW)
-        return kTab + i;
+        return kTab + pages[i];
+    }
+    return -1;
+  }
+  if (P.page == kPageGame) {
+    int count;
+    {
+      std::lock_guard lock{g_devOptions.mutex};
+      count = static_cast<int>(g_devOptions.options.size());
+    }
+    for (int row = 0; row < count; ++row) {
+      const float y = static_cast<float>(kAudioRowY0 + row * kAudioRowStep);
+      if (px >= kTrackX0 - 24 && px < kChoiceX1 && py >= y - 18 && py < y + kTrackH + 18)
+        return kOption + row;
     }
     return -1;
   }
@@ -6505,6 +6603,28 @@ void audio_choose(int row, float px) {
   }
   P.dirty = true;
   audio_log();
+}
+
+void option_log(int option) {
+  std::lock_guard lock{g_devOptions.mutex};
+  const DevOption& o = g_devOptions.options[option];
+  const int v = g_devOptionValue[option].load(std::memory_order_relaxed);
+  Log.info("Dev tools: {} = {}", o.name, o.choices[v]);
+}
+
+// A press on a Game option's row at px: picks the choice under it.
+void option_choose(int option, float px) {
+  {
+    std::lock_guard lock{g_devOptions.mutex};
+    if (option >= static_cast<int>(g_devOptions.options.size()))
+      return;
+    const int n = static_cast<int>(g_devOptions.options[option].choices.size());
+    const int w = (kChoiceX1 - kTrackX0) / n;
+    g_devOptionValue[option].store(std::clamp(static_cast<int>((px - kTrackX0) / static_cast<float>(w)), 0, n - 1),
+                                   std::memory_order_relaxed);
+  }
+  P.dirty = true;
+  option_log(option);
 }
 
 // A press on the Stage page's graph at px, py: grabs the nearest band's
@@ -6582,6 +6702,14 @@ void panel_drag(int target, float px, float py) {
 }
 
 void panel_reset() {
+  if (P.page == kPageGame) {
+    std::lock_guard lock{g_devOptions.mutex};
+    for (size_t i = 0; i < g_devOptions.options.size(); ++i)
+      g_devOptionValue[i].store(g_devOptions.options[i].initial, std::memory_order_relaxed);
+    P.dirty = true;
+    Log.info("Dev tools: the game's options back as they were");
+    return;
+  }
   if (P.page == kPageMix) {
     {
       std::lock_guard lock{g_devMix.mutex};
@@ -6632,6 +6760,8 @@ void update_dev_panel(bool show, bool tintUsable) {
     P.tintUsable = tintUsable;
     P.dirty = true;
   }
+  if (g_devOptionsAdded.exchange(false, std::memory_order_relaxed))
+    P.dirty = true;
   if (show && !P.shown) {
     // Opened: to the right of where the head looks, facing it.
     const XrVector3f fwd = qrot(B.headOrientation, {0.f, 0.f, -1.f});
@@ -6641,12 +6771,18 @@ void update_dev_panel(bool show, bool tintUsable) {
       std::sscanf(v, "%f,%f,%f,%f", &offset.x, &offset.y, &offset.z, &P.width);
     P.pose.position = B.head + rot_y(offset, std::atan2(-fwd.x, -fwd.z));
     P.pose.orientation = facing(P.pose.position, B.head);
-    if (P.page < 0)
-      P.page = tintUsable ? kPageTint : kPageAudio;
     P.dirty = true;
     std::lock_guard lock{g_grade.mutex};
     P.stage = g_grade.stage;
     panel_from_grade(g_grade.grade);
+  }
+  if (show) {
+    // Kept while it has something on it; otherwise the first that has.
+    const std::vector<int> pages = shown_pages();
+    if (std::find(pages.begin(), pages.end(), P.page) == pages.end()) {
+      P.page = pages.front();
+      P.dirty = true;
+    }
   }
   if (!show && P.active >= 0)
     panel_released();
@@ -6682,6 +6818,8 @@ void update_dev_panel(bool show, bool tintUsable) {
       P.dirty = true;
     } else if (panel_pressed(hand) && target == kAudio + kSpatial) {
       audio_choose(target - kAudio, px);
+    } else if (panel_pressed(hand) && target >= kOption && target < kOption + AURORA_XR_DEV_OPTIONS) {
+      option_choose(target - kOption, px);
     } else if (panel_pressed(hand) && target >= kMixChan && target < kMixChan + AURORA_XR_MIX_CHANNELS) {
       P.mixChannel = target - kMixChan;
       P.dirty = true;
@@ -6723,6 +6861,16 @@ bool build_dev_panel_layer(XrCompositionLayerQuad& q) {
   if (P.dirty && now - P.drawn >= std::chrono::milliseconds(50)) {
     Canvas c{kPanelW, kPanelH};
     draw_panel(c);
+    // AURORA_XR_DUMP: the panel as last drawn, over black.
+    if (!B.dumpDir.empty()) {
+      if (FILE* f = std::fopen((B.dumpDir + "/xr_panel.ppm").c_str(), "wb")) {
+        std::fprintf(f, "P6\n%d %d\n255\n", kPanelW, kPanelH);
+        for (size_t i = 0; i < c.px.size(); i += 4)
+          for (int ch = 0; ch < 3; ++ch)
+            std::fputc(c.px[i + ch] * c.px[i + 3] / 255, f);
+        std::fclose(f);
+      }
+    }
     if (P.image.swapchain)
       P.retired.emplace_back(P.image.swapchain, now);
     P.image.swapchain = XR_NULL_HANDLE;
@@ -7070,9 +7218,9 @@ bool render_xr_frame() {
   const bool pointing = fight && held && B.focused;
   const bool screenPointing = screenShown && B.focused;
   locate_hands(fs.predictedDisplayTime);
-  // The dev tools panel, in a paused fight.
+  // The dev tools panel, in a paused fight, in 3D or on the screen.
   const bool roomWanted = B.passthroughLayer && B.passthroughRunning && g_passthroughWanted;
-  update_dev_panel(dev_tools_wanted() && pointing && g_fightPaused && placing == 0,
+  update_dev_panel(dev_tools_wanted() && g_fightPaused && placing == 0 && B.focused && (fight || screenShown),
                    roomWanted && B.hasColorLutExt);
   update_grab(fight ? Target::Arena : Target::Screen, pointing || screenPointing);
   bool onPanel = false;
@@ -7086,7 +7234,7 @@ bool render_xr_frame() {
   const bool onScreen = screenPointing && std::any_of(G.hands.begin(), G.hands.end(), [](const Hand& h) {
                           return h.engaged || h.clicking || h.inside || h.hit >= 0.f;
                         });
-  B.pointerMode = pointing || onScreen;
+  B.pointerMode = pointing || onScreen || onPanel;
   // The triggers click the screen or the panel instead of pressing L and R.
   B.triggersClick = onScreen || onPanel;
   // The surface under the stage is measured while it's being placed: the
@@ -10113,6 +10261,31 @@ extern "C" bool aurora_xr_dev_audio(AuroraXrDevAudio* audio) {
     return false;
   *audio = g_devAudio.value;
   return true;
+}
+
+extern "C" int aurora_xr_dev_option_add(const char* name, int count, const char* const choices[], int initial) {
+  using namespace aurora::xr;
+  if (!dev_tools_wanted() || count < 1)
+    return -1;
+  std::lock_guard lock{g_devOptions.mutex};
+  const int option = static_cast<int>(g_devOptions.options.size());
+  if (option >= AURORA_XR_DEV_OPTIONS)
+    return -1;
+  DevOption o;
+  o.name = name;
+  for (int i = 0; i < std::min(count, static_cast<int>(AURORA_XR_DEV_CHOICES)); ++i)
+    o.choices.emplace_back(choices[i]);
+  o.initial = std::clamp(initial, 0, static_cast<int>(o.choices.size()) - 1);
+  g_devOptionValue[option].store(o.initial, std::memory_order_relaxed);
+  g_devOptions.options.push_back(std::move(o));
+  g_devOptionsAdded.store(true, std::memory_order_relaxed);
+  return option;
+}
+
+extern "C" int aurora_xr_dev_option(int option) {
+  if (option < 0 || option >= AURORA_XR_DEV_OPTIONS)
+    return -1;
+  return aurora::xr::g_devOptionValue[option].load(std::memory_order_relaxed);
 }
 
 extern "C" void aurora_xr_dev_mix_stage(int stage, int count, const char* const names[],
