@@ -69,6 +69,11 @@ bool aurora_xr_pace_until(uint64_t count);
  * arena to move, turn and scale it instead of pressing Z. */
 void aurora_xr_set_paused(bool paused);
 
+/* Whether the game is in its menus, with no fight loaded. With dev tools
+ * (AURORA_XR_DEV_TOOLS=1), their panel shows beside the screen there, for
+ * settings to pick before a fight. Any thread; call whenever it changes. */
+void aurora_xr_set_menus(bool menus);
+
 /* The fight is held before it starts so the player can place the stage:
  * the hands grab the arena as in a pause. 0: not held; 1: held, showing
  * the button legend; 2: held, showing the how-to cards and the legend.

@@ -404,6 +404,9 @@ Footprint g_footprint;
 // Set by the game every fight frame (aurora_xr_set_paused): the fight is
 // paused, so the controllers point and grab instead of playing.
 std::atomic<bool> g_fightPaused{false};
+// Set by the game (aurora_xr_set_menus): it is in its menus, with no fight
+// loaded, so the dev tools panel shows beside the screen.
+std::atomic<bool> g_inMenus{false};
 // Set by the game (aurora_xr_set_placing): the fight is held before it
 // starts for placing the stage. 0 no; 1 with the legend; 2 with the cards.
 std::atomic<int> g_placing{0};
@@ -3630,8 +3633,9 @@ bool create_pointer_textures() {
          create_static_swapchain(B.backSwapchain, kBackSize, kBackSize, back);
 }
 
-// a beam and a dot per hand, and the screen's bar and Back button
-constexpr size_t kMaxPointerLayers = 6;
+// a beam and a dot per hand, the screen's bar and Back button, the dev tools
+// panel's bar
+constexpr size_t kMaxPointerLayers = 7;
 
 struct PointerLayers {
   std::array<XrCompositionLayerQuad, kMaxPointerLayers> quads;
@@ -5880,11 +5884,15 @@ void build_placing_layers(PlacingLayers& out, int mode) {
 // ---------------------------------------------------------------- XR thread: the dev tools panel
 //
 // For tuning and A/Bs on the headset (AURORA_XR_DEV_TOOLS=1, a debug aid):
-// while a fight is paused, in 3D or on the virtual screen, a panel floats to
-// the right of where the head looked as the pause began, with a page per
-// tab. A laser on the panel and the trigger (a pinch for a tracked hand)
-// pick a tab or a choice and drag a slider; Reset gives the page's settings
-// back as they were without it. A page shows only with something on it: the
+// while a fight is paused, in 3D or on the virtual screen, and in the game's
+// menus (aurora_xr_set_menus), a panel floats beside the screen or, in 3D,
+// to the right of where the head looked as it opened, with a page per tab.
+// A laser on the panel and the trigger (a pinch for a tracked hand) pick a
+// tab or a choice and drag a slider; Reset gives the page's settings back as
+// they were without it. It moves as the screen does: a controller's grip
+// with its laser on it, or the bar under it pointed at or touched and held
+// with a grip, trigger or pinch; the other hand pressing on it as well
+// resizes it. Once moved it stays where it was put, for the session. A page shows only with something on it: the
 // game's options, the room's grade on, audio settings or a stage's mixer
 // from the game.
 //
@@ -6071,6 +6079,15 @@ struct DevPanel {
   float grabDx = 0.f, grabDy = 0.f; // from the laser to the grabbed handle, in pixels
   bool dirty = true;   // the picture needs drawing
   std::chrono::steady_clock::time_point drawn{};
+  // Moving it: the hand moving it alone (from the bar by touch, or along its
+  // laser at moveDist), or both hands resizing it from width0 and pos0 as
+  // their touch points spread from span0 about mid0.
+  bool placed = false; // moved by the player: it stays where they put it
+  int moveHand = -1;
+  bool moveDirect = false, sizing = false;
+  float moveDist = 0.f, span0 = 1.f, width0 = 0.36f;
+  XrVector3f moveOffset{}, mid0{}, pos0{};
+  bool barHover = false;
   PlacingImage image;
   std::deque<std::pair<XrSwapchain, std::chrono::steady_clock::time_point>> retired;
 } P;
@@ -6748,10 +6765,178 @@ void panel_released() {
     mix_log();
 }
 
+// The bar under the panel, in its frame (meters), as the screen's.
+BarRect panel_bar() {
+  const float hw = std::clamp(P.width * 0.1f, 0.05f, 0.2f);
+  const float hh = std::clamp(P.width * 0.008f, 0.005f, 0.012f);
+  return {-P.width * kPanelH / kPanelW * 0.5f - hh * 3.f, hw, hh};
+}
+
+// A point in the panel's frame on (or within 2 cm of) its bar.
+bool on_panel_bar(float x, float y) {
+  const BarRect b = panel_bar();
+  return std::abs(x) <= b.hw + 0.02f && std::abs(y - b.y) <= b.hh + 0.02f;
+}
+
+// A point in the room touching the bar: on it and within 5 cm of its plane.
+bool in_panel_bar_box(XrVector3f p) {
+  const XrVector3f l = qrot(qconj(P.pose.orientation), p - P.pose.position);
+  return on_panel_bar(l.x, l.y) && std::abs(l.z) <= 0.05f;
+}
+
+// Opening where the player hasn't put it: right of the screen, at a reading
+// distance along the head's line to there (beside the screen); or right of
+// where the head looks (AURORA_XR_DEV_TOOLS_POS), in 3D.
+void place_dev_panel(bool besideScreen) {
+  P.width = 0.36f;
+  if (besideScreen) {
+    const ScreenPose& s = screen_pose();
+    const XrVector3f edge = s.pos + qrot(s.orientation, {s.width * 0.5f, 0.f, 0.f});
+    const float d = std::min(vlen(s.pos - B.head), 0.7f);
+    // Turned right past the screen's edge by half the panel and a few cm.
+    const XrVector3f toEdge = vnorm(edge - B.head);
+    P.pose.position = B.head + rot_y(toEdge, -std::atan((P.width * 0.5f + 0.04f) / d)) * d;
+  } else {
+    const XrVector3f fwd = qrot(B.headOrientation, {0.f, 0.f, -1.f});
+    XrVector3f offset{0.3f, -0.15f, -0.55f};
+    if (const char* v = std::getenv("AURORA_XR_DEV_TOOLS_POS"))
+      std::sscanf(v, "%f,%f,%f,%f", &offset.x, &offset.y, &offset.z, &P.width);
+    P.pose.position = B.head + rot_y(offset, std::atan2(-fwd.x, -fwd.z));
+  }
+  P.pose.orientation = facing(P.pose.position, B.head);
+}
+
+void end_panel_move() {
+  if (P.moveHand < 0 && !P.sizing)
+    return;
+  P.moveHand = -1;
+  P.sizing = false;
+  P.placed = true;
+  Log.info("Dev tools panel placed at {:.2f},{:.2f},{:.2f}, width {:.2f} m", P.pose.position.x, P.pose.position.y,
+           P.pose.position.z, P.width);
+}
+
+void begin_panel_move(int h, float hit) {
+  const Hand& hand = G.hands[h];
+  P.moveHand = h;
+  P.sizing = false;
+  P.moveDirect = in_panel_bar_box(hand.touch);
+  P.moveDist = hit >= 0.f ? hit : std::max(vdot(P.pose.position - hand.origin, hand.dir), 0.1f);
+  P.moveOffset = P.pose.position - (P.moveDirect ? hand.touch : hand.origin + hand.dir * P.moveDist);
+}
+
+// Moving the panel, each display frame it shows, before its presses: takes
+// hold of it, moves or resizes it, lets go. A hand holding it is on it.
+void move_dev_panel() {
+  const auto down = [](const Hand& h) { return h.valid && (h.held || h.sel); };
+  const auto pressed = [](const Hand& h) { return h.valid && ((h.held && !h.wasHeld) || (h.sel && !h.wasSel)); };
+  const auto gripPressed = [](const Hand& h) { return h.valid && !h.tracked && h.held && !h.wasHeld; };
+  // What each hand's laser is on: the panel, its bar (or a touch on it).
+  std::array<float, 2> hit{-1.f, -1.f};
+  std::array<bool, 2> onFace{}, onBar{};
+  P.barHover = false;
+  for (int h = 0; h < 2; ++h) {
+    const Hand& hand = G.hands[h];
+    if (!hand.valid || hand.engaged)
+      continue;
+    float t, px, py;
+    if (in_panel_bar_box(hand.touch)) {
+      onBar[h] = true;
+      hit[h] = std::max(vdot(P.pose.position - hand.origin, hand.dir), 0.05f);
+    } else if (panel_ray(hand, t, px, py)) {
+      const float x = (px / kPanelW - 0.5f) * P.width, y = (0.5f - py / kPanelH) * P.width * kPanelH / kPanelW;
+      onFace[h] = px >= 0.f && px < kPanelW && py >= 0.f && py < kPanelH;
+      onBar[h] = on_panel_bar(x, y);
+      if (onFace[h] || onBar[h])
+        hit[h] = t;
+    }
+    P.barHover |= onBar[h];
+  }
+  // Letting go; with two, the other carries on alone.
+  if (P.sizing) {
+    const bool l = down(G.hands[0]), r = down(G.hands[1]);
+    if (l && !r)
+      begin_panel_move(0, -1.f);
+    else if (r && !l)
+      begin_panel_move(1, -1.f);
+    else if (!l && !r)
+      end_panel_move();
+  } else if (P.moveHand >= 0 && !down(G.hands[P.moveHand])) {
+    end_panel_move();
+  }
+  // Taking hold: the bar with anything, the panel with a controller's grip;
+  // the other hand, while one holds, pressing on either, to resize.
+  for (int h = 0; h < 2; ++h) {
+    if (P.activeHand == h || P.moveHand == h || P.sizing)
+      continue;
+    const Hand& hand = G.hands[h];
+    const bool take = (onBar[h] && pressed(hand)) || (onFace[h] && gripPressed(hand));
+    if (P.moveHand >= 0 && (onBar[h] || onFace[h]) && pressed(hand)) {
+      P.sizing = true;
+      P.moveHand = -1;
+      const XrVector3f l = G.hands[0].touch, r = G.hands[1].touch;
+      P.span0 = std::max(vlen(r - l), 0.05f);
+      P.mid0 = (l + r) * 0.5f;
+      P.width0 = P.width;
+      P.pos0 = P.pose.position;
+    } else if (P.moveHand < 0 && P.activeHand < 0 && take) {
+      begin_panel_move(h, hit[h]);
+    }
+  }
+  if (P.sizing) {
+    const XrVector3f l = G.hands[0].touch, r = G.hands[1].touch;
+    P.width = std::clamp(P.width0 * vlen(r - l) / P.span0, 0.15f, 1.5f);
+    P.pose.position = P.pos0 + ((l + r) * 0.5f - P.mid0);
+  } else if (P.moveHand >= 0) {
+    const Hand& hand = G.hands[P.moveHand];
+    if (!P.moveDirect && !hand.tracked) {
+      // The stick reels it along the laser, as the screen's.
+      static auto last = std::chrono::steady_clock::now();
+      const auto now = std::chrono::steady_clock::now();
+      const float dt = std::min(std::chrono::duration<float>(now - last).count(), 0.05f);
+      last = now;
+      const float y = B.stickY[P.moveHand];
+      if (std::abs(y) > 0.2f)
+        P.moveDist = std::clamp(P.moveDist * std::exp(y * dt * 0.7f), 0.2f, 4.f);
+    }
+    P.pose.position = (P.moveDirect ? hand.touch : hand.origin + hand.dir * P.moveDist) + P.moveOffset;
+  }
+  if (P.sizing || P.moveHand >= 0)
+    P.pose.orientation = facing(P.pose.position, B.head);
+  for (int h = 0; h < 2; ++h) {
+    Hand& hand = G.hands[h];
+    const bool holding = P.sizing || P.moveHand == h;
+    if (holding || onBar[h]) {
+      hand.onPanel = true;
+      hand.panelHit = holding && !P.sizing && !P.moveDirect ? P.moveDist : hit[h];
+    }
+  }
+}
+
+// The controller reeling the panel with its stick, or -1.
+int dev_panel_reel_hand() {
+  return P.shown && P.moveHand >= 0 && !P.moveDirect && !G.hands[P.moveHand].tracked ? P.moveHand : -1;
+}
+
+// The panel's bar: faint, brighter while a laser or hand is on it, tinted
+// while the panel is held.
+void add_panel_bar(PointerLayers& out) {
+  if (!B.barSwapchain || !P.shown)
+    return;
+  const BarRect b = panel_bar();
+  const bool held = P.moveHand >= 0 || P.sizing;
+  const XrColor4f color = held         ? XrColor4f{0.45f, 0.85f, 1.f, 1.f}
+                          : P.barHover ? XrColor4f{1.f, 1.f, 1.f, 0.95f}
+                                       : XrColor4f{0.85f, 0.88f, 0.92f, 0.55f};
+  add_pointer_quad(out, B.barSwapchain, kBarW, kBarH, P.pose.position + qrot(P.pose.orientation, {0.f, b.y, 0.f}),
+                   P.pose.orientation, {b.hw * 2.f, b.hh * 2.f}, color);
+}
+
 // Each display frame, before the arena's grab: shows the panel while `show`,
-// and points, presses and drags on it. Marks the hands on it (Hand::onPanel).
-// `tintUsable`: the room's grade is on and the room shows.
-void update_dev_panel(bool show, bool tintUsable) {
+// and moves it, points, presses and drags on it. Marks the hands on it
+// (Hand::onPanel). `tintUsable`: the room's grade is on and the room shows.
+// `besideScreen`: the screen shows, so it opens beside it.
+void update_dev_panel(bool show, bool tintUsable, bool besideScreen) {
   for (Hand& hand : G.hands) {
     hand.onPanel = false;
     hand.panelHit = -1.f;
@@ -6763,14 +6948,15 @@ void update_dev_panel(bool show, bool tintUsable) {
   if (g_devOptionsAdded.exchange(false, std::memory_order_relaxed))
     P.dirty = true;
   if (show && !P.shown) {
-    // Opened: to the right of where the head looks, facing it.
-    const XrVector3f fwd = qrot(B.headOrientation, {0.f, 0.f, -1.f});
-    XrVector3f offset{0.3f, -0.15f, -0.55f};
-    P.width = 0.36f;
-    if (const char* v = std::getenv("AURORA_XR_DEV_TOOLS_POS"))
-      std::sscanf(v, "%f,%f,%f,%f", &offset.x, &offset.y, &offset.z, &P.width);
-    P.pose.position = B.head + rot_y(offset, std::atan2(-fwd.x, -fwd.z));
-    P.pose.orientation = facing(P.pose.position, B.head);
+    if (!P.placed) {
+      place_dev_panel(besideScreen);
+      const ScreenPose& sp = screen_pose();
+      Log.info("Dev tools panel opened at {:.2f},{:.2f},{:.2f}, width {:.2f} m{}", P.pose.position.x,
+               P.pose.position.y, P.pose.position.z, P.width,
+               besideScreen ? fmt::format(", beside the screen at {:.2f},{:.2f},{:.2f}, width {:.2f} m", sp.pos.x,
+                                          sp.pos.y, sp.pos.z, sp.width)
+                            : std::string{});
+    }
     P.dirty = true;
     std::lock_guard lock{g_grade.mutex};
     P.stage = g_grade.stage;
@@ -6786,15 +6972,20 @@ void update_dev_panel(bool show, bool tintUsable) {
   }
   if (!show && P.active >= 0)
     panel_released();
-  if (!show)
+  if (!show) {
     P.active = P.activeHand = -1;
+    end_panel_move();
+  }
   P.shown = show;
   g_devMixListening.store(show && P.page == kPageMix, std::memory_order_relaxed);
   if (!show)
     return;
+  move_dev_panel();
   int hover = -1;
   for (int h = 0; h < 2; ++h) {
     Hand& hand = G.hands[h];
+    if (P.sizing || P.moveHand == h)
+      continue;
     float t, px, py;
     if (!panel_ray(hand, t, px, py))
       continue;
@@ -7218,11 +7409,15 @@ bool render_xr_frame() {
   const bool pointing = fight && held && B.focused;
   const bool screenPointing = screenShown && B.focused;
   locate_hands(fs.predictedDisplayTime);
-  // The dev tools panel, in a paused fight, in 3D or on the screen.
+  // The dev tools panel, in a paused fight, in 3D or on the screen, and in
+  // the menus.
   const bool roomWanted = B.passthroughLayer && B.passthroughRunning && g_passthroughWanted;
-  update_dev_panel(dev_tools_wanted() && g_fightPaused && placing == 0 && B.focused && (fight || screenShown),
-                   roomWanted && B.hasColorLutExt);
+  update_dev_panel(dev_tools_wanted() && placing == 0 && B.focused &&
+                       ((g_fightPaused && (fight || screenShown)) || (g_inMenus && screenShown)),
+                   roomWanted && B.hasColorLutExt, screenShown);
   update_grab(fight ? Target::Arena : Target::Screen, pointing || screenPointing);
+  if (const int h = dev_panel_reel_hand(); h >= 0)
+    B.reelHand = h;
   bool onPanel = false;
   for (Hand& hand : G.hands) {
     if (hand.onPanel) {
@@ -7374,9 +7569,11 @@ bool render_xr_frame() {
       for (uint32_t i = 0; i < placingLayers.count; ++i)
         layers[layerCount++] = reinterpret_cast<const XrCompositionLayerBaseHeader*>(&placingLayers.quads[i]);
     }
-    if (panel)
+    if (panel) {
       layers[layerCount++] = reinterpret_cast<const XrCompositionLayerBaseHeader*>(&panelQuad);
-    if (pointing) {
+      add_panel_bar(pointers);
+    }
+    if (pointing || onPanel) {
       build_pointer_layers(pointers);
       for (uint32_t i = 0; i < pointers.count; ++i)
         layers[layerCount++] = reinterpret_cast<const XrCompositionLayerBaseHeader*>(&pointers.quads[i]);
@@ -7394,6 +7591,10 @@ bool render_xr_frame() {
     screenQuad.pose = {pose.orientation, pose.pos};
     screenQuad.size = {pose.width, pose.width * screen_aspect()};
     layers[layerCount++] = reinterpret_cast<const XrCompositionLayerBaseHeader*>(&screenQuad);
+    if (panel) {
+      layers[layerCount++] = reinterpret_cast<const XrCompositionLayerBaseHeader*>(&panelQuad);
+      add_panel_bar(pointers);
+    }
     add_screen_bar(pointers);
     if (onScreen)
       build_pointer_layers(pointers, true);
@@ -10153,6 +10354,7 @@ extern "C" bool aurora_xr_screen_back(void) {
 }
 
 extern "C" void aurora_xr_set_paused(bool paused) { aurora::xr::g_fightPaused = paused; }
+extern "C" void aurora_xr_set_menus(bool menus) { aurora::xr::g_inMenus = menus; }
 
 extern "C" void aurora_xr_set_placing(int mode) { aurora::xr::g_placing = mode; }
 
