@@ -6194,6 +6194,9 @@ constexpr float kCapFighters = 0.7f;
 // user's STRENGTH put the level at 9.6 times the median with no light, 9.0
 // at 0.04, 8.1-8.4 at 0.12 and 7.6-7.7 at 0.16 (2026-10-21).
 constexpr float kCapMedian = 9.6f, kCapLightDim = 1.25f;
+// An unseen part takes its hemisphere's seen parts up to this times their
+// median (the rest are lights, not the room's surfaces).
+constexpr float kCapFillMax = 2.f;
 constexpr float kCapClipped = 0.02f, kCapClipBoost = 4.f;
 // Ambient capture: each part a running mean of about its last 600 samples.
 constexpr double kCapPartMax = 600.0;
@@ -6238,6 +6241,7 @@ struct {
   float seen = 0.f;   // the seen parts' mean luminance, in passthrough's scale (as display)
   float middle = 0.f; // and their median by solid angle
   float unclamped = 0.f; // the level before its clamp
+  std::array<std::array<float, 3>, 2> fill{}; // the unseen parts' colour (luminance 1), upper and lower
   // The light last made from them (made: any).
   bool made = false;
   std::array<std::array<float, 3>, 9> sh{};
@@ -6285,12 +6289,12 @@ void capture_make() {
   auto& c = g_capture;
   std::array<std::array<double, 3>, kCapCells> L{};
   std::array<bool, kCapCells> seen{};
-  // The parts' radiance, and the seen parts' mean by solid angle, upper and
-  // lower hemisphere.
+  // The parts' radiance, and each hemisphere's seen parts (luminance, solid
+  // angle, part).
   std::vector<std::array<double, 3>> P(kCapParts);
   std::vector<bool> partSeen(kCapParts);
-  std::array<double, 3> hemi[2]{};
-  double hemiW[2]{}, seenW = 0.0, seenLum = 0.0;
+  std::vector<std::tuple<double, double, int>> hemiParts[2];
+  double seenW = 0.0, seenLum = 0.0;
   std::vector<std::pair<double, double>> byLum; // the seen parts' luminance and solid angle
   for (int f = 0; f < kCapParts; ++f) {
     const auto& e = c.parts[f];
@@ -6300,21 +6304,60 @@ void capture_make() {
     float dw;
     const auto d = cap_dir(f, dw, kCapF);
     const int h = d[1] >= 0.f ? 0 : 1;
-    for (int k = 0; k < 3; ++k) {
+    for (int k = 0; k < 3; ++k)
       P[f][k] = (e[k] + e[4 + k]) / (e[3] + e[7]);
-      hemi[h][k] += P[f][k] * dw;
-    }
-    hemiW[h] += dw;
     seenW += dw;
     const double lum = 0.2126 * P[f][0] + 0.7152 * P[f][1] + 0.0722 * P[f][2];
     seenLum += lum * dw;
     byLum.emplace_back(lum, dw);
+    hemiParts[h].emplace_back(lum, dw, f);
   }
   if (!(seenW > 0.0))
     return;
-  for (int h = 0; h < 2; ++h)
+  // What unseen parts take: their hemisphere's seen surfaces, by solid angle,
+  // without its lights (parts over kCapFillMax times its median). A monitor
+  // filling the view ahead turned the whole room its blue, as if it lit
+  // every direction the camera hadn't seen (2026-10-22). A hemisphere
+  // unseen takes half the other's.
+  std::array<double, 3> hemi[2]{};
+  bool hemiSeen[2]{};
+  for (int h = 0; h < 2; ++h) {
+    auto& v = hemiParts[h];
+    if (v.empty())
+      continue;
+    std::sort(v.begin(), v.end());
+    double total = 0.0;
+    for (const auto& [lum, dw, f] : v)
+      total += dw;
+    double half = 0.5 * total, med = std::get<0>(v.back());
+    for (const auto& [lum, dw, f] : v)
+      if ((half -= dw) <= 0.0) {
+        med = lum;
+        break;
+      }
+    double w = 0.0;
+    for (const auto& [lum, dw, f] : v) {
+      if (lum > kCapFillMax * med)
+        break;
+      for (int k = 0; k < 3; ++k)
+        hemi[h][k] += P[f][k] * dw;
+      w += dw;
+    }
+    if (!(w > 0.0))
+      continue;
     for (int k = 0; k < 3; ++k)
-      hemi[h][k] = hemiW[h] > 0.0 ? hemi[h][k] / hemiW[h] : hemi[1 - h][k] / std::max(hemiW[1 - h], 1e-9) * 0.5;
+      hemi[h][k] /= w;
+    hemiSeen[h] = true;
+  }
+  for (int h = 0; h < 2; ++h)
+    if (!hemiSeen[h])
+      for (int k = 0; k < 3; ++k)
+        hemi[h][k] = hemi[1 - h][k] * 0.5;
+  for (int h = 0; h < 2; ++h) {
+    const double lum = 0.2126 * hemi[h][0] + 0.7152 * hemi[h][1] + 0.0722 * hemi[h][2];
+    for (int k = 0; k < 3; ++k)
+      c.fill[h][k] = static_cast<float>(lum > 0.0 ? hemi[h][k] / lum : 0.0);
+  }
   // The cells: their parts by solid angle, the unseen ones their hemisphere's.
   std::array<double, kCapCells> cellW{};
   c.seenAs = {};
@@ -11260,7 +11303,7 @@ void capture_log(const char* what, uint32_t frames) {
   Log.info("Room capture{}: {} frames, {:.0f}% of the room seen; lights {:.2f},{:.2f},{:.2f} from {:.2f},{:.2f},{:.2f} "
            "and {:.2f},{:.2f},{:.2f} from {:.2f},{:.2f},{:.2f} (placed: {}, {}; {} casts, {} hits kept, {} and {} "
            "near the lights); passthrough's up {:.4f}, seen {:.4f}, median {:.4f}, level {:.2f} ({:.2f} unclamped); "
-           "brightest cells (room x,y,z; times the mean):{}",
+           "unseen as {:.2f},{:.2f},{:.2f} above, {:.2f},{:.2f},{:.2f} below; brightest cells (room x,y,z; times the mean):{}",
            what, frames, c.coverage * 100.f, c.light[0][0], c.light[0][1], c.light[0][2], c.lightDir[0][0],
            c.lightDir[0][1], c.lightDir[0][2], c.light[1][0], c.light[1][1], c.light[1][2], c.lightDir[1][0],
            c.lightDir[1][1], c.lightDir[1][2],
@@ -11269,7 +11312,8 @@ void capture_log(const char* what, uint32_t frames) {
            c.lightAt[1] ? fmt::format("{:.2f},{:.2f},{:.2f}", c.lightPos[1][0], c.lightPos[1][1], c.lightPos[1][2])
                         : "no",
            c.casts, c.hits.size(), c.lightHits[0], c.lightHits[1], c.display, c.seen, c.middle, c.level,
-           c.unclamped, capture_brightest());
+           c.unclamped, c.fill[0][0], c.fill[0][1], c.fill[0][2], c.fill[1][0], c.fill[1][1], c.fill[1][2],
+           capture_brightest());
 }
 
 // XR thread, every frame: whether ambient capture may run (the menus, or
