@@ -6194,6 +6194,10 @@ constexpr float kCapFighters = 0.7f;
 // user's STRENGTH put the level at 9.6 times the median with no light, 9.0
 // at 0.04, 8.1-8.4 at 0.12 and 7.6-7.7 at 0.16 (2026-10-21).
 constexpr float kCapMedian = 9.6f, kCapLightDim = 1.25f;
+// The frames whose exposure sets the level: the camera's middle within 40
+// degrees of the stage, the closest 30, at least 10.
+constexpr float kCapStageCos = 0.766f;
+constexpr size_t kCapStageFrames = 30, kCapStageMinFrames = 10;
 // An unseen part takes its hemisphere's seen parts up to this times their
 // median (the rest are lights, not the room's surfaces).
 constexpr float kCapFillMax = 2.f;
@@ -6228,7 +6232,13 @@ struct {
   std::array<std::array<float, 4>, kCapCells> seenAs{};
   uint32_t frames = 0, sinceMade = 0;
   float exposure = -1.f, iso = -1.f;
-  std::vector<float> factors; // recent frames' exposure (ms) times ISO over 100
+  // Recent frames' exposure (ms) times ISO over 100, and where the head was
+  // and the camera looked (the capture's frame).
+  struct View {
+    float factor;
+    XrVector3f head, dir;
+  };
+  std::vector<View> views;
   // Depth hits (light_cast): direction from the head (unit), then the point;
   // the oldest replaced once full.
   std::vector<std::array<float, 6>> hits;
@@ -6241,6 +6251,12 @@ struct {
   float seen = 0.f;   // the seen parts' mean luminance, in passthrough's scale (as display)
   float middle = 0.f; // and their median by solid angle
   float unclamped = 0.f; // the level before its clamp
+  float radiance = 0.f, dim = 1.f; // the seen median's relative radiance, and the lights' dimming
+  // The stage the level was last made for (LOCAL), and from how many frames
+  // looking at it (0: all of them).
+  bool haveStage = false;
+  XrVector3f stageAt{};
+  int stageFrames = 0;
   std::array<std::array<float, 3>, 2> fill{}; // the unseen parts' colour (luminance 1), upper and lower
   // The light last made from them (made: any).
   bool made = false;
@@ -6282,6 +6298,54 @@ std::array<float, 3> cap_dir(int cell, float& dOmega, int n = kCapN) {
   const float r2 = 1.f + u * u + v * v;
   dOmega = (4.f / (n * n)) / (r2 * std::sqrt(r2));
   return d;
+}
+
+// The median exposure of the frames looking at the stage (LOCAL; null: of
+// all frames), as passthrough showed the room there: it shares the
+// camera's auto exposure, so a monitor or a window in view darkened both,
+// and the user plays looking at the stage, not at them (2026-10-22: a
+// capture looking at a monitor came out at level 0.45, too dark). The
+// closest kCapStageFrames within kCapStageCos; fewer than
+// kCapStageMinFrames, all of them. Under g_capture.mutex.
+float capture_factor_locked(const XrVector3f* stage, int* used = nullptr) {
+  auto& c = g_capture;
+  if (used)
+    *used = 0;
+  if (c.views.empty())
+    return 1.f;
+  std::vector<std::pair<float, float>> near; // cos, factor
+  if (stage) {
+    const XrVector3f s = rot_y(*stage - c.pos, -c.yaw);
+    for (const auto& v : c.views) {
+      const XrVector3f d = s - v.head;
+      const float n = std::sqrt(vdot(d, d));
+      if (n > 0.05f)
+        if (const float cs = vdot(d, v.dir) / n; cs > kCapStageCos)
+          near.emplace_back(cs, v.factor);
+    }
+  }
+  std::vector<float> f;
+  if (near.size() >= kCapStageMinFrames) {
+    const size_t k = std::min<size_t>(near.size(), kCapStageFrames);
+    std::partial_sort(near.begin(), near.begin() + k, near.end(), std::greater<>());
+    for (size_t i = 0; i < k; ++i)
+      f.push_back(near[i].second);
+    if (used)
+      *used = static_cast<int>(k);
+  } else {
+    for (const auto& v : c.views)
+      f.push_back(v.factor);
+  }
+  std::nth_element(f.begin(), f.begin() + f.size() / 2, f.end());
+  return f[f.size() / 2];
+}
+
+// The level, for the stage where it last was. Under g_capture.mutex.
+void capture_level_locked() {
+  auto& c = g_capture;
+  const float factor = capture_factor_locked(c.haveStage ? &c.stageAt : nullptr, &c.stageFrames);
+  c.unclamped = kCapMedian * c.dim * c.radiance * factor;
+  c.level = std::clamp(c.unclamped, 0.15f, 1.25f);
 }
 
 // The light from the cells so far (under g_capture.mutex).
@@ -6454,12 +6518,7 @@ void capture_make() {
     return;
   // Up-facing light 1; the level from passthrough's brightness.
   const double scale = 1.0 / upLum;
-  float median = 1.f;
-  if (!c.factors.empty()) {
-    std::vector<float> f = c.factors;
-    std::nth_element(f.begin(), f.begin() + f.size() / 2, f.end());
-    median = f[f.size() / 2];
-  }
+  const float median = capture_factor_locked(nullptr);
   c.display = static_cast<float>(upLum * median);
   c.seen = static_cast<float>(seenLum / seenW * median);
   std::sort(byLum.begin(), byLum.end());
@@ -6474,8 +6533,9 @@ void capture_make() {
   // the camera's view (it sees ~36 degrees up and down) moves the light
   // from above 3x, the room the same.
   const double lights = (lum_of(light[0]) + lum_of(light[1])) * scale;
-  c.unclamped = static_cast<float>(kCapMedian * std::max(1.0 - kCapLightDim * lights, 0.5) * c.middle);
-  c.level = std::clamp(c.unclamped, 0.15f, 1.25f);
+  c.radiance = static_cast<float>(middle);
+  c.dim = static_cast<float>(std::max(1.0 - kCapLightDim * lights, 0.5));
+  capture_level_locked();
   c.mean = static_cast<float>((0.2126 * sh[0][0] + 0.7152 * sh[0][1] + 0.0722 * sh[0][2] +
                                0.25 * (lum_of(light[0]) + lum_of(light[1]))) * scale);
   for (int k = 0; k < 9; ++k)
@@ -6529,7 +6589,7 @@ void capture_start() {
   g_capture.frames = g_capture.sinceMade = 0;
   g_capture.made = false;
   g_capture.coverage = 0.f;
-  g_capture.factors.clear();
+  g_capture.views.clear();
   g_capture.hits.clear();
   g_capture.casts = 0;
   g_capture.lightAt = {};
@@ -6619,6 +6679,12 @@ bool capture_light(std::array<std::array<float, 3>, 9>& sh, std::array<std::arra
   std::lock_guard lock{g_capture.mutex};
   if (!g_capture.made)
     return false;
+  // The stage moved (5 cm): the level from the frames looking at it there.
+  if (const XrVector3f d = stage - g_capture.stageAt; !g_capture.haveStage || vdot(d, d) > 0.0025f) {
+    g_capture.haveStage = true;
+    g_capture.stageAt = stage;
+    capture_level_locked();
+  }
   sh = g_capture.sh;
   dirs = g_capture.lightDir;
   // A light with a place: toward it from the stage, wherever the stage is.
@@ -11302,7 +11368,7 @@ void capture_log(const char* what, uint32_t frames) {
   auto& c = g_capture;
   Log.info("Room capture{}: {} frames, {:.0f}% of the room seen; lights {:.2f},{:.2f},{:.2f} from {:.2f},{:.2f},{:.2f} "
            "and {:.2f},{:.2f},{:.2f} from {:.2f},{:.2f},{:.2f} (placed: {}, {}; {} casts, {} hits kept, {} and {} "
-           "near the lights); passthrough's up {:.4f}, seen {:.4f}, median {:.4f}, level {:.2f} ({:.2f} unclamped); "
+           "near the lights); passthrough's up {:.4f}, seen {:.4f}, median {:.4f}, level {:.2f} ({:.2f} unclamped, exposure from {}); "
            "unseen as {:.2f},{:.2f},{:.2f} above, {:.2f},{:.2f},{:.2f} below; brightest cells (room x,y,z; times the mean):{}",
            what, frames, c.coverage * 100.f, c.light[0][0], c.light[0][1], c.light[0][2], c.lightDir[0][0],
            c.lightDir[0][1], c.lightDir[0][2], c.light[1][0], c.light[1][1], c.light[1][2], c.lightDir[1][0],
@@ -11312,7 +11378,8 @@ void capture_log(const char* what, uint32_t frames) {
            c.lightAt[1] ? fmt::format("{:.2f},{:.2f},{:.2f}", c.lightPos[1][0], c.lightPos[1][1], c.lightPos[1][2])
                         : "no",
            c.casts, c.hits.size(), c.lightHits[0], c.lightHits[1], c.display, c.seen, c.middle, c.level,
-           c.unclamped, c.fill[0][0], c.fill[0][1], c.fill[0][2], c.fill[1][0], c.fill[1][1], c.fill[1][2],
+           c.unclamped,
+           c.stageFrames > 0 ? fmt::format("{} frames looking at the stage", c.stageFrames) : "all frames", c.fill[0][0], c.fill[0][1], c.fill[0][2], c.fill[1][0], c.fill[1][1], c.fill[1][2],
            capture_brightest());
 }
 
@@ -11370,11 +11437,13 @@ extern "C" void aurora_xr_room_capture_camera(const float rotation[4], const flo
 extern "C" void aurora_xr_room_capture_frame(const float* rgb, int cols, int rows, float exposure_ms, float iso) {
   using namespace aurora::xr;
   XrQuaternionf head;
+  XrVector3f headAt;
   {
     std::lock_guard lock{g_viewMutex};
     if (!g_viewsValid)
       return;
     head = B.headOrientation;
+    headAt = B.head;
   }
   std::lock_guard lock{g_capture.mutex};
   auto& c = g_capture;
@@ -11433,9 +11502,15 @@ extern "C" void aurora_xr_room_capture_frame(const float* rgb, int cols, int row
              toRoom(0.f, c.h * 0.5f));
   }
   c.exposure = exposure_ms, c.iso = iso;
-  c.factors.push_back(exposure_ms * iso / 100.f);
-  if (c.factors.size() > 600)
-    c.factors.erase(c.factors.begin(), c.factors.begin() + 300);
+  {
+    const std::array<float, 3> mid{(c.sensorW * 0.5f - c.k[2]) / c.k[0], (c.sensorH * 0.5f - c.k[3]) / c.k[1], 1.f};
+    const auto d = rotate(head.x, head.y, head.z, head.w, rotate(-c.q[0], -c.q[1], -c.q[2], c.q[3], mid));
+    const float n = std::sqrt(d[0] * d[0] + d[1] * d[1] + d[2] * d[2]);
+    c.views.push_back({exposure_ms * iso / 100.f, rot_y(headAt - c.pos, -c.yaw),
+                       rot_y({d[0] / n, d[1] / n, d[2] / n}, -c.yaw)});
+  }
+  if (c.views.size() > 600)
+    c.views.erase(c.views.begin(), c.views.begin() + 300);
   ++c.frames;
   if (mode == 2)
     ++c.ambientFrames;
