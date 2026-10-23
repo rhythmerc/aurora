@@ -404,6 +404,9 @@ Footprint g_footprint;
 // Set by the game every fight frame (aurora_xr_set_paused): the fight is
 // paused, so the controllers point and grab instead of playing.
 std::atomic<bool> g_fightPaused{false};
+// And the match itself stopped (aurora_xr_set_match_stopped): a pause, not
+// Slippi's overlay.
+std::atomic<bool> g_matchStopped{false};
 // Set by the game (aurora_xr_set_placing): the fight is held before it
 // starts for placing the stage. 0 no; 1 with the legend; 2 with the cards.
 std::atomic<int> g_placing{0};
@@ -6193,7 +6196,22 @@ constexpr float kCapFighters = 0.7f;
 // own on top (as up 1: the sum of their luminance): six captures, where the
 // user's STRENGTH put the level at 9.6 times the median with no light, 9.0
 // at 0.04, 8.1-8.4 at 0.12 and 7.6-7.7 at 0.16 (2026-10-21).
-constexpr float kCapMedian = 9.6f, kCapLightDim = 1.25f;
+// Then 1.3 times that: the user's STRENGTH over a day of rooms (2026-10-22).
+constexpr float kCapMedian = 12.5f, kCapLightDim = 1.25f, kCapLevelMax = 1.6f;
+// A frame a bright light dominates (a monitor ahead in a lit room) exposed
+// passthrough darker than the room: its exposure counts as up to
+// kCapGlareMax brighter, by the square root of its mean over its mean
+// without the light (samples over twice the median). The user found such
+// a stage "a little too dark" at the frame's own exposure (2026-10-22).
+constexpr float kCapGlareMax = 1.4f;
+// The room changed (a light switched off): a frame whose samples, where
+// the capture has seen well (kCapChangeSeen samples a part), read
+// kCapChange times brighter or darker by their median, every frame for
+// kCapChangeNs (a hand before the camera passes sooner), starts the capture over, its parts and frames dropped (its depth
+// hits kept): the old light and the new would fight.
+constexpr double kCapChange = 3.0, kCapChangeSeen = 20.0;
+constexpr int64_t kCapChangeNs = 1'000'000'000;
+constexpr size_t kCapChangeMinSamples = 64;
 // The frames whose exposure sets the level: the camera's middle within 40
 // degrees of the stage, the closest 30, at least 10.
 constexpr float kCapStageCos = 0.766f;
@@ -6206,7 +6224,7 @@ constexpr float kCapClipped = 0.02f, kCapClipBoost = 4.f;
 constexpr double kCapPartMax = 600.0;
 constexpr int kRoomSourceCaptured = static_cast<int>(kRoomPresets.size()) + 1;
 
-struct {
+struct Capture {
   std::mutex mutex;
   bool requested = false;
   int64_t untilNs = 0; // steady clock; 0: not started (no head pose yet)
@@ -6235,8 +6253,9 @@ struct {
   // Recent frames' exposure (ms) times ISO over 100, and where the head was
   // and the camera looked (the capture's frame).
   struct View {
-    float factor;
+    float factor; // with the glare's (kCapGlareMax)
     XrVector3f head, dir;
+    float glare;
   };
   std::vector<View> views;
   // Depth hits (light_cast): direction from the head (unit), then the point;
@@ -6257,6 +6276,9 @@ struct {
   bool haveStage = false;
   XrVector3f stageAt{};
   int stageFrames = 0;
+  float stageGlare = 1.f; // the median glare of those frames
+  int64_t changedNs = 0;  // since when the room read changed (kCapChange); 0: it doesn't
+  std::array<float, 2> lightRange{}; // a placed light's distance from the head where it was seen
   std::array<std::array<float, 3>, 2> fill{}; // the unseen parts' colour (luminance 1), upper and lower
   // The light last made from them (made: any).
   bool made = false;
@@ -6307,13 +6329,15 @@ std::array<float, 3> cap_dir(int cell, float& dOmega, int n = kCapN) {
 // capture looking at a monitor came out at level 0.45, too dark). The
 // closest kCapStageFrames within kCapStageCos; fewer than
 // kCapStageMinFrames, all of them. Under g_capture.mutex.
-float capture_factor_locked(const XrVector3f* stage, int* used = nullptr) {
+float capture_factor_locked(const XrVector3f* stage, int* used = nullptr, float* glare = nullptr) {
   auto& c = g_capture;
   if (used)
     *used = 0;
+  if (glare)
+    *glare = 1.f;
   if (c.views.empty())
     return 1.f;
-  std::vector<std::pair<float, float>> near; // cos, factor
+  std::vector<std::pair<float, const Capture::View*>> near; // cos, frame
   if (stage) {
     const XrVector3f s = rot_y(*stage - c.pos, -c.yaw);
     for (const auto& v : c.views) {
@@ -6321,31 +6345,40 @@ float capture_factor_locked(const XrVector3f* stage, int* used = nullptr) {
       const float n = std::sqrt(vdot(d, d));
       if (n > 0.05f)
         if (const float cs = vdot(d, v.dir) / n; cs > kCapStageCos)
-          near.emplace_back(cs, v.factor);
+          near.emplace_back(cs, &v);
     }
   }
-  std::vector<float> f;
+  std::vector<const Capture::View*> chosen;
   if (near.size() >= kCapStageMinFrames) {
     const size_t k = std::min<size_t>(near.size(), kCapStageFrames);
-    std::partial_sort(near.begin(), near.begin() + k, near.end(), std::greater<>());
+    std::partial_sort(near.begin(), near.begin() + k, near.end(),
+                      [](const auto& a, const auto& b) { return a.first > b.first; });
     for (size_t i = 0; i < k; ++i)
-      f.push_back(near[i].second);
+      chosen.push_back(near[i].second);
     if (used)
       *used = static_cast<int>(k);
   } else {
     for (const auto& v : c.views)
-      f.push_back(v.factor);
+      chosen.push_back(&v);
   }
-  std::nth_element(f.begin(), f.begin() + f.size() / 2, f.end());
-  return f[f.size() / 2];
+  const auto median_of = [&](auto get) {
+    std::vector<float> f;
+    for (const auto* v : chosen)
+      f.push_back(get(*v));
+    std::nth_element(f.begin(), f.begin() + f.size() / 2, f.end());
+    return f[f.size() / 2];
+  };
+  if (glare)
+    *glare = median_of([](const Capture::View& v) { return v.glare; });
+  return median_of([](const Capture::View& v) { return v.factor; });
 }
 
 // The level, for the stage where it last was. Under g_capture.mutex.
 void capture_level_locked() {
   auto& c = g_capture;
-  const float factor = capture_factor_locked(c.haveStage ? &c.stageAt : nullptr, &c.stageFrames);
+  const float factor = capture_factor_locked(c.haveStage ? &c.stageAt : nullptr, &c.stageFrames, &c.stageGlare);
   c.unclamped = kCapMedian * c.dim * c.radiance * factor;
-  c.level = std::clamp(c.unclamped, 0.15f, 1.25f);
+  c.level = std::clamp(c.unclamped, 0.15f, kCapLevelMax);
 }
 
 // The light from the cells so far (under g_capture.mutex).
@@ -6570,6 +6603,14 @@ void capture_make() {
                                         c.yaw);
     c.lightPos[l] = {at.x, at.y, at.z};
     c.lightAt[l] = true;
+    // Its distance from where the head was (the frames' mean): the light
+    // measured there, it falls off with distance from the stage.
+    XrVector3f head{};
+    for (const auto& v : c.views)
+      head = head + v.head * (1.f / static_cast<float>(c.views.size()));
+    const XrVector3f d = XrVector3f{static_cast<float>(sum[0] / n), static_cast<float>(sum[1] / n),
+                                    static_cast<float>(sum[2] / n)} - head;
+    c.lightRange[l] = c.views.empty() ? 0.f : std::sqrt(vdot(d, d));
   }
   c.coverage = static_cast<float>(seenW / (4.0 * 3.14159265358979323846));
   c.made = true;
@@ -6593,6 +6634,8 @@ void capture_start() {
   g_capture.hits.clear();
   g_capture.casts = 0;
   g_capture.lightAt = {};
+  g_capture.lightRange = {};
+  g_capture.changedNs = 0;
 }
 
 // ROOM chosen again: the capture so far kept (ambient capture goes on from
@@ -6698,6 +6741,20 @@ bool capture_light(std::array<std::array<float, 3>, 9>& sh, std::array<std::arra
       dirs[l] = {d[0] / n, d[1] / n, d[2] / n};
   }
   lights = g_capture.light;
+  // A placed light by the inverse square of its distance, from where it was
+  // measured (the head) to the stage: a ceiling light a stage on a table
+  // sits farther from than the head did lit it as strongly (2026-10-22: "a
+  // bit too much influence").
+  for (int l = 0; l < 2; ++l) {
+    const auto& p = g_capture.lightPos[l];
+    const float d[3] = {p[0] - stage.x, p[1] - stage.y, p[2] - stage.z};
+    const float n2 = d[0] * d[0] + d[1] * d[1] + d[2] * d[2];
+    if (!g_capture.lightAt[l] || !(g_capture.lightRange[l] > 0.f) || n2 < 0.01f)
+      continue;
+    const float k = std::clamp(g_capture.lightRange[l] * g_capture.lightRange[l] / n2, 0.2f, 2.f);
+    for (float& x : lights[l])
+      x *= k;
+  }
   mean = g_capture.mean;
   level = g_capture.level;
   return true;
@@ -8331,7 +8388,9 @@ bool render_xr_frame() {
   // hold before a fight, or a grab in a pause.
   const bool placingNow = fight && (placing > 0 || (G.target == Target::Arena && (G.oneHand >= 0 || G.twoHands)));
   surface_frame(fight, placingNow, fs.predictedDisplayTime);
-  capture_ambient(!fight || placing > 0);
+  // Ambient capture in the menus, while the stage is placed and in a pause
+  // (where the stage is placed again; not Slippi's, the match runs on).
+  capture_ambient(!fight || placing > 0 || (g_fightPaused && g_matchStopped));
   room_survey_apply();
   spot_frame(fs.predictedDisplayTime);
 
@@ -11281,6 +11340,7 @@ extern "C" bool aurora_xr_screen_back(void) {
 }
 
 extern "C" void aurora_xr_set_paused(bool paused) { aurora::xr::g_fightPaused = paused; }
+extern "C" void aurora_xr_set_match_stopped(bool stopped) { aurora::xr::g_matchStopped = stopped; }
 
 extern "C" void aurora_xr_set_placing(int mode) { aurora::xr::g_placing = mode; }
 
@@ -11368,7 +11428,7 @@ void capture_log(const char* what, uint32_t frames) {
   auto& c = g_capture;
   Log.info("Room capture{}: {} frames, {:.0f}% of the room seen; lights {:.2f},{:.2f},{:.2f} from {:.2f},{:.2f},{:.2f} "
            "and {:.2f},{:.2f},{:.2f} from {:.2f},{:.2f},{:.2f} (placed: {}, {}; {} casts, {} hits kept, {} and {} "
-           "near the lights); passthrough's up {:.4f}, seen {:.4f}, median {:.4f}, level {:.2f} ({:.2f} unclamped, exposure from {}); "
+           "near the lights); passthrough's up {:.4f}, seen {:.4f}, median {:.4f}, level {:.2f} ({:.2f} unclamped, exposure from {}, glare {:.2f}); "
            "unseen as {:.2f},{:.2f},{:.2f} above, {:.2f},{:.2f},{:.2f} below; brightest cells (room x,y,z; times the mean):{}",
            what, frames, c.coverage * 100.f, c.light[0][0], c.light[0][1], c.light[0][2], c.lightDir[0][0],
            c.lightDir[0][1], c.lightDir[0][2], c.light[1][0], c.light[1][1], c.light[1][2], c.lightDir[1][0],
@@ -11379,7 +11439,8 @@ void capture_log(const char* what, uint32_t frames) {
                         : "no",
            c.casts, c.hits.size(), c.lightHits[0], c.lightHits[1], c.display, c.seen, c.middle, c.level,
            c.unclamped,
-           c.stageFrames > 0 ? fmt::format("{} frames looking at the stage", c.stageFrames) : "all frames", c.fill[0][0], c.fill[0][1], c.fill[0][2], c.fill[1][0], c.fill[1][1], c.fill[1][2],
+           c.stageFrames > 0 ? fmt::format("{} frames looking at the stage", c.stageFrames) : "all frames",
+           c.stageGlare, c.fill[0][0], c.fill[0][1], c.fill[0][2], c.fill[1][0], c.fill[1][1], c.fill[1][2],
            capture_brightest());
 }
 
@@ -11464,6 +11525,15 @@ extern "C" void aurora_xr_room_capture_frame(const float* rgb, int cols, int row
                                 v[2] + qw * tz + (qx * ty - qy * tx)};
   };
   const float sx = static_cast<float>(c.sensorW) / c.w, sy = static_cast<float>(c.sensorH) / c.h;
+  const auto lum_at = [&](int i) {
+    const float* p = rgb + i * 4;
+    return 0.2126f * p[0] + 0.7152f * p[1] + 0.0722f * p[2];
+  };
+  // Each sample's part, and the frame's glare: its mean over its mean
+  // without the light (kCapGlareMax).
+  std::vector<int> cells(static_cast<size_t>(cols) * rows, -1);
+  std::vector<float> lums(cells.size());
+  double sumAll = 0.0;
   for (int gy = 0; gy < rows; ++gy)
     for (int gx = 0; gx < cols; ++gx) {
       const float px = (gx + 0.5f) * c.w / cols * sx, py = (gy + 0.5f) * c.h / rows * sy;
@@ -11471,7 +11541,55 @@ extern "C" void aurora_xr_room_capture_frame(const float* rgb, int cols, int row
       const auto inHead = rotate(-c.q[0], -c.q[1], -c.q[2], c.q[3], cam);
       const auto inLocal = rotate(head.x, head.y, head.z, head.w, inHead);
       const XrVector3f inRoom = rot_y({inLocal[0], inLocal[1], inLocal[2]}, -c.yaw); // the capture's frame
-      const int cell = cap_cell({inRoom.x, inRoom.y, inRoom.z}, kCapF);
+      const int i = gy * cols + gx;
+      cells[i] = cap_cell({inRoom.x, inRoom.y, inRoom.z}, kCapF);
+      lums[i] = lum_at(i);
+      sumAll += lums[i];
+    }
+  std::vector<float> sorted = lums;
+  std::nth_element(sorted.begin(), sorted.begin() + sorted.size() / 2, sorted.end());
+  const float med = sorted[sorted.size() / 2];
+  double sumRoom = 0.0;
+  int nRoom = 0;
+  for (const float l : lums)
+    if (l <= 2.f * med)
+      sumRoom += l, ++nRoom;
+  const float glare =
+      nRoom > 0 && sumRoom > 0.0
+          ? std::clamp(std::sqrt(static_cast<float>(sumAll / lums.size() / (sumRoom / nRoom))), 1.f, kCapGlareMax)
+          : 1.f;
+  // The room changed: the samples against the parts well seen, by their median.
+  std::vector<float> ratios;
+  for (size_t i = 0; i < cells.size(); ++i) {
+    const int cell = cells[i];
+    if (cell < 0 || rgb[i * 4 + 3] > kCapClipped)
+      continue;
+    const auto& e = c.parts[cell];
+    if (e[3] + e[7] < kCapChangeSeen)
+      continue;
+    const double was = (0.2126 * (e[0] + e[4]) + 0.7152 * (e[1] + e[5]) + 0.0722 * (e[2] + e[6])) / (e[3] + e[7]);
+    if (was > 1e-6)
+      ratios.push_back(static_cast<float>(lums[i] * scale / was));
+  }
+  if (ratios.size() >= kCapChangeMinSamples) {
+    std::nth_element(ratios.begin(), ratios.begin() + ratios.size() / 2, ratios.end());
+    const float r = ratios[ratios.size() / 2];
+    const int64_t now = steady_ns();
+    if (!(r > kCapChange || r < 1.0 / kCapChange))
+      c.changedNs = 0;
+    else if (c.changedNs == 0)
+      c.changedNs = now;
+    if (c.changedNs != 0 && now - c.changedNs >= kCapChangeNs) {
+      Log.info("Room capture: the room changed ({:.2f}x the capture where it saw well); starting over", r);
+      c.parts = {};
+      c.views.clear();
+      c.frames = c.sinceMade = 0;
+      c.changedNs = 0;
+    }
+  }
+  for (int gy = 0; gy < rows; ++gy)
+    for (int gx = 0; gx < cols; ++gx) {
+      const int cell = cells[gy * cols + gx];
       if (cell < 0)
         continue;
       const float* p = rgb + (gy * cols + gx) * 4;
@@ -11506,8 +11624,8 @@ extern "C" void aurora_xr_room_capture_frame(const float* rgb, int cols, int row
     const std::array<float, 3> mid{(c.sensorW * 0.5f - c.k[2]) / c.k[0], (c.sensorH * 0.5f - c.k[3]) / c.k[1], 1.f};
     const auto d = rotate(head.x, head.y, head.z, head.w, rotate(-c.q[0], -c.q[1], -c.q[2], c.q[3], mid));
     const float n = std::sqrt(d[0] * d[0] + d[1] * d[1] + d[2] * d[2]);
-    c.views.push_back({exposure_ms * iso / 100.f, rot_y(headAt - c.pos, -c.yaw),
-                       rot_y({d[0] / n, d[1] / n, d[2] / n}, -c.yaw)});
+    c.views.push_back({exposure_ms * iso / 100.f * glare, rot_y(headAt - c.pos, -c.yaw),
+                       rot_y({d[0] / n, d[1] / n, d[2] / n}, -c.yaw), glare});
   }
   if (c.views.size() > 600)
     c.views.erase(c.views.begin(), c.views.begin() + 300);
