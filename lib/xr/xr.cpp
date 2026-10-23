@@ -541,6 +541,7 @@ struct Bridge {
   // XR_FB_spatial_entity to make and locate it, XR_META_spatial_entity_
   // persistence to save it, XR_META_spatial_entity_discovery to find it again.
   bool hasSpatialEntityExt = false, hasSpacePersistenceExt = false, hasSpaceDiscoveryExt = false;
+  bool hasEnvDepthExt = false, envDepth = false; // XR_META_environment_depth: offered and wanted; the system can
   bool anchors = false; // all three, and the system says it can
   PFN_xrCreateSpatialAnchorFB createSpatialAnchor = nullptr;
   PFN_xrSetSpaceComponentStatusFB setComponentStatus = nullptr;
@@ -756,6 +757,9 @@ bool create_instance() {
     B.hasSpatialEntityExt |= !std::strcmp(p.extensionName, XR_FB_SPATIAL_ENTITY_EXTENSION_NAME);
     B.hasSpacePersistenceExt |= !std::strcmp(p.extensionName, XR_META_SPATIAL_ENTITY_PERSISTENCE_EXTENSION_NAME);
     B.hasSpaceDiscoveryExt |= !std::strcmp(p.extensionName, XR_META_SPATIAL_ENTITY_DISCOVERY_EXTENSION_NAME);
+#ifdef XR_META_environment_depth
+    B.hasEnvDepthExt |= !std::strcmp(p.extensionName, XR_META_ENVIRONMENT_DEPTH_EXTENSION_NAME);
+#endif
   }
   if (!hasVk2) {
     Log.error("OpenXR runtime lacks XR_KHR_vulkan_enable2");
@@ -798,6 +802,12 @@ bool create_instance() {
     exts.push_back(XR_EXT_FUTURE_EXTENSION_NAME);
     exts.push_back(XR_META_ENVIRONMENT_RAYCAST_EXTENSION_NAME);
   }
+#ifdef XR_META_environment_depth
+  // The environment depth probe (AURORA_XR_DEPTH_PROBE, depth_probe_frame).
+  B.hasEnvDepthExt &= env_float("AURORA_XR_DEPTH_PROBE", 0.f) > 0.f;
+  if (B.hasEnvDepthExt)
+    exts.push_back(XR_META_ENVIRONMENT_DEPTH_EXTENSION_NAME);
+#endif
   B.hasLocalFloorExt &= env_flag("AURORA_XR_LOCAL_FLOOR", true);
   if (B.hasLocalFloorExt)
     exts.push_back(XR_EXT_LOCAL_FLOOR_EXTENSION_NAME);
@@ -854,6 +864,13 @@ bool create_instance() {
       raycast.next = sp.next;
       sp.next = &raycast;
     }
+#ifdef XR_META_environment_depth
+    XrSystemEnvironmentDepthPropertiesMETA depth{XR_TYPE_SYSTEM_ENVIRONMENT_DEPTH_PROPERTIES_META};
+    if (B.hasEnvDepthExt) {
+      depth.next = sp.next;
+      sp.next = &depth;
+    }
+#endif
     if (B.hasColorLutExt) {
       lut.next = sp.next;
       sp.next = &lut;
@@ -862,6 +879,12 @@ bool create_instance() {
       B.maxLayers = std::max<uint32_t>(sp.graphicsProperties.maxLayerCount, 1);
       B.envRaycast = B.hasEnvRaycastExt && raycast.supportsEnvironmentRaycast;
       B.maxLutResolution = B.hasColorLutExt ? lut.maxColorLutResolution : 0;
+#ifdef XR_META_environment_depth
+      B.envDepth = B.hasEnvDepthExt && depth.supportsEnvironmentDepth;
+      if (B.hasEnvDepthExt)
+        Log.info("Environment depth: {}, hand removal {}", depth.supportsEnvironmentDepth ? "supported" : "unsupported",
+                 depth.supportsHandRemoval ? "supported" : "unsupported");
+#endif
     }
     Log.info("System {}: at most {} composition layers a frame; environment raycast {}, local floor {}, "
              "passthrough colour LUTs {}",
@@ -6760,6 +6783,319 @@ bool capture_light(std::array<std::array<float, 3>, 9>& sh, std::array<std::arra
   return true;
 }
 
+#ifdef XR_META_environment_depth
+// The environment depth probe (AURORA_XR_DEPTH_PROBE: 1 while the room
+// capture runs, 2 always, for its cost in fights). Measuring the Depth API
+// for a room capture by points (docs/xr-room-depth-plan.md): the depth
+// image's size, how soon the provider gives one after starting, its age,
+// and, twice a second, the image read back and checked against the
+// capture's raycast hits (in which orientation its rows run, and the
+// conversion: OpenGL depth, nearZ / (1 - d) with an infinite far plane).
+struct DepthProbe {
+  int mode = 0;
+  bool tried = false, ok = false, running = false, first = false;
+  XrEnvironmentDepthProviderMETA provider = XR_NULL_HANDLE;
+  XrEnvironmentDepthSwapchainMETA swapchain = XR_NULL_HANDLE;
+  uint32_t w = 0, h = 0;
+  std::vector<VkImage> images;
+  VkBuffer buf = VK_NULL_HANDLE;
+  VkDeviceMemory mem = VK_NULL_HANDLE;
+  const uint16_t* mapped = nullptr;
+  VkCommandBuffer cmd = VK_NULL_HANDLE;
+  VkFence fence = VK_NULL_HANDLE;
+  bool pending = false; // a read-back in flight
+  XrEnvironmentDepthImageMETA copied{XR_TYPE_ENVIRONMENT_DEPTH_IMAGE_META};
+  int64_t startNs = 0, copyNs = 0, logNs = 0;
+  uint32_t acquired = 0, unavailable = 0, failed = 0, checks = 0;
+  int64_t acquireNs = 0, ageNs = 0;
+  PFN_xrCreateEnvironmentDepthProviderMETA createProvider = nullptr;
+  PFN_xrStartEnvironmentDepthProviderMETA start = nullptr;
+  PFN_xrStopEnvironmentDepthProviderMETA stop = nullptr;
+  PFN_xrCreateEnvironmentDepthSwapchainMETA createSwapchain = nullptr;
+  PFN_xrEnumerateEnvironmentDepthSwapchainImagesMETA enumerateImages = nullptr;
+  PFN_xrGetEnvironmentDepthSwapchainStateMETA getState = nullptr;
+  PFN_xrAcquireEnvironmentDepthImageMETA acquire = nullptr;
+  PFN_xrSetEnvironmentDepthHandRemovalMETA setHandRemoval = nullptr;
+} g_depth;
+
+bool depth_probe_init() {
+  auto& d = g_depth;
+  d.createProvider = xr_proc<PFN_xrCreateEnvironmentDepthProviderMETA>("xrCreateEnvironmentDepthProviderMETA");
+  d.start = xr_proc<PFN_xrStartEnvironmentDepthProviderMETA>("xrStartEnvironmentDepthProviderMETA");
+  d.stop = xr_proc<PFN_xrStopEnvironmentDepthProviderMETA>("xrStopEnvironmentDepthProviderMETA");
+  d.createSwapchain = xr_proc<PFN_xrCreateEnvironmentDepthSwapchainMETA>("xrCreateEnvironmentDepthSwapchainMETA");
+  d.enumerateImages =
+      xr_proc<PFN_xrEnumerateEnvironmentDepthSwapchainImagesMETA>("xrEnumerateEnvironmentDepthSwapchainImagesMETA");
+  d.getState = xr_proc<PFN_xrGetEnvironmentDepthSwapchainStateMETA>("xrGetEnvironmentDepthSwapchainStateMETA");
+  d.acquire = xr_proc<PFN_xrAcquireEnvironmentDepthImageMETA>("xrAcquireEnvironmentDepthImageMETA");
+  d.setHandRemoval = xr_proc<PFN_xrSetEnvironmentDepthHandRemovalMETA>("xrSetEnvironmentDepthHandRemovalMETA");
+  if (!d.createProvider || !d.start || !d.stop || !d.createSwapchain || !d.enumerateImages || !d.getState ||
+      !d.acquire) {
+    Log.warn("Depth probe: the extension's functions are missing");
+    return false;
+  }
+  XrEnvironmentDepthProviderCreateInfoMETA pci{XR_TYPE_ENVIRONMENT_DEPTH_PROVIDER_CREATE_INFO_META};
+  if (const XrResult r = d.createProvider(B.session, &pci, &d.provider); XR_FAILED(r)) {
+    Log.warn("Depth probe: xrCreateEnvironmentDepthProviderMETA failed: {}", static_cast<int>(r));
+    return false;
+  }
+  XrEnvironmentDepthSwapchainCreateInfoMETA sci{XR_TYPE_ENVIRONMENT_DEPTH_SWAPCHAIN_CREATE_INFO_META};
+  if (const XrResult r = d.createSwapchain(d.provider, &sci, &d.swapchain); XR_FAILED(r)) {
+    Log.warn("Depth probe: xrCreateEnvironmentDepthSwapchainMETA failed: {}", static_cast<int>(r));
+    return false;
+  }
+  XrEnvironmentDepthSwapchainStateMETA st{XR_TYPE_ENVIRONMENT_DEPTH_SWAPCHAIN_STATE_META};
+  if (XR_FAILED(d.getState(d.swapchain, &st)) || st.width == 0 || st.height == 0)
+    return false;
+  d.w = st.width, d.h = st.height;
+  uint32_t n = 0;
+  if (XR_FAILED(d.enumerateImages(d.swapchain, 0, &n, nullptr)) || n == 0)
+    return false;
+  std::vector<XrSwapchainImageVulkan2KHR> imgs(n, {XR_TYPE_SWAPCHAIN_IMAGE_VULKAN2_KHR});
+  if (XR_FAILED(d.enumerateImages(d.swapchain, n, &n, reinterpret_cast<XrSwapchainImageBaseHeader*>(imgs.data()))))
+    return false;
+  for (const auto& i : imgs)
+    d.images.push_back(i.image);
+  // Both views (D16 assumed: the check against the hits says if it isn't).
+  VkBufferCreateInfo bci{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+  bci.size = static_cast<VkDeviceSize>(d.w) * d.h * 2 * 2;
+  bci.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+  VK_TRY(vkCreateBuffer(B.dev, &bci, nullptr, &d.buf));
+  VkMemoryRequirements mr;
+  vkGetBufferMemoryRequirements(B.dev, d.buf, &mr);
+  VkMemoryAllocateInfo mai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+  mai.allocationSize = mr.size;
+  mai.memoryTypeIndex =
+      find_memory_type(mr.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+  if (mai.memoryTypeIndex == UINT32_MAX)
+    return false;
+  VK_TRY(vkAllocateMemory(B.dev, &mai, nullptr, &d.mem));
+  VK_TRY(vkBindBufferMemory(B.dev, d.buf, d.mem, 0));
+  void* p = nullptr;
+  VK_TRY(vkMapMemory(B.dev, d.mem, 0, VK_WHOLE_SIZE, 0, &p));
+  d.mapped = static_cast<const uint16_t*>(p);
+  VkCommandBufferAllocateInfo cai{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+  cai.commandPool = B.pool;
+  cai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+  cai.commandBufferCount = 1;
+  VK_TRY(vkAllocateCommandBuffers(B.dev, &cai, &d.cmd));
+  VkFenceCreateInfo fci{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+  VK_TRY(vkCreateFence(B.dev, &fci, nullptr, &d.fence));
+  bool handRemoval = false;
+  if (d.setHandRemoval) {
+    XrEnvironmentDepthHandRemovalSetInfoMETA hi{XR_TYPE_ENVIRONMENT_DEPTH_HAND_REMOVAL_SET_INFO_META};
+    hi.enabled = XR_TRUE;
+    handRemoval = XR_SUCCEEDED(d.setHandRemoval(d.provider, &hi));
+  }
+  Log.info("Depth probe: {}x{} depth, {} images, hand removal {}, mode {}", d.w, d.h, n, handRemoval ? "on" : "off",
+           d.mode);
+  return true;
+}
+
+// Distance along the view's axis, from a depth value.
+float depth_linear(uint16_t v, float nearZ, float farZ) {
+  const float dn = static_cast<float>(v) / 65535.f;
+  if (!std::isfinite(farZ))
+    return dn < 1.f ? nearZ / (1.f - dn) : INFINITY;
+  const float z = 2.f * dn - 1.f;
+  return 2.f * nearZ * farZ / (farZ + nearZ - z * (farZ - nearZ));
+}
+
+// The read-back's view 0 against the capture's hits.
+void depth_probe_check() {
+  auto& d = g_depth;
+  const auto& im = d.copied;
+  const XrEnvironmentDepthImageViewMETA& v = im.views[0];
+  const float tl = std::tan(v.fov.angleLeft), tr = std::tan(v.fov.angleRight), tu = std::tan(v.fov.angleUp),
+              td = std::tan(v.fov.angleDown);
+  // The view's own: valid share and median distance.
+  std::vector<float> zs;
+  uint32_t valid = 0;
+  for (uint32_t i = 0; i < d.w * d.h; i += 7) {
+    const float z = depth_linear(d.mapped[i], im.nearZ, im.farZ);
+    if (std::isfinite(z) && z > 0.f)
+      ++valid, zs.push_back(z);
+  }
+  float med = 0.f;
+  if (!zs.empty()) {
+    std::nth_element(zs.begin(), zs.begin() + zs.size() / 2, zs.end());
+    med = zs[zs.size() / 2];
+  }
+  // The hits in its view, sampled with the rows from the top and from the bottom.
+  std::vector<float> ratio[2];
+  {
+    std::lock_guard lock{g_capture.mutex};
+    const auto& c = g_capture;
+    const size_t step = std::max<size_t>(c.hits.size() / 1500, 1);
+    for (size_t k = 0; k < c.hits.size(); k += step) {
+      const auto& hit = c.hits[k];
+      const XrVector3f at = c.pos + rot_y({hit[3], hit[4], hit[5]}, c.yaw);
+      const XrVector3f pv = qrot(qconj(v.pose.orientation), at - v.pose.position);
+      if (pv.z > -0.2f)
+        continue;
+      const float x = pv.x / -pv.z, y = pv.y / -pv.z;
+      const float u = (x - tl) / (tr - tl), vt = (tu - y) / (tu - td);
+      if (u < 0.f || u >= 1.f || vt < 0.f || vt >= 1.f)
+        continue;
+      const uint32_t px = static_cast<uint32_t>(u * d.w);
+      for (int o = 0; o < 2; ++o) {
+        const uint32_t py = static_cast<uint32_t>((o == 0 ? vt : 1.f - vt) * d.h);
+        const float z = depth_linear(d.mapped[std::min(py, d.h - 1) * d.w + px], im.nearZ, im.farZ);
+        if (std::isfinite(z) && z > 0.f)
+          ratio[o].push_back(z / -pv.z);
+      }
+    }
+  }
+  std::string out;
+  for (int o = 0; o < 2; ++o) {
+    auto& r = ratio[o];
+    if (r.empty()) {
+      out += fmt::format("{}: no hits; ", o == 0 ? "rows from the top" : "from the bottom");
+      continue;
+    }
+    std::sort(r.begin(), r.end());
+    size_t within = 0;
+    for (const float x : r)
+      within += std::abs(x - 1.f) < 0.1f;
+    out += fmt::format("{}: {} hits, depth/hit {:.3f} (quartiles {:.3f}-{:.3f}), {:.0f}% within 10%; ",
+                       o == 0 ? "rows from the top" : "from the bottom", r.size(), r[r.size() / 2], r[r.size() / 4],
+                       r[r.size() * 3 / 4], 100.f * within / r.size());
+  }
+  ++d.checks;
+  Log.info("Depth probe: check {}: near {:.3f} far {}, view 0 fov {:.1f}/{:.1f}/{:.1f}/{:.1f} deg, {:.0f}% valid, "
+           "median {:.2f} m; {}",
+           d.checks, im.nearZ, im.farZ, v.fov.angleLeft * 57.2958f, v.fov.angleRight * 57.2958f,
+           v.fov.angleUp * 57.2958f, v.fov.angleDown * 57.2958f, 700.f * valid / (d.w * d.h), med, out);
+}
+
+#define VK_TRY_VOID(x)                                                                                                 \
+  do {                                                                                                                 \
+    VkResult r_ = (x);                                                                                                 \
+    if (r_ != VK_SUCCESS) {                                                                                            \
+      Log.error("{} failed: VkResult {}", #x, static_cast<int>(r_));                                                   \
+      d.ok = false;                                                                                                    \
+      return;                                                                                                          \
+    }                                                                                                                  \
+  } while (0)
+
+// Each frame between xrBeginFrame and xrEndFrame.
+void depth_probe_frame(XrTime displayTime) {
+  auto& d = g_depth;
+  if (!B.envDepth)
+    return;
+  if (!d.tried) {
+    d.tried = true;
+    d.mode = static_cast<int>(env_float("AURORA_XR_DEPTH_PROBE", 0.f));
+    d.ok = depth_probe_init();
+  }
+  if (!d.ok)
+    return;
+  int captureMode;
+  {
+    std::lock_guard lock{g_capture.mutex};
+    captureMode = capture_mode_locked();
+  }
+  const bool want = d.mode >= 2 || captureMode != 0;
+  const int64_t now = monotonic_ns();
+  if (want != d.running) {
+    const int64_t t0 = monotonic_ns();
+    const XrResult r = want ? d.start(d.provider) : d.stop(d.provider);
+    Log.info("Depth probe: provider {} ({}, {:.2f} ms)", want ? "started" : "stopped", static_cast<int>(r),
+             (monotonic_ns() - t0) / 1e6);
+    if (XR_FAILED(r))
+      return;
+    d.running = want;
+    d.first = true;
+    d.startNs = now;
+  }
+  if (d.pending && vkGetFenceStatus(B.dev, d.fence) == VK_SUCCESS) {
+    d.pending = false;
+    depth_probe_check();
+  }
+  if (!d.running)
+    return;
+  XrEnvironmentDepthImageAcquireInfoMETA ai{XR_TYPE_ENVIRONMENT_DEPTH_IMAGE_ACQUIRE_INFO_META};
+  ai.space = B.space;
+  ai.displayTime = displayTime;
+  XrEnvironmentDepthImageTimestampMETA ts{XR_TYPE_ENVIRONMENT_DEPTH_IMAGE_TIMESTAMP_META};
+  XrEnvironmentDepthImageMETA im{XR_TYPE_ENVIRONMENT_DEPTH_IMAGE_META};
+  im.next = &ts;
+  im.views[0].type = im.views[1].type = XR_TYPE_ENVIRONMENT_DEPTH_IMAGE_VIEW_META;
+  const int64_t t0 = monotonic_ns();
+  const XrResult r = d.acquire(d.provider, &ai, &im);
+  d.acquireNs += monotonic_ns() - t0;
+  if (r == XR_ENVIRONMENT_DEPTH_NOT_AVAILABLE_META) {
+    ++d.unavailable;
+  } else if (XR_FAILED(r)) {
+    ++d.failed;
+  } else {
+    ++d.acquired;
+    if (ts.captureTime > 0)
+      d.ageNs += displayTime - ts.captureTime;
+    if (d.first) {
+      d.first = false;
+      Log.info("Depth probe: first image {:.0f} ms after the start, index {}, near {:.3f} far {}, {:.0f} ms old at "
+               "display",
+               (now - d.startNs) / 1e6, im.swapchainIndex, im.nearZ, im.farZ,
+               ts.captureTime > 0 ? (displayTime - ts.captureTime) / 1e6 : -1.0);
+    }
+    if (!d.pending && now - d.copyNs >= 500'000'000 && im.swapchainIndex < d.images.size()) {
+      d.copyNs = now;
+      VK_TRY_VOID(vkResetFences(B.dev, 1, &d.fence));
+      VK_TRY_VOID(vkResetCommandBuffer(d.cmd, 0));
+      VkCommandBufferBeginInfo cbi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+      cbi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+      VK_TRY_VOID(vkBeginCommandBuffer(d.cmd, &cbi));
+      const VkImage img = d.images[im.swapchainIndex];
+      VkImageMemoryBarrier b =
+          barrier(img, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                  VK_ACCESS_SHADER_READ_BIT, VK_ACCESS_TRANSFER_READ_BIT, VK_QUEUE_FAMILY_IGNORED,
+                  VK_QUEUE_FAMILY_IGNORED, VK_IMAGE_ASPECT_DEPTH_BIT);
+      vkCmdPipelineBarrier(d.cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr,
+                           0, nullptr, 1, &b);
+      VkBufferImageCopy region{};
+      region.imageSubresource = {VK_IMAGE_ASPECT_DEPTH_BIT, 0, 0, 2};
+      region.imageExtent = {d.w, d.h, 1};
+      vkCmdCopyImageToBuffer(d.cmd, img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, d.buf, 1, &region);
+      b = barrier(img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                  VK_ACCESS_TRANSFER_READ_BIT, VK_ACCESS_SHADER_READ_BIT, VK_QUEUE_FAMILY_IGNORED,
+                  VK_QUEUE_FAMILY_IGNORED, VK_IMAGE_ASPECT_DEPTH_BIT);
+      vkCmdPipelineBarrier(d.cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, nullptr,
+                           0, nullptr, 1, &b);
+      VkBufferMemoryBarrier bb{VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER};
+      bb.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+      bb.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
+      bb.srcQueueFamilyIndex = bb.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+      bb.buffer = d.buf;
+      bb.size = VK_WHOLE_SIZE;
+      vkCmdPipelineBarrier(d.cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0, 0, nullptr, 1, &bb,
+                           0, nullptr);
+      VK_TRY_VOID(vkEndCommandBuffer(d.cmd));
+      VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+      si.commandBufferCount = 1;
+      si.pCommandBuffers = &d.cmd;
+      VK_TRY_VOID(vkQueueSubmit(B.queue, 1, &si, d.fence));
+      d.copied = im;
+      d.pending = true;
+    }
+  }
+  if (now - d.logNs >= 5'000'000'000) {
+    const uint32_t n = d.acquired + d.unavailable + d.failed;
+    if (d.logNs != 0 && n > 0)
+      Log.info("Depth probe: {} acquires (new {}, not available {}, failed {}), {:.3f} ms each, images {:.1f} ms old",
+               n, d.acquired, d.unavailable, d.failed, d.acquireNs / 1e6 / n,
+               d.acquired > 0 ? d.ageNs / 1e6 / d.acquired : -1.0);
+    d.logNs = now;
+    d.acquired = d.unavailable = d.failed = 0;
+    d.acquireNs = d.ageNs = 0;
+  }
+}
+#undef VK_TRY_VOID
+#else
+void depth_probe_frame(XrTime) {}
+#endif
+
+
 // The capture's brightest cells, for the log: where, how bright (relative
 // to the mean, as capture_make last made them), how many of their samples
 // clipped, and how many of their parts were seen.
@@ -8393,6 +8729,7 @@ bool render_xr_frame() {
   capture_ambient(!fight || placing > 0 || (g_fightPaused && g_matchStopped));
   room_survey_apply();
   spot_frame(fs.predictedDisplayTime);
+  depth_probe_frame(fs.predictedDisplayTime);
 
   // The passthrough, the shadow, the HUD and the 3D view, the HUD on top in
   // full VR, then the placing cards and the lasers.
