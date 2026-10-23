@@ -7,6 +7,7 @@
 #include <SDL3/SDL_mouse.h>
 
 #include <array>
+#include <atomic>
 #include <filesystem>
 #include <limits>
 #include <ranges>
@@ -35,6 +36,8 @@ std::array<PADButtonMapping, PAD_BUTTON_COUNT> g_defaultButtonsStandard{{
 
 std::array<PADStatus, PAD_CHANMAX> g_virtualPadStatus{};
 std::array<bool, PAD_CHANMAX> g_virtualPadActive{};
+// PADSetMirrorX: every port's left and right swapped (set from another thread).
+std::atomic<bool> g_mirrorX{false};
 
 std::array<PADButtonMapping, PAD_BUTTON_COUNT> g_defaultButtonsXBox360{{
     {SDL_GAMEPAD_BUTTON_SOUTH, PAD_BUTTON_A},
@@ -709,6 +712,16 @@ static void merge_virtual_status(PADStatus& status, const PADStatus& virtualStat
   status.analogB = std::max(status.analogB, virtualStatus.analogB);
 }
 
+// Left and right swapped: both sticks' X and the d-pad's left and right.
+static void mirror_x(PADStatus& status) {
+  status.stickX = static_cast<s8>(-std::max<int>(status.stickX, -127));
+  status.substickX = static_cast<s8>(-std::max<int>(status.substickX, -127));
+  const u16 lr = status.button & (PAD_BUTTON_LEFT | PAD_BUTTON_RIGHT);
+  if (lr == PAD_BUTTON_LEFT || lr == PAD_BUTTON_RIGHT) {
+    status.button ^= PAD_BUTTON_LEFT | PAD_BUTTON_RIGHT;
+  }
+}
+
 u32 PADRead(PADStatus* status) {
   if (!g_initialized) {
     Log.fatal("PADRead called before PADInit()!");
@@ -942,6 +955,9 @@ u32 PADRead(PADStatus* status) {
       if (g_virtualPadActive[i]) {
         merge_virtual_status(status[i], g_virtualPadStatus[i]);
       }
+      if (g_mirrorX.load(std::memory_order_relaxed)) {
+        mirror_x(status[i]);
+      }
       apply_unblock_suppression(status[i], i, captureHeldInput);
     }
   }
@@ -971,6 +987,8 @@ void PADClearAllVirtualStatus() {
   g_virtualPadStatus.fill({});
   g_virtualPadActive.fill(false);
 }
+
+void PADSetMirrorX(bool mirror) { g_mirrorX.store(mirror, std::memory_order_relaxed); }
 
 void PADControlMotor(const u32 chan, const u32 cmd) {
   const auto controller = aurora::input::get_controller_for_player(chan);

@@ -245,6 +245,9 @@ void PADBlockInput(bool block);
 void PADSetVirtualStatus(u32 port, const PADStatus* status);
 void PADClearVirtualStatus(u32 port);
 void PADClearAllVirtualStatus();
+/* Swap left and right on every port (both sticks' X, the d-pad), as for a
+ * player watching the game from behind. Takes effect on the next PADRead. */
+void PADSetMirrorX(bool mirror);
 
 /**
  * Set the default controller mapping used.

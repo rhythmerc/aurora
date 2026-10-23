@@ -10,6 +10,7 @@
 #include "../gx/gx.hpp"
 
 #include <aurora/gfx.hpp>
+#include <dolphin/pad.h>
 
 #include <SDL3/SDL.h>
 
@@ -3905,6 +3906,31 @@ void update_grab(Target target, bool active) {
 
 // ---------------------------------------------------------------- XR thread: lasers
 
+// The player watches from behind the stage (the side away from the HUD's
+// face). XR thread.
+std::atomic<bool> g_viewBehind{false};
+
+// Per frame: whether the head is behind the stage, by the side of the arena
+// it's on (with ~15 deg either side of the stage's left-right line before it
+// switches). While a fight shows from behind, every pad's left and right are
+// swapped, so left on the stick runs to the player's left
+// (AURORA_XR_BEHIND=0: never).
+void behind_frame(bool fight) {
+  static const bool enabled = env_flag("AURORA_XR_BEHIND", true);
+  const ArenaPose arena = arena_pose();
+  const XrVector3f local = rot_y(B.head - arena.pos, -arena.yaw);
+  const float flat = std::sqrt(local.x * local.x + local.z * local.z);
+  if (flat > 0.01f) {
+    const float front = local.z / flat; // cos of the angle from the stage's front
+    const bool behind = g_viewBehind ? front < 0.26f : front < -0.26f;
+    if (behind != g_viewBehind) {
+      g_viewBehind = behind;
+      Log.info("Viewer {} the stage", behind ? "behind" : "in front of");
+    }
+  }
+  PADSetMirrorX(enabled && fight && g_viewBehind);
+}
+
 // Where the HUD quad goes, in the room. It moves, turns and scales with the
 // arena.
 void hud_placement(XrPosef& pose, XrExtent2Df& size) {
@@ -3933,8 +3959,11 @@ void hud_placement(XrPosef& pose, XrExtent2Df& size) {
     const float clear = env_float("AURORA_XR_HUD_CLEARANCE", 40.f); // game units
     height = std::max(height, (top + clear - centerY) * arena.scale + size.height * 0.5f);
   }
-  pose.orientation = yaw_quat(arena.yaw);
-  pose.position = arena.pos + rot_y({0.f, height, -0.15f * k}, arena.yaw);
+  // From behind the stage it turns around to face the player, over the
+  // stage's front edge (the far one from there).
+  const float yaw = g_viewBehind ? arena.yaw + 3.14159265f : arena.yaw;
+  pose.orientation = yaw_quat(yaw);
+  pose.position = arena.pos + rot_y({0.f, height, -0.15f * k}, yaw);
 }
 
 // AURORA_XR_DUMP: the left eye's view and the HUD quad, so a dump of the 3D
@@ -8761,6 +8790,7 @@ bool render_xr_frame() {
   spot_frame(fs.predictedDisplayTime);
   room_depth_frame(fs.predictedDisplayTime);
   density_frame();
+  behind_frame(fight && placing == 0);
 
   // The passthrough, the shadow, the HUD and the 3D view, the HUD on top in
   // full VR, then the placing cards and the lasers.
