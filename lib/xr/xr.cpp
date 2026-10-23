@@ -332,6 +332,14 @@ double g_headTurnSum = 0.0;
 uint32_t g_headTurnN = 0;
 XrQuaternionf g_headTurnPrev{0.f, 0.f, 0.f, 1.f};
 XrTime g_headTurnPrevTime = 0;
+// The head's last few poses (publish_views; XR thread): a recenter's report
+// is read against where the head was just before it (spot_recentered).
+struct HeadSample {
+  XrVector3f pos{};
+  XrQuaternionf orientation{0.f, 0.f, 0.f, 1.f};
+};
+std::array<HeadSample, 12> g_headHistory{};
+size_t g_headHistoryN = 0;
 std::atomic<float> g_headTurnLast{0.f};
 
 // Lock-step pacing (aurora_xr_pace): the XR thread ticks every
@@ -3185,6 +3193,7 @@ void publish_views(XrTime displayTime) {
     const XrVector3f &l = views[0].pose.position, &r = views[1].pose.position;
     B.head = {(l.x + r.x) * 0.5f, (l.y + r.y) * 0.5f, (l.z + r.z) * 0.5f};
     B.headOrientation = views[0].pose.orientation;
+    g_headHistory[g_headHistoryN++ % g_headHistory.size()] = {B.head, B.headOrientation};
     // The turn since the last pose: 2 asin |q_rel.xyz|, from the quaternions'
     // dot (no libm calls here: the game's own libm interposes some).
     const XrQuaternionf& q = B.headOrientation;
@@ -5655,23 +5664,95 @@ void move_arenas(XrVector3f p0, float y0, XrVector3f p1, float y1) {
     move(a);
 }
 
-// A recenter (LOCAL): the new origin, as a pose in the old space. The stage
-// keeps its place in the room: everything placed moves the other way.
+XrQuaternionf qmul(const XrQuaternionf& a, const XrQuaternionf& b);
+
+// A recenter (LOCAL) puts the origin at the head, facing where it looks. The
+// stage and the screen keep their places in the room: everything placed
+// moves the other way. The report's pose is meant to be the new origin in
+// the old space; Quest's (Oculus 209) is the old origin in the new space
+// instead (2026-10-23: eight recenters, each the inverse of the head's
+// jump), which turned and threw the stage across the room. Which reading
+// holds comes from the head's last poses, since the new origin is where the
+// head just was. The move waits for the head to show in the new space
+// (spot_recenter_frame: 0-2 frames after the report on Quest), so nothing is
+// drawn displaced in between.
+struct {
+  bool pending = false;
+  XrVector3f origin{}; // the new origin in the old space
+  float yaw = 0.f;
+  XrVector3f oldHead{}; // where the head was, in the old space
+  int frames = 0;
+} g_recenter;
+
+void spot_recenter_frame();
+
 void spot_recentered(const XrEventDataReferenceSpaceChangePending& e) {
   if (e.referenceSpaceType != XR_REFERENCE_SPACE_TYPE_LOCAL || !e.poseValid)
     return;
+  if (g_recenter.pending) { // another one already: that one first
+    g_recenter.frames = 10;
+    spot_recenter_frame();
+  }
   const XrVector3f t = e.poseInPreviousSpace.position;
   const float th = pose_yaw(e.poseInPreviousSpace.orientation);
-  // p_new = R^-1 (p_old - t): the old origin goes to rot_y(-t, -th).
-  std::lock_guard lock{g_arenaMutex};
-  if (!g_arenaInit)
-    return;
-  move_arenas(t, th, {0.f, 0.f, 0.f}, 0.f);
-  if (g_spot.haveLast) {
-    g_spot.lastPos = rot_y(g_spot.lastPos - t, -th);
-    g_spot.lastYaw -= th;
+  const XrVector3f inv = rot_y(XrVector3f{-t.x, -t.y, -t.z}, -th); // the inverse's translation
+  // How far a head pose is from an origin (meters, with half a meter a radian).
+  auto off = [](const HeadSample& h, XrVector3f o, float yaw) {
+    float turn = pose_yaw(h.orientation) - yaw;
+    while (turn > 3.14159265f)
+      turn -= 6.2831853f;
+    while (turn < -3.14159265f)
+      turn += 6.2831853f;
+    return vlen(h.pos - o) + 0.5f * std::fabs(turn);
+  };
+  float asSpec = std::numeric_limits<float>::infinity(), asInverse = asSpec;
+  XrVector3f specHead = t, inverseHead = inv;
+  const size_t n = std::min(g_headHistoryN, g_headHistory.size());
+  for (size_t i = 0; i < n; ++i) {
+    const HeadSample& h = g_headHistory[i];
+    if (const float d = off(h, t, th); d < asSpec)
+      asSpec = d, specHead = h.pos;
+    if (const float d = off(h, inv, -th); d < asInverse)
+      asInverse = d, inverseHead = h.pos;
   }
-  Log.info("Recentered: the stage kept its place in the room");
+  const bool spec = asSpec <= asInverse;
+  g_recenter = {true, spec ? t : inv, spec ? th : -th, spec ? specHead : inverseHead, 0};
+  Log.info("Recentered: the runtime's pose read {} ({:.2f} off the head before it, {:.2f} the other way)",
+           spec ? "as the new origin" : "as the old origin", spec ? asSpec : asInverse, spec ? asInverse : asSpec);
+}
+
+// XR thread, each frame once the head is located: a recenter's move, once
+// the head shows in the new space (or after 10 frames).
+void spot_recenter_frame() {
+  if (!g_recenter.pending)
+    return;
+  const XrVector3f o = g_recenter.origin;
+  const float yaw = g_recenter.yaw;
+  const XrVector3f moved = rot_y(g_recenter.oldHead - o, -yaw); // the old head, in the new space
+  if (vlen(B.head - moved) >= vlen(B.head - g_recenter.oldHead) && ++g_recenter.frames < 10)
+    return;
+  g_recenter.pending = false;
+  // p_new = R^-1 (p_old - o): the old origin goes to rot_y(-o, -yaw).
+  {
+    std::lock_guard lock{g_arenaMutex};
+    if (g_arenaInit)
+      move_arenas(o, yaw, {0.f, 0.f, 0.f}, 0.f);
+    if (g_spot.haveLast) {
+      g_spot.lastPos = rot_y(g_spot.lastPos - o, -yaw);
+      g_spot.lastYaw -= yaw;
+    }
+  }
+  const XrQuaternionf turn = yaw_quat(-yaw);
+  auto move = [&](ScreenPose& s) {
+    s.pos = rot_y(s.pos - o, -yaw);
+    s.orientation = qmul(turn, s.orientation);
+  };
+  if (g_screenInit)
+    move(g_screen);
+  move(g_screenGlide.from);
+  move(g_screenGlide.to);
+  Log.info("Recentered: the stage and the screen kept their places in the room ({:.2f} m, {:.0f} deg)", vlen(o),
+           yaw * 57.2958f);
 }
 
 // XR thread: a spatial anchor event. True if it was one.
@@ -8759,6 +8840,7 @@ bool render_xr_frame() {
   update_input();
   pre[3] = monotonic_ns();
   publish_views(fs.predictedDisplayTime);
+  spot_recenter_frame();
   pre[4] = monotonic_ns();
   static const bool atHead = env_flag("AURORA_XR_ARENA_AT_HEAD", false);
   bool viewsValid;
@@ -9263,7 +9345,7 @@ bool poll_events() {
       g_sessionRunning = B.running;
     } else if (ev.type == XR_TYPE_EVENT_DATA_REFERENCE_SPACE_CHANGE_PENDING) {
       // A recenter moves LOCAL: whatever was measured in it is gone, and the
-      // stage keeps its place in the room.
+      // stage and the screen keep their places in the room.
       const auto& e = reinterpret_cast<const XrEventDataReferenceSpaceChangePending&>(ev);
       Log.info("Reference space {} recentered", static_cast<int>(e.referenceSpaceType));
       g_recenteredNs.store(monotonic_ns(), std::memory_order_relaxed);
