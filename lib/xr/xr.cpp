@@ -25,6 +25,8 @@
 #include <vulkan/vulkan.h>
 #include <openxr/openxr.h>
 #include <openxr/openxr_platform.h>
+#include <roomtone/record.hpp>
+#include <roomtone/roomtone.hpp>
 // After vulkan.h: the fork's single-device hooks (github.com/encounter/dawn
 // plus the melee-xr patches; see docs/quest-xr.md).
 #include <dawn/native/VulkanBackend.h>
@@ -803,8 +805,8 @@ bool create_instance() {
     exts.push_back(XR_META_ENVIRONMENT_RAYCAST_EXTENSION_NAME);
   }
 #ifdef XR_META_environment_depth
-  // The environment depth probe (AURORA_XR_DEPTH_PROBE, depth_probe_frame).
-  B.hasEnvDepthExt &= env_float("AURORA_XR_DEPTH_PROBE", 0.f) > 0.f;
+  // The room capture's depth (AURORA_XR_ROOM_DEPTH=0 leaves it out: room_depth_frame).
+  B.hasEnvDepthExt &= env_flag("AURORA_XR_ROOM_DEPTH", true);
   if (B.hasEnvDepthExt)
     exts.push_back(XR_META_ENVIRONMENT_DEPTH_EXTENSION_NAME);
 #endif
@@ -6182,132 +6184,42 @@ struct {
 } g_room;
 
 // Room capture (source ROOM): the room's light from a passthrough camera
-// (the platform's capture thread, aurora_xr_room_capture_*), while a capture
-// runs: 20 s from choosing ROOM, the head looking around. Each frame's grid
-// of mean colour, over its exposure times sensitivity (relative radiance),
-// lands by the ray of each cell (the lens's intrinsics, its pose against the
-// head, the head's latest pose) in a cube of kCapN x kCapN cells a face, in
-// the room, each of kCapSub x kCapSub parts. A part's radiance is the mean
-// of its samples, the clipped boosted by how much clipped (a lower bound,
-// and a lamp seen only clipped would otherwise vanish into the sky); a
-// cell's is its parts' by solid angle, the unseen ones its hemisphere's
-// mean (a lamp seen at the frame's edge alone lights by the part it covers,
-// not the whole cell). The light is remade
-// every few frames: up to two lights, the brightest cells at least 45
-// degrees apart, by their excess over the mean (the shader's key and fill;
-// a window and a ceiling light both count), the rest as SH L2 as the
-// presets' (room_sh), unseen cells filled from their hemisphere's seen
-// ones. Its level is the room's as passthrough shows it: the seen room's
-// median brightness in the frames' own pixel scale (the relative radiance
-// times the capture's median exposure times sensitivity, undoing what auto
-// exposure took out), by kCapMedian, is the level (ABL). In room_frame the
-// stage's unlit draws take it from above (their tops the baked colour times
-// the level, times STRENGTH), and the fighters as the room's mean light
-// over every direction (kCapFighters times the level): a backlit room
-// shades their front, but on average they keep the game's brightness.
-constexpr int kCapN = 8, kCapSub = 3, kCapF = kCapN * kCapSub;
-constexpr int kCapCells = 6 * kCapN * kCapN, kCapParts = 6 * kCapF * kCapF;
+// (the platform's capture thread, aurora_xr_room_capture_*), estimated by
+// Roomtone (github.com/rhythmerc/roomtone): each frame's grid of linear
+// colour with its exposure and the head's pose, and the raycasts' depth
+// hits, become SH L2, up to two lights with a place in the room, and a
+// level that matches the brightness passthrough shows the room at, at the
+// stage. A capture runs 20 s from choosing ROOM, the head looking around,
+// then ambiently while ROOM stays the source (in the menus, while the stage
+// is placed, in a pause), at kCapAmbientMs a frame. In room_frame the
+// stage's unlit draws take the level from above (their tops the baked
+// colour times the level, times STRENGTH), and the fighters as the room's
+// mean light over every direction (kCapFighters times the level): a
+// backlit room shades their front, but on average they keep the game's
+// brightness. AURORA_XR_ROOM_RECORD=path records the capture's inputs for
+// roomtone_replay.
 constexpr int64_t kCaptureNs = 20'000'000'000;
 // The fighters' mean light at level 1.
 constexpr float kCapFighters = 0.7f;
-// The level per unit of the seen room's median brightness (by solid angle,
-// in passthrough's scale). Passthrough's up moved the level 3x on whether
-// the camera caught the ceiling light (2026-10-21: up 0.115 and level 0.58,
-// too dark, looking ahead; 0.33-0.40 and 1.25, overlit, with the light in
-// view), the room the same. The walls' median hardly moves with a fixture
-// in or out of view. Less where the capture found lights, which add their
-// own on top (as up 1: the sum of their luminance): six captures, where the
-// user's STRENGTH put the level at 9.6 times the median with no light, 9.0
-// at 0.04, 8.1-8.4 at 0.12 and 7.6-7.7 at 0.16 (2026-10-21).
-// Then 1.3 times that: the user's STRENGTH over a day of rooms (2026-10-22).
-constexpr float kCapMedian = 12.5f, kCapLightDim = 1.25f, kCapLevelMax = 1.6f;
-// A frame a bright light dominates (a monitor ahead in a lit room) exposed
-// passthrough darker than the room: its exposure counts as up to
-// kCapGlareMax brighter, by the square root of its mean over its mean
-// without the light (samples over twice the median). The user found such
-// a stage "a little too dark" at the frame's own exposure (2026-10-22).
-constexpr float kCapGlareMax = 1.4f;
-// The room changed (a light switched off): a frame whose samples, where
-// the capture has seen well (kCapChangeSeen samples a part), read
-// kCapChange times brighter or darker by their median, every frame for
-// kCapChangeNs (a hand before the camera passes sooner), starts the capture over, its parts and frames dropped (its depth
-// hits kept): the old light and the new would fight.
-constexpr double kCapChange = 3.0, kCapChangeSeen = 20.0;
-constexpr int64_t kCapChangeNs = 1'000'000'000;
-constexpr size_t kCapChangeMinSamples = 64;
-// The frames whose exposure sets the level: the camera's middle within 40
-// degrees of the stage, the closest 30, at least 10.
-constexpr float kCapStageCos = 0.766f;
-constexpr size_t kCapStageFrames = 30, kCapStageMinFrames = 10;
-// An unseen part takes its hemisphere's seen parts up to this times their
-// median (the rest are lights, not the room's surfaces).
-constexpr float kCapFillMax = 2.f;
-constexpr float kCapClipped = 0.02f, kCapClipBoost = 4.f;
-// Ambient capture: each part a running mean of about its last 600 samples.
-constexpr double kCapPartMax = 600.0;
 constexpr int kRoomSourceCaptured = static_cast<int>(kRoomPresets.size()) + 1;
 
 struct Capture {
   std::mutex mutex;
   bool requested = false;
   int64_t untilNs = 0; // steady clock; 0: not started (no head pose yet)
-  // Ambient capture: while ROOM is the source, in the menus and while the
-  // stage is placed (the head looks around the room there, past lights the
-  // camera's narrower view misses while it looks ahead), at kCapAmbientMs a
-  // frame; the parts are running means (kCapPartMax), so the room keeps up.
+  // Ambient capture: while ROOM is the source, in the menus, while the stage
+  // is placed and in a pause (the head looks around the room there, past
+  // lights the camera's narrower view misses while it looks ahead).
   bool room = false, ambientOk = false;
   uint32_t ambientFrames = 0; // since the last log
-  // The capture's own frame in LOCAL (p = pos + rot_y(p_capture, yaw)): its
-  // parts and hits are kept in it, and a recenter or the stage spot's
-  // anchor moving (move_arenas) moves it, so the lights keep their place in
-  // the room; the light made from them (sh, lightDir, lightPos) is in LOCAL.
-  XrVector3f pos{};
-  float yaw = 0.f;
-  bool haveCamera = false;
-  float q[4]{0.f, 0.f, 0.f, 1.f}, t[3]{}, k[4]{};
-  int sensorW = 0, sensorH = 0, w = 0, h = 0;
-  // Each part's r, g, b sums and their count: unclipped samples, then clipped (boosted).
-  std::array<std::array<double, 8>, kCapParts> parts{};
-  // Each cell's luminance and how it was seen (clear and clipped samples,
-  // parts seen), for the log.
-  std::array<std::array<float, 4>, kCapCells> seenAs{};
-  uint32_t frames = 0, sinceMade = 0;
-  float exposure = -1.f, iso = -1.f;
-  // Recent frames' exposure (ms) times ISO over 100, and where the head was
-  // and the camera looked (the capture's frame).
-  struct View {
-    float factor; // with the glare's (kCapGlareMax)
-    XrVector3f head, dir;
-    float glare;
-  };
-  std::vector<View> views;
-  // Depth hits (light_cast): direction from the head (unit), then the point;
-  // the oldest replaced once full.
-  std::vector<std::array<float, 6>> hits;
-  size_t hitNext = 0;
   uint32_t casts = 0;
-  std::array<bool, 2> lightAt{};                 // a light with a place in the room
-  std::array<std::array<float, 3>, 2> lightPos{}; // where
-  std::array<int, 2> lightHits{};                // from how many hits
-  float mean = 1.f, display = 0.f, level = 1.f; // mean light (up 1), passthrough's up, level
-  float seen = 0.f;   // the seen parts' mean luminance, in passthrough's scale (as display)
-  float middle = 0.f; // and their median by solid angle
-  float unclamped = 0.f; // the level before its clamp
-  float radiance = 0.f, dim = 1.f; // the seen median's relative radiance, and the lights' dimming
-  // The stage the level was last made for (LOCAL), and from how many frames
-  // looking at it (0: all of them).
-  bool haveStage = false;
-  XrVector3f stageAt{};
-  int stageFrames = 0;
-  float stageGlare = 1.f; // the median glare of those frames
-  int64_t changedNs = 0;  // since when the room read changed (kCapChange); 0: it doesn't
-  std::array<float, 2> lightRange{}; // a placed light's distance from the head where it was seen
-  std::array<std::array<float, 3>, 2> fill{}; // the unseen parts' colour (luminance 1), upper and lower
-  // The light last made from them (made: any).
-  bool made = false;
-  std::array<std::array<float, 3>, 9> sh{};
-  std::array<std::array<float, 3>, 2> lightDir{{{0.f, 1.f, 0.f}, {0.f, 1.f, 0.f}}}, light{};
-  float coverage = 0.f;
+  roomtone::Room est;
+  roomtone::Recorder rec;
+  bool recTried = false;
+  // capture_light's last answer, for frames the capture thread holds the
+  // mutex (a make with voxels takes milliseconds).
+  bool haveLast = false;
+  roomtone::Lighting last;
 } g_capture;
 
 int64_t steady_ns() {
@@ -6315,350 +6227,31 @@ int64_t steady_ns() {
       .count();
 }
 
-// A direction's cube cell (of n x n a face), and a cell's direction
-// (unnormalized) and solid angle.
-int cap_cell(const std::array<float, 3>& d, int n = kCapN) {
-  const float ax = std::abs(d[0]), ay = std::abs(d[1]), az = std::abs(d[2]);
-  int face;
-  float u, v, m;
-  if (ax >= ay && ax >= az)
-    face = d[0] > 0.f ? 0 : 1, m = ax, u = d[2], v = d[1];
-  else if (ay >= az)
-    face = d[1] > 0.f ? 2 : 3, m = ay, u = d[0], v = d[2];
-  else
-    face = d[2] > 0.f ? 4 : 5, m = az, u = d[0], v = d[1];
-  if (!(m > 0.f))
-    return -1;
-  const int i = std::clamp(static_cast<int>((u / m + 1.f) * 0.5f * n), 0, n - 1);
-  const int j = std::clamp(static_cast<int>((v / m + 1.f) * 0.5f * n), 0, n - 1);
-  return (face * n + j) * n + i;
-}
-std::array<float, 3> cap_dir(int cell, float& dOmega, int n = kCapN) {
-  const int face = cell / (n * n), j = (cell / n) % n, i = cell % n;
-  const float u = (i + 0.5f) / n * 2.f - 1.f, v = (j + 0.5f) / n * 2.f - 1.f;
-  const float s = face % 2 == 0 ? 1.f : -1.f;
-  const std::array<float, 3> d = face < 2 ? std::array<float, 3>{s, v, u}
-                                 : face < 4 ? std::array<float, 3>{u, s, v}
-                                            : std::array<float, 3>{u, v, s};
-  const float r2 = 1.f + u * u + v * v;
-  dOmega = (4.f / (n * n)) / (r2 * std::sqrt(r2));
-  return d;
-}
+roomtone::Vec3 rt(const XrVector3f& v) { return {v.x, v.y, v.z}; }
+roomtone::Quat rt(const XrQuaternionf& q) { return {q.x, q.y, q.z, q.w}; }
 
-// The median exposure of the frames looking at the stage (LOCAL; null: of
-// all frames), as passthrough showed the room there: it shares the
-// camera's auto exposure, so a monitor or a window in view darkened both,
-// and the user plays looking at the stage, not at them (2026-10-22: a
-// capture looking at a monitor came out at level 0.45, too dark). The
-// closest kCapStageFrames within kCapStageCos; fewer than
-// kCapStageMinFrames, all of them. Under g_capture.mutex.
-float capture_factor_locked(const XrVector3f* stage, int* used = nullptr, float* glare = nullptr) {
+// AURORA_XR_ROOM_RECORD: opened with the first capture. Under g_capture.mutex.
+void capture_record_open_locked() {
   auto& c = g_capture;
-  if (used)
-    *used = 0;
-  if (glare)
-    *glare = 1.f;
-  if (c.views.empty())
-    return 1.f;
-  std::vector<std::pair<float, const Capture::View*>> near; // cos, frame
-  if (stage) {
-    const XrVector3f s = rot_y(*stage - c.pos, -c.yaw);
-    for (const auto& v : c.views) {
-      const XrVector3f d = s - v.head;
-      const float n = std::sqrt(vdot(d, d));
-      if (n > 0.05f)
-        if (const float cs = vdot(d, v.dir) / n; cs > kCapStageCos)
-          near.emplace_back(cs, &v);
-    }
-  }
-  std::vector<const Capture::View*> chosen;
-  if (near.size() >= kCapStageMinFrames) {
-    const size_t k = std::min<size_t>(near.size(), kCapStageFrames);
-    std::partial_sort(near.begin(), near.begin() + k, near.end(),
-                      [](const auto& a, const auto& b) { return a.first > b.first; });
-    for (size_t i = 0; i < k; ++i)
-      chosen.push_back(near[i].second);
-    if (used)
-      *used = static_cast<int>(k);
-  } else {
-    for (const auto& v : c.views)
-      chosen.push_back(&v);
-  }
-  const auto median_of = [&](auto get) {
-    std::vector<float> f;
-    for (const auto* v : chosen)
-      f.push_back(get(*v));
-    std::nth_element(f.begin(), f.begin() + f.size() / 2, f.end());
-    return f[f.size() / 2];
-  };
-  if (glare)
-    *glare = median_of([](const Capture::View& v) { return v.glare; });
-  return median_of([](const Capture::View& v) { return v.factor; });
-}
-
-// The level, for the stage where it last was. Under g_capture.mutex.
-void capture_level_locked() {
-  auto& c = g_capture;
-  const float factor = capture_factor_locked(c.haveStage ? &c.stageAt : nullptr, &c.stageFrames, &c.stageGlare);
-  c.unclamped = kCapMedian * c.dim * c.radiance * factor;
-  c.level = std::clamp(c.unclamped, 0.15f, kCapLevelMax);
-}
-
-// The light from the cells so far (under g_capture.mutex).
-void capture_make() {
-  auto& c = g_capture;
-  std::array<std::array<double, 3>, kCapCells> L{};
-  std::array<bool, kCapCells> seen{};
-  // The parts' radiance, and each hemisphere's seen parts (luminance, solid
-  // angle, part).
-  std::vector<std::array<double, 3>> P(kCapParts);
-  std::vector<bool> partSeen(kCapParts);
-  std::vector<std::tuple<double, double, int>> hemiParts[2];
-  double seenW = 0.0, seenLum = 0.0;
-  std::vector<std::pair<double, double>> byLum; // the seen parts' luminance and solid angle
-  for (int f = 0; f < kCapParts; ++f) {
-    const auto& e = c.parts[f];
-    if (!(e[3] + e[7] > 0.0))
-      continue;
-    partSeen[f] = true;
-    float dw;
-    const auto d = cap_dir(f, dw, kCapF);
-    const int h = d[1] >= 0.f ? 0 : 1;
-    for (int k = 0; k < 3; ++k)
-      P[f][k] = (e[k] + e[4 + k]) / (e[3] + e[7]);
-    seenW += dw;
-    const double lum = 0.2126 * P[f][0] + 0.7152 * P[f][1] + 0.0722 * P[f][2];
-    seenLum += lum * dw;
-    byLum.emplace_back(lum, dw);
-    hemiParts[h].emplace_back(lum, dw, f);
-  }
-  if (!(seenW > 0.0))
+  if (std::exchange(c.recTried, true))
     return;
-  // What unseen parts take: their hemisphere's seen surfaces, by solid angle,
-  // without its lights (parts over kCapFillMax times its median). A monitor
-  // filling the view ahead turned the whole room its blue, as if it lit
-  // every direction the camera hadn't seen (2026-10-22). A hemisphere
-  // unseen takes half the other's.
-  std::array<double, 3> hemi[2]{};
-  bool hemiSeen[2]{};
-  for (int h = 0; h < 2; ++h) {
-    auto& v = hemiParts[h];
-    if (v.empty())
-      continue;
-    std::sort(v.begin(), v.end());
-    double total = 0.0;
-    for (const auto& [lum, dw, f] : v)
-      total += dw;
-    double half = 0.5 * total, med = std::get<0>(v.back());
-    for (const auto& [lum, dw, f] : v)
-      if ((half -= dw) <= 0.0) {
-        med = lum;
-        break;
-      }
-    double w = 0.0;
-    for (const auto& [lum, dw, f] : v) {
-      if (lum > kCapFillMax * med)
-        break;
-      for (int k = 0; k < 3; ++k)
-        hemi[h][k] += P[f][k] * dw;
-      w += dw;
-    }
-    if (!(w > 0.0))
-      continue;
-    for (int k = 0; k < 3; ++k)
-      hemi[h][k] /= w;
-    hemiSeen[h] = true;
-  }
-  for (int h = 0; h < 2; ++h)
-    if (!hemiSeen[h])
-      for (int k = 0; k < 3; ++k)
-        hemi[h][k] = hemi[1 - h][k] * 0.5;
-  for (int h = 0; h < 2; ++h) {
-    const double lum = 0.2126 * hemi[h][0] + 0.7152 * hemi[h][1] + 0.0722 * hemi[h][2];
-    for (int k = 0; k < 3; ++k)
-      c.fill[h][k] = static_cast<float>(lum > 0.0 ? hemi[h][k] / lum : 0.0);
-  }
-  // The cells: their parts by solid angle, the unseen ones their hemisphere's.
-  std::array<double, kCapCells> cellW{};
-  c.seenAs = {};
-  for (int f = 0; f < kCapParts; ++f) {
-    const int face = f / (kCapF * kCapF), j = (f / kCapF) % kCapF, i = f % kCapF;
-    const int cell = (face * kCapN + j / kCapSub) * kCapN + i / kCapSub;
-    float dw;
-    const auto d = cap_dir(f, dw, kCapF);
-    const auto& v = partSeen[f] ? P[f] : hemi[d[1] >= 0.f ? 0 : 1];
-    for (int k = 0; k < 3; ++k)
-      L[cell][k] += v[k] * dw;
-    cellW[cell] += dw;
-    if (partSeen[f]) {
-      seen[cell] = true;
-      c.seenAs[cell][1] += static_cast<float>(c.parts[f][3]);
-      c.seenAs[cell][2] += static_cast<float>(c.parts[f][7]);
-      c.seenAs[cell][3] += 1.f;
-    }
-  }
-  for (int i = 0; i < kCapCells; ++i) {
-    for (int k = 0; k < 3; ++k)
-      L[i][k] /= cellW[i];
-    c.seenAs[i][0] = static_cast<float>(0.2126 * L[i][0] + 0.7152 * L[i][1] + 0.0722 * L[i][2]);
-  }
-  // The lights: the brightest seen cells, at least 45 degrees apart, each
-  // its excess over the mean of the room taken out of the sky as a
-  // directional light of that irradiance over pi (as the presets' are).
-  const auto lum_of = [](const std::array<double, 3>& v) { return 0.2126 * v[0] + 0.7152 * v[1] + 0.0722 * v[2]; };
-  const auto unit_dir = [](int cell) {
-    float dw;
-    const auto d = cap_dir(cell, dw);
-    const float dl = std::sqrt(d[0] * d[0] + d[1] * d[1] + d[2] * d[2]);
-    return std::array<float, 3>{d[0] / dl, d[1] / dl, d[2] / dl};
-  };
-  double meanLum = 0.0;
-  for (int i = 0; i < kCapCells; ++i)
-    meanLum += lum_of(L[i]) / kCapCells;
-  std::array<std::array<double, 3>, 2> light{};
-  std::array<std::array<float, 3>, 2> lightDir{{{0.f, 1.f, 0.f}, {0.f, 1.f, 0.f}}};
-  int picked[2] = {-1, -1};
-  for (int l = 0; l < 2; ++l) {
-    int best = -1;
-    double bestLum = 2.0 * meanLum;
-    for (int i = 0; i < kCapCells; ++i) {
-      if (!seen[i] || i == picked[0])
-        continue;
-      if (l == 1 && picked[0] >= 0) {
-        const auto a = unit_dir(i), b = unit_dir(picked[0]);
-        if (a[0] * b[0] + a[1] * b[1] + a[2] * b[2] > 0.7071f)
-          continue;
-      }
-      if (const double lum = lum_of(L[i]); lum > bestLum)
-        bestLum = lum, best = i;
-    }
-    if (best < 0)
-      break;
-    picked[l] = best;
-    float dw;
-    cap_dir(best, dw);
-    lightDir[l] = unit_dir(best);
-    for (int k = 0; k < 3; ++k) {
-      const double excess = std::max(L[best][k] - meanLum, 0.0);
-      light[l][k] = excess * dw / 3.14159265358979323846;
-      L[best][k] -= excess;
-    }
-  }
-  // SH L2, as room_sh.
-  constexpr std::array<double, 9> basis{0.282095, 0.488603, 0.488603, 0.488603, 1.092548,
-                                        1.092548, 0.315392, 1.092548, 0.546274};
-  constexpr std::array<double, 9> lobe{1.0, 2.0 / 3, 2.0 / 3, 2.0 / 3, 0.25, 0.25, 0.25, 0.25, 0.25};
-  std::array<std::array<double, 3>, 9> acc{};
-  for (int i = 0; i < kCapCells; ++i) {
-    float dw;
-    const auto dc = cap_dir(i, dw);
-    const XrVector3f dv = rot_y({dc[0], dc[1], dc[2]}, c.yaw); // in LOCAL
-    const double dl = std::sqrt(double(dv.x) * dv.x + double(dv.y) * dv.y + double(dv.z) * dv.z);
-    const double x = dv.x / dl, y = dv.y / dl, z = dv.z / dl;
-    const std::array<double, 9> poly{1.0, y, z, x, x * y, y * z, 3.0 * z * z - 1.0, x * z, x * x - y * y};
-    for (int k = 0; k < 9; ++k)
-      for (int ch = 0; ch < 3; ++ch)
-        acc[k][ch] += L[i][ch] * basis[k] * poly[k] * dw;
-  }
-  std::array<std::array<double, 3>, 9> sh;
-  for (int k = 0; k < 9; ++k)
-    for (int ch = 0; ch < 3; ++ch)
-      sh[k][ch] = acc[k][ch] * lobe[k] * basis[k];
-  // Scaled so an up-facing surface gets 1 (as room_frame's up), the level apart.
-  double up[3];
-  for (int ch = 0; ch < 3; ++ch)
-    up[ch] = sh[0][ch] + sh[1][ch] - sh[6][ch] - sh[8][ch] + std::max(lightDir[0][1], 0.f) * light[0][ch] +
-             std::max(lightDir[1][1], 0.f) * light[1][ch];
-  const double upLum = 0.2126 * up[0] + 0.7152 * up[1] + 0.0722 * up[2];
-  if (!(upLum > 1e-12))
-    return;
-  // Up-facing light 1; the level from passthrough's brightness.
-  const double scale = 1.0 / upLum;
-  const float median = capture_factor_locked(nullptr);
-  c.display = static_cast<float>(upLum * median);
-  c.seen = static_cast<float>(seenLum / seenW * median);
-  std::sort(byLum.begin(), byLum.end());
-  double half = 0.5 * seenW, middle = byLum.back().first;
-  for (const auto& [lum, dw] : byLum)
-    if ((half -= dw) <= 0.0) {
-      middle = lum;
-      break;
-    }
-  c.middle = static_cast<float>(middle * median);
-  // The level from the walls as seen, not from above: a light in or out of
-  // the camera's view (it sees ~36 degrees up and down) moves the light
-  // from above 3x, the room the same.
-  const double lights = (lum_of(light[0]) + lum_of(light[1])) * scale;
-  c.radiance = static_cast<float>(middle);
-  c.dim = static_cast<float>(std::max(1.0 - kCapLightDim * lights, 0.5));
-  capture_level_locked();
-  c.mean = static_cast<float>((0.2126 * sh[0][0] + 0.7152 * sh[0][1] + 0.0722 * sh[0][2] +
-                               0.25 * (lum_of(light[0]) + lum_of(light[1]))) * scale);
-  for (int k = 0; k < 9; ++k)
-    for (int ch = 0; ch < 3; ++ch)
-      c.sh[k][ch] = static_cast<float>(sh[k][ch] * scale);
-  for (int l = 0; l < 2; ++l)
-    for (int ch = 0; ch < 3; ++ch)
-      c.light[l][ch] = static_cast<float>(light[l][ch] * scale);
-  for (int l = 0; l < 2; ++l) {
-    const XrVector3f d = rot_y({lightDir[l][0], lightDir[l][1], lightDir[l][2]}, c.yaw);
-    c.lightDir[l] = {d.x, d.y, d.z};
-  }
-  // Where the lights are, from the depth hits within 10 degrees of them
-  // (none: at a distance, as daylight through a window, whose glass depth
-  // doesn't see).
-  for (int l = 0; l < 2; ++l) {
-    c.lightAt[l] = false;
-    c.lightHits[l] = 0;
-    if (picked[l] < 0)
-      continue;
-    const auto& u = lightDir[l];
-    double sum[3]{};
-    int n = 0;
-    for (const auto& h : c.hits)
-      if (h[0] * u[0] + h[1] * u[1] + h[2] * u[2] > 0.9848f)
-        sum[0] += h[3], sum[1] += h[4], sum[2] += h[5], ++n;
-    c.lightHits[l] = n;
-    if (n < 2)
-      continue;
-    const XrVector3f at = c.pos + rot_y({static_cast<float>(sum[0] / n), static_cast<float>(sum[1] / n),
-                                         static_cast<float>(sum[2] / n)},
-                                        c.yaw);
-    c.lightPos[l] = {at.x, at.y, at.z};
-    c.lightAt[l] = true;
-    // Its distance from where the head was (the frames' mean): the light
-    // measured there, it falls off with distance from the stage.
-    XrVector3f head{};
-    for (const auto& v : c.views)
-      head = head + v.head * (1.f / static_cast<float>(c.views.size()));
-    const XrVector3f d = XrVector3f{static_cast<float>(sum[0] / n), static_cast<float>(sum[1] / n),
-                                    static_cast<float>(sum[2] / n)} - head;
-    c.lightRange[l] = c.views.empty() ? 0.f : std::sqrt(vdot(d, d));
-  }
-  c.coverage = static_cast<float>(seenW / (4.0 * 3.14159265358979323846));
-  c.made = true;
+  if (const char* path = std::getenv("AURORA_XR_ROOM_RECORD"); path && *path)
+    Log.info("Room capture: recording to {} ({})", path, c.rec.open(path) ? "open" : "failed");
 }
 
-// Starts a capture (choosing ROOM), the cells so far dropped.
+// Starts a capture (choosing ROOM), what was seen dropped.
 void capture_start() {
   std::lock_guard lock{g_capture.mutex};
-  g_capture.requested = true;
-  g_capture.room = true;
-  g_capture.ambientFrames = 0;
-  g_capture.hitNext = 0;
-  g_capture.pos = {};
-  g_capture.yaw = 0.f;
-  g_capture.untilNs = 0;
-  g_capture.parts = {};
-  g_capture.frames = g_capture.sinceMade = 0;
-  g_capture.made = false;
-  g_capture.coverage = 0.f;
-  g_capture.views.clear();
-  g_capture.hits.clear();
-  g_capture.casts = 0;
-  g_capture.lightAt = {};
-  g_capture.lightRange = {};
-  g_capture.changedNs = 0;
+  auto& c = g_capture;
+  capture_record_open_locked();
+  c.requested = true;
+  c.room = true;
+  c.ambientFrames = 0;
+  c.untilNs = 0;
+  c.casts = 0;
+  c.est.reset();
+  c.rec.reset();
+  c.haveLast = false;
 }
 
 // ROOM chosen again: the capture so far kept (ambient capture goes on from
@@ -6667,7 +6260,7 @@ void capture_start() {
 void capture_resume() {
   {
     std::lock_guard lock{g_capture.mutex};
-    if (g_capture.made || g_capture.frames > 0) {
+    if (g_capture.est.made() || g_capture.est.frames() > 0) {
       g_capture.room = true;
       return;
     }
@@ -6682,26 +6275,14 @@ void capture_stop() {
 }
 
 // Under g_arenaMutex (move_arenas): the room moved in LOCAL, (p0, y0) to
-// (p1, y1); the capture's frame and its light move with it. A turn of a
-// degree or more remakes the light (its SH turned with the parts).
+// (p1, y1); the capture and its light move with it.
 void capture_moved(XrVector3f p0, float y0, XrVector3f p1, float y1) {
   std::lock_guard lock{g_capture.mutex};
   auto& c = g_capture;
-  const float dy = y1 - y0;
-  c.pos = p1 + rot_y(c.pos - p0, dy);
-  c.yaw += dy;
-  for (int l = 0; l < 2; ++l) {
-    const XrVector3f at = p1 + rot_y(XrVector3f{c.lightPos[l][0], c.lightPos[l][1], c.lightPos[l][2]} - p0, dy);
-    const XrVector3f d = rot_y({c.lightDir[l][0], c.lightDir[l][1], c.lightDir[l][2]}, dy);
-    c.lightPos[l] = {at.x, at.y, at.z};
-    c.lightDir[l] = {d.x, d.y, d.z};
-  }
-  if (c.made && std::abs(dy) > 0.0175f) {
-    capture_make();
-    Log.info("Room capture: the room turned {:.0f} deg in tracking space; its lights kept their place (key from "
-             "{:.2f},{:.2f},{:.2f})",
-             dy * 57.2958f, c.lightDir[0][0], c.lightDir[0][1], c.lightDir[0][2]);
-  }
+  c.rec.moved(rt(p0), y0, rt(p1), y1);
+  if (c.est.moved(rt(p0), y0, rt(p1), y1))
+    Log.info("Room capture: the room turned {:.0f} deg in tracking space; its lights kept their place",
+             (y1 - y0) * 57.2958f);
 }
 
 // A capture's frames wanted now: 1 (the 20 s after choosing ROOM), 2
@@ -6715,7 +6296,7 @@ int capture_mode_locked() {
 int capture_casting() {
   std::lock_guard lock{g_capture.mutex};
   const int mode = capture_mode_locked();
-  return mode == 1 ? (g_capture.untilNs != 0 ? 1 : 0) : mode == 2 && g_capture.frames > 0 ? 2 : 0;
+  return mode == 1 ? (g_capture.untilNs != 0 ? 1 : 0) : mode == 2 && g_capture.est.frames() > 0 ? 2 : 0;
 }
 
 void capture_note_cast() {
@@ -6724,75 +6305,58 @@ void capture_note_cast() {
 }
 
 void capture_note_hit(const XrVector3f& origin, const XrVector3f& point) {
-  const float d[3] = {point.x - origin.x, point.y - origin.y, point.z - origin.z};
-  const float n = std::sqrt(d[0] * d[0] + d[1] * d[1] + d[2] * d[2]);
-  if (!(n > 0.05f))
-    return;
   std::lock_guard lock{g_capture.mutex};
-  auto& c = g_capture;
-  const XrVector3f u = rot_y({d[0] / n, d[1] / n, d[2] / n}, -c.yaw), q = rot_y(point - c.pos, -c.yaw);
-  const std::array<float, 6> h{u.x, u.y, u.z, q.x, q.y, q.z};
-  if (c.hits.size() < 16384)
-    c.hits.push_back(h);
-  else
-    c.hits[c.hitNext++ % c.hits.size()] = h;
+  g_capture.est.addHit(rt(origin), rt(point));
+  g_capture.rec.hit(rt(origin), rt(point));
 }
 
-// The captured light for room_frame: false while none is made.
+// The captured light for room_frame, at the stage (its origin, lifted to
+// about a fighter's middle: the origin is on the table, whose own surface
+// Roomtone leaves out within 15 cm): false while none is made.
+constexpr float kCapLift = 0.04f;
 bool capture_light(std::array<std::array<float, 3>, 9>& sh, std::array<std::array<float, 3>, 2>& dirs,
                    std::array<std::array<float, 3>, 2>& lights, float& mean, float& level,
                    const XrVector3f& stage) {
-  std::lock_guard lock{g_capture.mutex};
-  if (!g_capture.made)
+  auto& c = g_capture;
+  roomtone::Lighting l;
+  if (std::unique_lock lock{c.mutex, std::try_to_lock}; lock.owns_lock()) {
+    const roomtone::Vec3 at{stage.x, stage.y + kCapLift, stage.z};
+    if (c.rec.isOpen())
+      c.rec.query(at, steady_ns());
+    c.haveLast = c.est.lightAt(at, l);
+    if (c.haveLast)
+      c.last = l;
+    else
+      return false;
+  } else if (c.haveLast) {
+    l = c.last;
+  } else {
     return false;
-  // The stage moved (5 cm): the level from the frames looking at it there.
-  if (const XrVector3f d = stage - g_capture.stageAt; !g_capture.haveStage || vdot(d, d) > 0.0025f) {
-    g_capture.haveStage = true;
-    g_capture.stageAt = stage;
-    capture_level_locked();
   }
-  sh = g_capture.sh;
-  dirs = g_capture.lightDir;
-  // A light with a place: toward it from the stage, wherever the stage is.
-  for (int l = 0; l < 2; ++l) {
-    if (!g_capture.lightAt[l])
-      continue;
-    const auto& p = g_capture.lightPos[l];
-    const float d[3] = {p[0] - stage.x, p[1] - stage.y, p[2] - stage.z};
-    const float n = std::sqrt(d[0] * d[0] + d[1] * d[1] + d[2] * d[2]);
-    if (n > 0.05f)
-      dirs[l] = {d[0] / n, d[1] / n, d[2] / n};
+  sh = l.sh;
+  for (int i = 0; i < 2; ++i) {
+    dirs[i] = {l.lights[i].dir.x, l.lights[i].dir.y, l.lights[i].dir.z};
+    lights[i] = l.lights[i].color;
   }
-  lights = g_capture.light;
-  // A placed light by the inverse square of its distance, from where it was
-  // measured (the head) to the stage: a ceiling light a stage on a table
-  // sits farther from than the head did lit it as strongly (2026-10-22: "a
-  // bit too much influence").
-  for (int l = 0; l < 2; ++l) {
-    const auto& p = g_capture.lightPos[l];
-    const float d[3] = {p[0] - stage.x, p[1] - stage.y, p[2] - stage.z};
-    const float n2 = d[0] * d[0] + d[1] * d[1] + d[2] * d[2];
-    if (!g_capture.lightAt[l] || !(g_capture.lightRange[l] > 0.f) || n2 < 0.01f)
-      continue;
-    const float k = std::clamp(g_capture.lightRange[l] * g_capture.lightRange[l] / n2, 0.2f, 2.f);
-    for (float& x : lights[l])
-      x *= k;
-  }
-  mean = g_capture.mean;
-  level = g_capture.level;
+  mean = l.mean;
+  level = l.level;
   return true;
 }
 
 #ifdef XR_META_environment_depth
-// The environment depth probe (AURORA_XR_DEPTH_PROBE: 1 while the room
-// capture runs, 2 always, for its cost in fights). Measuring the Depth API
-// for a room capture by points (docs/xr-room-depth-plan.md): the depth
-// image's size, how soon the provider gives one after starting, its age,
-// and, twice a second, the image read back and checked against the
-// capture's raycast hits (in which orientation its rows run, and the
-// conversion: OpenGL depth, nearZ / (1 - d) with an infinite far plane).
-struct DepthProbe {
-  int mode = 0;
+// The room capture's depth (AURORA_XR_ROOM_DEPTH, on by default where the
+// runtime offers XR_META_environment_depth): while a capture runs, the
+// provider runs, and up to kRoomDepthHz images a second are read back (a
+// copy into a host buffer) and handed to Roomtone, view 0 (the left eye,
+// by the left camera) at 80x80, so the room's surfaces get a place
+// (docs/xr-room-depth-plan.md). Measured on a Quest 3 (e7df6af): 320x320 a
+// view, D16, nearZ / (1 - d) with rows from the bottom, 94x99 degrees; the
+// first image 128 ms after a 9 ms start; 0.25-0.3 ms an acquire; no
+// measurable cost in a four-CPU fight.
+constexpr int64_t kRoomDepthNs = 100'000'000;
+constexpr uint32_t kRoomDepthGrid = 80;
+
+struct RoomDepth {
   bool tried = false, ok = false, running = false, first = false;
   XrEnvironmentDepthProviderMETA provider = XR_NULL_HANDLE;
   XrEnvironmentDepthSwapchainMETA swapchain = XR_NULL_HANDLE;
@@ -6805,9 +6369,10 @@ struct DepthProbe {
   VkFence fence = VK_NULL_HANDLE;
   bool pending = false; // a read-back in flight
   XrEnvironmentDepthImageMETA copied{XR_TYPE_ENVIRONMENT_DEPTH_IMAGE_META};
-  int64_t startNs = 0, copyNs = 0, logNs = 0;
-  uint32_t acquired = 0, unavailable = 0, failed = 0, checks = 0;
+  int64_t copiedNs = 0, startNs = 0, acquireAtNs = 0, logNs = 0;
+  uint32_t acquired = 0, unavailable = 0, failed = 0, fed = 0;
   int64_t acquireNs = 0, ageNs = 0;
+  std::vector<uint16_t> small;
   PFN_xrCreateEnvironmentDepthProviderMETA createProvider = nullptr;
   PFN_xrStartEnvironmentDepthProviderMETA start = nullptr;
   PFN_xrStopEnvironmentDepthProviderMETA stop = nullptr;
@@ -6818,7 +6383,7 @@ struct DepthProbe {
   PFN_xrSetEnvironmentDepthHandRemovalMETA setHandRemoval = nullptr;
 } g_depth;
 
-bool depth_probe_init() {
+bool room_depth_init() {
   auto& d = g_depth;
   d.createProvider = xr_proc<PFN_xrCreateEnvironmentDepthProviderMETA>("xrCreateEnvironmentDepthProviderMETA");
   d.start = xr_proc<PFN_xrStartEnvironmentDepthProviderMETA>("xrStartEnvironmentDepthProviderMETA");
@@ -6831,21 +6396,21 @@ bool depth_probe_init() {
   d.setHandRemoval = xr_proc<PFN_xrSetEnvironmentDepthHandRemovalMETA>("xrSetEnvironmentDepthHandRemovalMETA");
   if (!d.createProvider || !d.start || !d.stop || !d.createSwapchain || !d.enumerateImages || !d.getState ||
       !d.acquire) {
-    Log.warn("Depth probe: the extension's functions are missing");
+    Log.warn("Room depth: the extension's functions are missing");
     return false;
   }
   XrEnvironmentDepthProviderCreateInfoMETA pci{XR_TYPE_ENVIRONMENT_DEPTH_PROVIDER_CREATE_INFO_META};
   if (const XrResult r = d.createProvider(B.session, &pci, &d.provider); XR_FAILED(r)) {
-    Log.warn("Depth probe: xrCreateEnvironmentDepthProviderMETA failed: {}", static_cast<int>(r));
+    Log.warn("Room depth: xrCreateEnvironmentDepthProviderMETA failed: {}", static_cast<int>(r));
     return false;
   }
   XrEnvironmentDepthSwapchainCreateInfoMETA sci{XR_TYPE_ENVIRONMENT_DEPTH_SWAPCHAIN_CREATE_INFO_META};
   if (const XrResult r = d.createSwapchain(d.provider, &sci, &d.swapchain); XR_FAILED(r)) {
-    Log.warn("Depth probe: xrCreateEnvironmentDepthSwapchainMETA failed: {}", static_cast<int>(r));
+    Log.warn("Room depth: xrCreateEnvironmentDepthSwapchainMETA failed: {}", static_cast<int>(r));
     return false;
   }
   XrEnvironmentDepthSwapchainStateMETA st{XR_TYPE_ENVIRONMENT_DEPTH_SWAPCHAIN_STATE_META};
-  if (XR_FAILED(d.getState(d.swapchain, &st)) || st.width == 0 || st.height == 0)
+  if (XR_FAILED(d.getState(d.swapchain, &st)) || st.width < kRoomDepthGrid || st.height < kRoomDepthGrid)
     return false;
   d.w = st.width, d.h = st.height;
   uint32_t n = 0;
@@ -6856,7 +6421,7 @@ bool depth_probe_init() {
     return false;
   for (const auto& i : imgs)
     d.images.push_back(i.image);
-  // Both views (D16 assumed: the check against the hits says if it isn't).
+  // Both views, D16.
   VkBufferCreateInfo bci{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
   bci.size = static_cast<VkDeviceSize>(d.w) * d.h * 2 * 2;
   bci.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
@@ -6881,91 +6446,41 @@ bool depth_probe_init() {
   VK_TRY(vkAllocateCommandBuffers(B.dev, &cai, &d.cmd));
   VkFenceCreateInfo fci{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
   VK_TRY(vkCreateFence(B.dev, &fci, nullptr, &d.fence));
+  // The hands left out (the room behind them), as the camera's samples of
+  // a hand land on whatever depth is behind it anyway.
   bool handRemoval = false;
   if (d.setHandRemoval) {
     XrEnvironmentDepthHandRemovalSetInfoMETA hi{XR_TYPE_ENVIRONMENT_DEPTH_HAND_REMOVAL_SET_INFO_META};
     hi.enabled = XR_TRUE;
     handRemoval = XR_SUCCEEDED(d.setHandRemoval(d.provider, &hi));
   }
-  Log.info("Depth probe: {}x{} depth, {} images, hand removal {}, mode {}", d.w, d.h, n, handRemoval ? "on" : "off",
-           d.mode);
+  Log.info("Room depth: {}x{} depth, {} images, hand removal {}", d.w, d.h, n, handRemoval ? "on" : "off");
   return true;
 }
 
-// Distance along the view's axis, from a depth value.
-float depth_linear(uint16_t v, float nearZ, float farZ) {
-  const float dn = static_cast<float>(v) / 65535.f;
-  if (!std::isfinite(farZ))
-    return dn < 1.f ? nearZ / (1.f - dn) : INFINITY;
-  const float z = 2.f * dn - 1.f;
-  return 2.f * nearZ * farZ / (farZ + nearZ - z * (farZ - nearZ));
-}
-
-// The read-back's view 0 against the capture's hits.
-void depth_probe_check() {
+// The read-back's view 0, at kRoomDepthGrid a side, to the capture.
+void room_depth_feed() {
   auto& d = g_depth;
   const auto& im = d.copied;
   const XrEnvironmentDepthImageViewMETA& v = im.views[0];
-  const float tl = std::tan(v.fov.angleLeft), tr = std::tan(v.fov.angleRight), tu = std::tan(v.fov.angleUp),
-              td = std::tan(v.fov.angleDown);
-  // The view's own: valid share and median distance.
-  std::vector<float> zs;
-  uint32_t valid = 0;
-  for (uint32_t i = 0; i < d.w * d.h; i += 7) {
-    const float z = depth_linear(d.mapped[i], im.nearZ, im.farZ);
-    if (std::isfinite(z) && z > 0.f)
-      ++valid, zs.push_back(z);
-  }
-  float med = 0.f;
-  if (!zs.empty()) {
-    std::nth_element(zs.begin(), zs.begin() + zs.size() / 2, zs.end());
-    med = zs[zs.size() / 2];
-  }
-  // The hits in its view, sampled with the rows from the top and from the bottom.
-  std::vector<float> ratio[2];
-  {
-    std::lock_guard lock{g_capture.mutex};
-    const auto& c = g_capture;
-    const size_t step = std::max<size_t>(c.hits.size() / 1500, 1);
-    for (size_t k = 0; k < c.hits.size(); k += step) {
-      const auto& hit = c.hits[k];
-      const XrVector3f at = c.pos + rot_y({hit[3], hit[4], hit[5]}, c.yaw);
-      const XrVector3f pv = qrot(qconj(v.pose.orientation), at - v.pose.position);
-      if (pv.z > -0.2f)
-        continue;
-      const float x = pv.x / -pv.z, y = pv.y / -pv.z;
-      const float u = (x - tl) / (tr - tl), vt = (tu - y) / (tu - td);
-      if (u < 0.f || u >= 1.f || vt < 0.f || vt >= 1.f)
-        continue;
-      const uint32_t px = static_cast<uint32_t>(u * d.w);
-      for (int o = 0; o < 2; ++o) {
-        const uint32_t py = static_cast<uint32_t>((o == 0 ? vt : 1.f - vt) * d.h);
-        const float z = depth_linear(d.mapped[std::min(py, d.h - 1) * d.w + px], im.nearZ, im.farZ);
-        if (std::isfinite(z) && z > 0.f)
-          ratio[o].push_back(z / -pv.z);
-      }
-    }
-  }
-  std::string out;
-  for (int o = 0; o < 2; ++o) {
-    auto& r = ratio[o];
-    if (r.empty()) {
-      out += fmt::format("{}: no hits; ", o == 0 ? "rows from the top" : "from the bottom");
-      continue;
-    }
-    std::sort(r.begin(), r.end());
-    size_t within = 0;
-    for (const float x : r)
-      within += std::abs(x - 1.f) < 0.1f;
-    out += fmt::format("{}: {} hits, depth/hit {:.3f} (quartiles {:.3f}-{:.3f}), {:.0f}% within 10%; ",
-                       o == 0 ? "rows from the top" : "from the bottom", r.size(), r[r.size() / 2], r[r.size() / 4],
-                       r[r.size() * 3 / 4], 100.f * within / r.size());
-  }
-  ++d.checks;
-  Log.info("Depth probe: check {}: near {:.3f} far {}, view 0 fov {:.1f}/{:.1f}/{:.1f}/{:.1f} deg, {:.0f}% valid, "
-           "median {:.2f} m; {}",
-           d.checks, im.nearZ, im.farZ, v.fov.angleLeft * 57.2958f, v.fov.angleRight * 57.2958f,
-           v.fov.angleUp * 57.2958f, v.fov.angleDown * 57.2958f, 700.f * valid / (d.w * d.h), med, out);
+  const uint32_t step = d.w / kRoomDepthGrid, stepY = d.h / kRoomDepthGrid;
+  d.small.resize(kRoomDepthGrid * kRoomDepthGrid);
+  for (uint32_t y = 0; y < kRoomDepthGrid; ++y)
+    for (uint32_t x = 0; x < kRoomDepthGrid; ++x)
+      d.small[y * kRoomDepthGrid + x] = d.mapped[(y * stepY + stepY / 2) * d.w + x * step + step / 2];
+  roomtone::DepthImage di;
+  di.depth = d.small.data();
+  di.width = di.height = di.stride = static_cast<int>(kRoomDepthGrid);
+  di.nearZ = im.nearZ;
+  di.farZ = im.farZ;
+  di.tanLeft = std::tan(v.fov.angleLeft), di.tanRight = std::tan(v.fov.angleRight);
+  di.tanUp = std::tan(v.fov.angleUp), di.tanDown = std::tan(v.fov.angleDown);
+  di.view = {rt(v.pose.orientation), rt(v.pose.position)};
+  di.timeNs = d.copiedNs;
+  std::lock_guard lock{g_capture.mutex};
+  g_capture.est.addDepth(di);
+  g_capture.rec.depth(di);
+  ++d.fed;
 }
 
 #define VK_TRY_VOID(x)                                                                                                 \
@@ -6979,14 +6494,13 @@ void depth_probe_check() {
   } while (0)
 
 // Each frame between xrBeginFrame and xrEndFrame.
-void depth_probe_frame(XrTime displayTime) {
+void room_depth_frame(XrTime displayTime) {
   auto& d = g_depth;
   if (!B.envDepth)
     return;
   if (!d.tried) {
     d.tried = true;
-    d.mode = static_cast<int>(env_float("AURORA_XR_DEPTH_PROBE", 0.f));
-    d.ok = depth_probe_init();
+    d.ok = room_depth_init();
   }
   if (!d.ok)
     return;
@@ -6995,13 +6509,13 @@ void depth_probe_frame(XrTime displayTime) {
     std::lock_guard lock{g_capture.mutex};
     captureMode = capture_mode_locked();
   }
-  const bool want = d.mode >= 2 || captureMode != 0;
-  const int64_t now = monotonic_ns();
+  const bool want = captureMode != 0;
+  const int64_t now = steady_ns();
   if (want != d.running) {
-    const int64_t t0 = monotonic_ns();
+    const int64_t t0 = steady_ns();
     const XrResult r = want ? d.start(d.provider) : d.stop(d.provider);
-    Log.info("Depth probe: provider {} ({}, {:.2f} ms)", want ? "started" : "stopped", static_cast<int>(r),
-             (monotonic_ns() - t0) / 1e6);
+    Log.info("Room depth: provider {} ({}, {:.2f} ms)", want ? "started" : "stopped", static_cast<int>(r),
+             (steady_ns() - t0) / 1e6);
     if (XR_FAILED(r))
       return;
     d.running = want;
@@ -7010,10 +6524,11 @@ void depth_probe_frame(XrTime displayTime) {
   }
   if (d.pending && vkGetFenceStatus(B.dev, d.fence) == VK_SUCCESS) {
     d.pending = false;
-    depth_probe_check();
+    room_depth_feed();
   }
-  if (!d.running)
+  if (!d.running || d.pending || now - d.acquireAtNs < kRoomDepthNs)
     return;
+  d.acquireAtNs = now;
   XrEnvironmentDepthImageAcquireInfoMETA ai{XR_TYPE_ENVIRONMENT_DEPTH_IMAGE_ACQUIRE_INFO_META};
   ai.space = B.space;
   ai.displayTime = displayTime;
@@ -7021,105 +6536,74 @@ void depth_probe_frame(XrTime displayTime) {
   XrEnvironmentDepthImageMETA im{XR_TYPE_ENVIRONMENT_DEPTH_IMAGE_META};
   im.next = &ts;
   im.views[0].type = im.views[1].type = XR_TYPE_ENVIRONMENT_DEPTH_IMAGE_VIEW_META;
-  const int64_t t0 = monotonic_ns();
   const XrResult r = d.acquire(d.provider, &ai, &im);
-  d.acquireNs += monotonic_ns() - t0;
+  d.acquireNs += steady_ns() - now;
   if (r == XR_ENVIRONMENT_DEPTH_NOT_AVAILABLE_META) {
     ++d.unavailable;
   } else if (XR_FAILED(r)) {
     ++d.failed;
-  } else {
+  } else if (im.swapchainIndex < d.images.size()) {
     ++d.acquired;
     if (ts.captureTime > 0)
       d.ageNs += displayTime - ts.captureTime;
     if (d.first) {
       d.first = false;
-      Log.info("Depth probe: first image {:.0f} ms after the start, index {}, near {:.3f} far {}, {:.0f} ms old at "
-               "display",
-               (now - d.startNs) / 1e6, im.swapchainIndex, im.nearZ, im.farZ,
-               ts.captureTime > 0 ? (displayTime - ts.captureTime) / 1e6 : -1.0);
+      Log.info("Room depth: first image {:.0f} ms after the start", (now - d.startNs) / 1e6);
     }
-    if (!d.pending && now - d.copyNs >= 500'000'000 && im.swapchainIndex < d.images.size()) {
-      d.copyNs = now;
-      VK_TRY_VOID(vkResetFences(B.dev, 1, &d.fence));
-      VK_TRY_VOID(vkResetCommandBuffer(d.cmd, 0));
-      VkCommandBufferBeginInfo cbi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
-      cbi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-      VK_TRY_VOID(vkBeginCommandBuffer(d.cmd, &cbi));
-      const VkImage img = d.images[im.swapchainIndex];
-      VkImageMemoryBarrier b =
-          barrier(img, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-                  VK_ACCESS_SHADER_READ_BIT, VK_ACCESS_TRANSFER_READ_BIT, VK_QUEUE_FAMILY_IGNORED,
-                  VK_QUEUE_FAMILY_IGNORED, VK_IMAGE_ASPECT_DEPTH_BIT);
-      vkCmdPipelineBarrier(d.cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr,
-                           0, nullptr, 1, &b);
-      VkBufferImageCopy region{};
-      region.imageSubresource = {VK_IMAGE_ASPECT_DEPTH_BIT, 0, 0, 2};
-      region.imageExtent = {d.w, d.h, 1};
-      vkCmdCopyImageToBuffer(d.cmd, img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, d.buf, 1, &region);
-      b = barrier(img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-                  VK_ACCESS_TRANSFER_READ_BIT, VK_ACCESS_SHADER_READ_BIT, VK_QUEUE_FAMILY_IGNORED,
-                  VK_QUEUE_FAMILY_IGNORED, VK_IMAGE_ASPECT_DEPTH_BIT);
-      vkCmdPipelineBarrier(d.cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, nullptr,
-                           0, nullptr, 1, &b);
-      VkBufferMemoryBarrier bb{VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER};
-      bb.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-      bb.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
-      bb.srcQueueFamilyIndex = bb.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-      bb.buffer = d.buf;
-      bb.size = VK_WHOLE_SIZE;
-      vkCmdPipelineBarrier(d.cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0, 0, nullptr, 1, &bb,
-                           0, nullptr);
-      VK_TRY_VOID(vkEndCommandBuffer(d.cmd));
-      VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
-      si.commandBufferCount = 1;
-      si.pCommandBuffers = &d.cmd;
-      VK_TRY_VOID(vkQueueSubmit(B.queue, 1, &si, d.fence));
-      d.copied = im;
-      d.pending = true;
-    }
+    VK_TRY_VOID(vkResetFences(B.dev, 1, &d.fence));
+    VK_TRY_VOID(vkResetCommandBuffer(d.cmd, 0));
+    VkCommandBufferBeginInfo cbi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+    cbi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    VK_TRY_VOID(vkBeginCommandBuffer(d.cmd, &cbi));
+    const VkImage img = d.images[im.swapchainIndex];
+    VkImageMemoryBarrier b = barrier(img, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                                     VK_ACCESS_SHADER_READ_BIT, VK_ACCESS_TRANSFER_READ_BIT, VK_QUEUE_FAMILY_IGNORED,
+                                     VK_QUEUE_FAMILY_IGNORED, VK_IMAGE_ASPECT_DEPTH_BIT);
+    vkCmdPipelineBarrier(d.cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0,
+                         nullptr, 1, &b);
+    VkBufferImageCopy region{};
+    region.imageSubresource = {VK_IMAGE_ASPECT_DEPTH_BIT, 0, 0, 2};
+    region.imageExtent = {d.w, d.h, 1};
+    vkCmdCopyImageToBuffer(d.cmd, img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, d.buf, 1, &region);
+    b = barrier(img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                VK_ACCESS_TRANSFER_READ_BIT, VK_ACCESS_SHADER_READ_BIT, VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED,
+                VK_IMAGE_ASPECT_DEPTH_BIT);
+    vkCmdPipelineBarrier(d.cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, nullptr, 0,
+                         nullptr, 1, &b);
+    VkBufferMemoryBarrier bb{VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER};
+    bb.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    bb.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
+    bb.srcQueueFamilyIndex = bb.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    bb.buffer = d.buf;
+    bb.size = VK_WHOLE_SIZE;
+    vkCmdPipelineBarrier(d.cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0, 0, nullptr, 1, &bb, 0,
+                         nullptr);
+    VK_TRY_VOID(vkEndCommandBuffer(d.cmd));
+    VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+    si.commandBufferCount = 1;
+    si.pCommandBuffers = &d.cmd;
+    VK_TRY_VOID(vkQueueSubmit(B.queue, 1, &si, d.fence));
+    d.copied = im;
+    d.copiedNs = now;
+    d.pending = true;
   }
-  if (now - d.logNs >= 5'000'000'000) {
+  if (now - d.logNs >= 30'000'000'000) {
     const uint32_t n = d.acquired + d.unavailable + d.failed;
     if (d.logNs != 0 && n > 0)
-      Log.info("Depth probe: {} acquires (new {}, not available {}, failed {}), {:.3f} ms each, images {:.1f} ms old",
+      Log.info("Room depth: {} acquires (new {}, not available {}, failed {}), {:.3f} ms each, images {:.1f} ms old, "
+               "{} fed",
                n, d.acquired, d.unavailable, d.failed, d.acquireNs / 1e6 / n,
-               d.acquired > 0 ? d.ageNs / 1e6 / d.acquired : -1.0);
+               d.acquired > 0 ? d.ageNs / 1e6 / d.acquired : -1.0, d.fed);
     d.logNs = now;
-    d.acquired = d.unavailable = d.failed = 0;
+    d.acquired = d.unavailable = d.failed = d.fed = 0;
     d.acquireNs = d.ageNs = 0;
   }
 }
 #undef VK_TRY_VOID
 #else
-void depth_probe_frame(XrTime) {}
+void room_depth_frame(XrTime) {}
 #endif
 
-
-// The capture's brightest cells, for the log: where, how bright (relative
-// to the mean, as capture_make last made them), how many of their samples
-// clipped, and how many of their parts were seen.
-std::string capture_brightest() {
-  auto& c = g_capture;
-  std::array<std::pair<float, int>, kCapCells> order;
-  double mean = 0.0;
-  for (int i = 0; i < kCapCells; ++i) {
-    order[i] = {c.seenAs[i][3] > 0.f ? c.seenAs[i][0] : 0.f, i};
-    mean += c.seenAs[i][0] / kCapCells;
-  }
-  std::partial_sort(order.begin(), order.begin() + 6, order.end(), std::greater<>());
-  std::string out;
-  for (int k = 0; k < 6 && order[k].first > 0.f; ++k) {
-    float dw;
-    const auto d = cap_dir(order[k].second, dw);
-    const float dl = std::sqrt(d[0] * d[0] + d[1] * d[1] + d[2] * d[2]);
-    const auto& e = c.seenAs[order[k].second];
-    out += fmt::format(" {:.2f},{:.2f},{:.2f} x{:.1f} ({:.0f} clear, {:.0f} clipped, {:.0f}/{} parts);", d[0] / dl,
-                       d[1] / dl, d[2] / dl, order[k].first / std::max(mean, 1e-12), e[1], e[2], e[3],
-                       kCapSub * kCapSub);
-  }
-  return out;
-}
 
 // The Light page's ROOM segment and RECAPTURE while a capture runs: the
 // seconds left (-1: none running).
@@ -8729,7 +8213,7 @@ bool render_xr_frame() {
   capture_ambient(!fight || placing > 0 || (g_fightPaused && g_matchStopped));
   room_survey_apply();
   spot_frame(fs.predictedDisplayTime);
-  depth_probe_frame(fs.predictedDisplayTime);
+  room_depth_frame(fs.predictedDisplayTime);
 
   // The passthrough, the shadow, the HUD and the 3D view, the HUD on top in
   // full VR, then the placing cards and the lasers.
@@ -11763,33 +11247,20 @@ namespace {
 // The capture's log line, as just made (under g_capture.mutex).
 void capture_log(const char* what, uint32_t frames) {
   auto& c = g_capture;
-  Log.info("Room capture{}: {} frames, {:.0f}% of the room seen; lights {:.2f},{:.2f},{:.2f} from {:.2f},{:.2f},{:.2f} "
-           "and {:.2f},{:.2f},{:.2f} from {:.2f},{:.2f},{:.2f} (placed: {}, {}; {} casts, {} hits kept, {} and {} "
-           "near the lights); passthrough's up {:.4f}, seen {:.4f}, median {:.4f}, level {:.2f} ({:.2f} unclamped, exposure from {}, glare {:.2f}); "
-           "unseen as {:.2f},{:.2f},{:.2f} above, {:.2f},{:.2f},{:.2f} below; brightest cells (room x,y,z; times the mean):{}",
-           what, frames, c.coverage * 100.f, c.light[0][0], c.light[0][1], c.light[0][2], c.lightDir[0][0],
-           c.lightDir[0][1], c.lightDir[0][2], c.light[1][0], c.light[1][1], c.light[1][2], c.lightDir[1][0],
-           c.lightDir[1][1], c.lightDir[1][2],
-           c.lightAt[0] ? fmt::format("{:.2f},{:.2f},{:.2f}", c.lightPos[0][0], c.lightPos[0][1], c.lightPos[0][2])
-                        : "no",
-           c.lightAt[1] ? fmt::format("{:.2f},{:.2f},{:.2f}", c.lightPos[1][0], c.lightPos[1][1], c.lightPos[1][2])
-                        : "no",
-           c.casts, c.hits.size(), c.lightHits[0], c.lightHits[1], c.display, c.seen, c.middle, c.level,
-           c.unclamped,
-           c.stageFrames > 0 ? fmt::format("{} frames looking at the stage", c.stageFrames) : "all frames",
-           c.stageGlare, c.fill[0][0], c.fill[0][1], c.fill[0][2], c.fill[1][0], c.fill[1][1], c.fill[1][2],
-           capture_brightest());
+  Log.info("Room capture{}: {} frames, {} casts; {}", what, frames, c.casts, c.est.summary());
 }
 
-// XR thread, every frame: whether ambient capture may run (the menus, or
-// the stage being placed). Leaving them logs what it gathered.
+// XR thread, every frame: whether ambient capture may run (the menus, the
+// stage being placed, a pause). Leaving them logs what it gathered.
 void capture_ambient(bool ok) {
   std::lock_guard lock{g_capture.mutex};
   auto& c = g_capture;
   if (c.ambientOk && !ok && c.ambientFrames > 0 && !c.requested) {
-    capture_make();
+    c.est.make();
     capture_log(" (ambient)", c.ambientFrames);
     c.ambientFrames = 0;
+  } else if (c.ambientOk && !ok && c.est.stale()) {
+    c.est.make(); // the stage moved since the capture's last frame
   }
   c.ambientOk = ok;
 }
@@ -11802,8 +11273,8 @@ extern "C" int aurora_xr_room_capture_wanted(void) {
   auto& c = g_capture;
   if (c.requested && c.untilNs != 0 && steady_ns() >= c.untilNs) {
     c.requested = false;
-    capture_make();
-    capture_log("", c.frames);
+    c.est.make();
+    capture_log("", c.est.frames());
     c.ambientFrames = 0;
   }
   return capture_mode_locked();
@@ -11813,25 +11284,24 @@ extern "C" void aurora_xr_room_capture_camera(const float rotation[4], const flo
                                               const float intrinsics[4], int sensor_width, int sensor_height, int width,
                                               int height) {
   using namespace aurora::xr;
+  (void)translation; // the room's light is at a distance
   std::lock_guard lock{g_capture.mutex};
   auto& c = g_capture;
-  std::copy_n(rotation, 4, c.q);
-  std::copy_n(translation, 3, c.t);
-  std::copy_n(intrinsics, 4, c.k);
-  c.sensorW = sensor_width, c.sensorH = sensor_height, c.w = width, c.h = height;
-  c.haveCamera = width > 0 && height > 0 && sensor_width > 0 && sensor_height > 0 && intrinsics[0] > 0.f &&
-                 intrinsics[1] > 0.f;
+  roomtone::Camera cam;
+  cam.lensRotation = {rotation[0], rotation[1], rotation[2], rotation[3]};
+  cam.fx = intrinsics[0], cam.fy = intrinsics[1], cam.cx = intrinsics[2], cam.cy = intrinsics[3];
+  cam.sensorWidth = sensor_width, cam.sensorHeight = sensor_height, cam.width = width, cam.height = height;
+  c.est.setCamera(cam);
+  c.rec.camera(cam);
   Log.info("Room capture: camera {}x{} of a {}x{} sensor, f {:.1f},{:.1f} c {:.1f},{:.1f}, lens {:.4f},{:.4f},{:.4f},{:.4f}",
            width, height, sensor_width, sensor_height, intrinsics[0], intrinsics[1], intrinsics[2], intrinsics[3],
            rotation[0], rotation[1], rotation[2], rotation[3]);
 }
 
-// Each cell's ray: OpenCV-style in the camera (x right, y down, z ahead,
-// from the intrinsics; the frame is the whole sensor scaled), into the head
-// by the lens rotation's inverse (Camera2's LENS_POSE_ROTATION turns the
-// head's axes into the camera's; Meta's PassthroughCameraUtils), then into
-// the room by the head's latest orientation. The lens's 6 cm from the head
-// are left out: the room's light is at a distance.
+// A frame's grid (per cell linear r, g, b and the share clipped), with the
+// head's latest pose. A frame without its exposure (the first, before
+// Camera2's first result) is left out: unscaled, it read ~100 times too
+// bright, a light wherever the head pointed then.
 extern "C" void aurora_xr_room_capture_frame(const float* rgb, int cols, int rows, float exposure_ms, float iso) {
   using namespace aurora::xr;
   XrQuaternionf head;
@@ -11845,134 +11315,18 @@ extern "C" void aurora_xr_room_capture_frame(const float* rgb, int cols, int row
   }
   std::lock_guard lock{g_capture.mutex};
   auto& c = g_capture;
-  // A frame without its exposure (the first, before Camera2's first
-  // result) is left out: unscaled, it read ~100 times too bright, a light
-  // wherever the head pointed then.
   const int mode = capture_mode_locked();
-  if (mode == 0 || !c.haveCamera || cols <= 0 || rows <= 0 || !(exposure_ms > 0.f && iso > 0.f))
+  if (mode == 0 || !c.est.hasCamera() || cols <= 0 || rows <= 0 || !(exposure_ms > 0.f && iso > 0.f))
     return;
   if (mode == 1 && c.untilNs == 0)
     c.untilNs = steady_ns() + kCaptureNs;
-  // Relative radiance: over exposure times sensitivity.
-  const float scale = 100.f / (exposure_ms * iso);
-  const auto rotate = [](float qx, float qy, float qz, float qw, const std::array<float, 3>& v) {
-    // v + 2w (q x v) + 2 q x (q x v)
-    const float tx = 2.f * (qy * v[2] - qz * v[1]), ty = 2.f * (qz * v[0] - qx * v[2]), tz = 2.f * (qx * v[1] - qy * v[0]);
-    return std::array<float, 3>{v[0] + qw * tx + (qy * tz - qz * ty), v[1] + qw * ty + (qz * tx - qx * tz),
-                                v[2] + qw * tz + (qx * ty - qy * tx)};
-  };
-  const float sx = static_cast<float>(c.sensorW) / c.w, sy = static_cast<float>(c.sensorH) / c.h;
-  const auto lum_at = [&](int i) {
-    const float* p = rgb + i * 4;
-    return 0.2126f * p[0] + 0.7152f * p[1] + 0.0722f * p[2];
-  };
-  // Each sample's part, and the frame's glare: its mean over its mean
-  // without the light (kCapGlareMax).
-  std::vector<int> cells(static_cast<size_t>(cols) * rows, -1);
-  std::vector<float> lums(cells.size());
-  double sumAll = 0.0;
-  for (int gy = 0; gy < rows; ++gy)
-    for (int gx = 0; gx < cols; ++gx) {
-      const float px = (gx + 0.5f) * c.w / cols * sx, py = (gy + 0.5f) * c.h / rows * sy;
-      const std::array<float, 3> cam{(px - c.k[2]) / c.k[0], (py - c.k[3]) / c.k[1], 1.f};
-      const auto inHead = rotate(-c.q[0], -c.q[1], -c.q[2], c.q[3], cam);
-      const auto inLocal = rotate(head.x, head.y, head.z, head.w, inHead);
-      const XrVector3f inRoom = rot_y({inLocal[0], inLocal[1], inLocal[2]}, -c.yaw); // the capture's frame
-      const int i = gy * cols + gx;
-      cells[i] = cap_cell({inRoom.x, inRoom.y, inRoom.z}, kCapF);
-      lums[i] = lum_at(i);
-      sumAll += lums[i];
-    }
-  std::vector<float> sorted = lums;
-  std::nth_element(sorted.begin(), sorted.begin() + sorted.size() / 2, sorted.end());
-  const float med = sorted[sorted.size() / 2];
-  double sumRoom = 0.0;
-  int nRoom = 0;
-  for (const float l : lums)
-    if (l <= 2.f * med)
-      sumRoom += l, ++nRoom;
-  const float glare =
-      nRoom > 0 && sumRoom > 0.0
-          ? std::clamp(std::sqrt(static_cast<float>(sumAll / lums.size() / (sumRoom / nRoom))), 1.f, kCapGlareMax)
-          : 1.f;
-  // The room changed: the samples against the parts well seen, by their median.
-  std::vector<float> ratios;
-  for (size_t i = 0; i < cells.size(); ++i) {
-    const int cell = cells[i];
-    if (cell < 0 || rgb[i * 4 + 3] > kCapClipped)
-      continue;
-    const auto& e = c.parts[cell];
-    if (e[3] + e[7] < kCapChangeSeen)
-      continue;
-    const double was = (0.2126 * (e[0] + e[4]) + 0.7152 * (e[1] + e[5]) + 0.0722 * (e[2] + e[6])) / (e[3] + e[7]);
-    if (was > 1e-6)
-      ratios.push_back(static_cast<float>(lums[i] * scale / was));
-  }
-  if (ratios.size() >= kCapChangeMinSamples) {
-    std::nth_element(ratios.begin(), ratios.begin() + ratios.size() / 2, ratios.end());
-    const float r = ratios[ratios.size() / 2];
-    const int64_t now = steady_ns();
-    if (!(r > kCapChange || r < 1.0 / kCapChange))
-      c.changedNs = 0;
-    else if (c.changedNs == 0)
-      c.changedNs = now;
-    if (c.changedNs != 0 && now - c.changedNs >= kCapChangeNs) {
-      Log.info("Room capture: the room changed ({:.2f}x the capture where it saw well); starting over", r);
-      c.parts = {};
-      c.views.clear();
-      c.frames = c.sinceMade = 0;
-      c.changedNs = 0;
-    }
-  }
-  for (int gy = 0; gy < rows; ++gy)
-    for (int gx = 0; gx < cols; ++gx) {
-      const int cell = cells[gy * cols + gx];
-      if (cell < 0)
-        continue;
-      const float* p = rgb + (gy * cols + gx) * 4;
-      const bool clipped = p[3] > kCapClipped;
-      const double s = scale * (clipped ? 1.0 + kCapClipBoost * p[3] : 1.0);
-      const int o = clipped ? 4 : 0;
-      for (int k = 0; k < 3; ++k)
-        c.parts[cell][o + k] += static_cast<double>(p[k]) * s;
-      c.parts[cell][o + 3] += 1.0;
-      if (auto& e = c.parts[cell]; e[3] + e[7] > kCapPartMax) {
-        const double keep = kCapPartMax / (e[3] + e[7]);
-        for (double& x : e)
-          x *= keep;
-      }
-    }
-  // With the capture log, beside RoomCapture's frame dumps: the head, and
-  // where the frame's middle and right edge point in the room.
-  static const bool dumpLog = env_flag("AURORA_XR_ROOM_CAPTURE_LOG", false);
-  if (dumpLog && (c.frames == 30 || c.frames == 150 || c.frames == 280)) {
-    const auto toRoom = [&](float px, float py) {
-      const std::array<float, 3> cam{(px * sx - c.k[2]) / c.k[0], (py * sy - c.k[3]) / c.k[1], 1.f};
-      auto d = rotate(head.x, head.y, head.z, head.w, rotate(-c.q[0], -c.q[1], -c.q[2], c.q[3], cam));
-      const float n = std::sqrt(d[0] * d[0] + d[1] * d[1] + d[2] * d[2]);
-      return fmt::format("{:.2f},{:.2f},{:.2f}", d[0] / n, d[1] / n, d[2] / n);
-    };
-    Log.info("Room capture: frame {} head {:.3f},{:.3f},{:.3f},{:.3f}; middle {}, right edge {}, left edge {}",
-             c.frames, head.x, head.y, head.z, head.w, toRoom(c.w * 0.5f, c.h * 0.5f), toRoom(c.w, c.h * 0.5f),
-             toRoom(0.f, c.h * 0.5f));
-  }
-  c.exposure = exposure_ms, c.iso = iso;
-  {
-    const std::array<float, 3> mid{(c.sensorW * 0.5f - c.k[2]) / c.k[0], (c.sensorH * 0.5f - c.k[3]) / c.k[1], 1.f};
-    const auto d = rotate(head.x, head.y, head.z, head.w, rotate(-c.q[0], -c.q[1], -c.q[2], c.q[3], mid));
-    const float n = std::sqrt(d[0] * d[0] + d[1] * d[1] + d[2] * d[2]);
-    c.views.push_back({exposure_ms * iso / 100.f * glare, rot_y(headAt - c.pos, -c.yaw),
-                       rot_y({d[0] / n, d[1] / n, d[2] / n}, -c.yaw), glare});
-  }
-  if (c.views.size() > 600)
-    c.views.erase(c.views.begin(), c.views.begin() + 300);
-  ++c.frames;
-  if (mode == 2)
+  const roomtone::Frame f{rgb, cols, rows, exposure_ms, iso, {rt(head), rt(headAt)}, steady_ns()};
+  c.rec.frame(f);
+  const roomtone::FrameResult r = c.est.addFrame(f);
+  if (r.restarted)
+    Log.info("Room capture: the room changed ({:.2f}x the capture where it saw well); starting over", r.change);
+  if (r.used && mode == 2)
     ++c.ambientFrames;
-  if (++c.sinceMade >= 5) {
-    c.sinceMade = 0;
-    capture_make();
-  }
 }
 
 extern "C" void aurora_xr_set_stage_footprint(float xmin, float xmax, float zmin, float zmax, float ybottom) {

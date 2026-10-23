@@ -9,6 +9,24 @@ include("${CMAKE_CURRENT_LIST_DIR}/AuroraDependencyVersions.cmake")
 target_sources(aurora_core PRIVATE lib/xr/xr.cpp)
 target_compile_definitions(aurora_core PUBLIC AURORA_ENABLE_OPENXR)
 
+# Roomtone: the room capture's light estimation (github.com/rhythmerc/roomtone).
+# ROOMTONE_SOURCE_DIR builds a local checkout instead.
+if (NOT TARGET roomtone)
+  set(ROOMTONE_SOURCE_DIR "" CACHE PATH "A local Roomtone checkout (empty: fetch the pinned one)")
+  if (ROOMTONE_SOURCE_DIR)
+    add_subdirectory("${ROOMTONE_SOURCE_DIR}" "${CMAKE_BINARY_DIR}/_deps/roomtone-build" EXCLUDE_FROM_ALL)
+  else ()
+    include(FetchContent)
+    FetchContent_Declare(roomtone
+      GIT_REPOSITORY https://github.com/rhythmerc/roomtone.git
+      GIT_TAG ${AURORA_ROOMTONE_COMMIT}
+      EXCLUDE_FROM_ALL
+    )
+    FetchContent_MakeAvailable(roomtone)
+  endif ()
+endif ()
+target_link_libraries(aurora_core PRIVATE roomtone)
+
 if (ANDROID)
   set(_xr_dir "${CMAKE_BINARY_DIR}/_deps/openxr_loader_android-${AURORA_OPENXR_ANDROID_VERSION}")
   set(_xr_aar "${_xr_dir}.aar")
