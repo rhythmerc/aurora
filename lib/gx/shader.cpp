@@ -1548,6 +1548,23 @@ std::string build_shader_source(const ShaderConfig& config, uint32_t normalAttac
                         " dot(cross(xr_r0, xr_r1), xr_sm), in_xr_sn.w);";
     }
   }
+  // The room's soft light (its SH, blended between its points) per vertex
+  // where a vertex has a normal (its own, or smooth: CPU normals), the key
+  // lights still per pixel: per pixel it cost 3.6 ms of a 7 ms eye pass with
+  // the stage at a player's size (2026-10-23), and the SH, low order, is
+  // smooth enough to interpolate. A smooth normal's sign is the pixel's
+  // (turned to its facet), so the SH goes as its even (constant and
+  // quadratic) and odd (linear) parts: SH(-n) = even - odd.
+  const bool xrRoomVsh =
+      xrRoom && (config.xrRoomPixel || config.xrRoomFacet) && (xrRoomNrmOut || xrRoomSmoothNrm);
+  if (xrRoomVsh) {
+    vtxOutAttrs += fmt::format("\n    @location({}) xr_she: vec3f,", vtxOutIdx++);
+    vtxOutAttrs += fmt::format("\n    @location({}) xr_sho: vec3f,", vtxOutIdx++);
+    vtxXfrAttrsPre += fmt::format("\n    let xr_vs = xr_room_sh_eo(xr_room_n({}));"
+                                  "\n    out.xr_she = xr_vs.e;"
+                                  "\n    out.xr_sho = xr_vs.o;",
+                                  xrRoomNrmOut ? "mv_nrm" : "out.xr_sn.xyz");
+  }
 
   uniBufAttrs += "\n    proj: mat4x4f,";
   uniBufAttrs += fmt::format("\n    postex_mtx: array<mat3x4f, {}>,", MaxPnMtx + MaxTexMtx);
@@ -1648,6 +1665,8 @@ std::string build_shader_source(const ShaderConfig& config, uint32_t normalAttac
   }
   if (xrRoomNrmOut) {
     fragmentFnPre += "\n    let xr_n = select(vec3f(0.0), normalize(in.xr_n), dot(in.xr_n, in.xr_n) > 1e-12);";
+    if (xrRoomVsh)
+      fragmentFnPre += "\n    xr_vsh = true; xr_she = in.xr_she; xr_sho = in.xr_sho; xr_shs = 1.0;";
   } else if (xrRoomFacetNrm) {
     fragmentFnPre += "\n    let xr_f = cross(dpdy(in.xr_p), dpdx(in.xr_p));";
     if (xrRoomSmoothNrm) {
@@ -1656,6 +1675,9 @@ std::string build_shader_source(const ShaderConfig& config, uint32_t normalAttac
                        "\n    let xr_n = select(xr_nf, select(xr_sn, -xr_sn, dot(xr_sn, xr_nf) < 0.0), "
                        "dot(xr_sn, xr_sn) > 0.0);"
                        "\n    let xr_dl = mix(1.0, in.xr_sn.w, xr.room_h.w);";
+      if (xrRoomVsh)
+        fragmentFnPre += "\n    xr_vsh = dot(xr_sn, xr_sn) > 0.0; xr_she = in.xr_she; xr_sho = in.xr_sho;"
+                         "\n    xr_shs = select(1.0, -1.0, dot(xr_sn, xr_nf) < 0.0);";
     } else {
       fragmentFnPre += "\n    let xr_n = select(vec3f(0.0), normalize(xr_f), dot(xr_f, xr_f) > 1e-30);";
     }
@@ -2707,6 +2729,10 @@ fn fs_main(in: VertexOutput) -> {10} {{{6}{5}{11}
                                                   "\nvar<private> xr_view: u32;"
                                                   "\nvar<private> xr_cam: vec3f;"
                                                   "\nvar<private> xr_rp: vec3f;"
+                                                  "\nvar<private> xr_vsh: bool;"
+                                                  "\nvar<private> xr_she: vec3f;"
+                                                  "\nvar<private> xr_sho: vec3f;"
+                                                  "\nvar<private> xr_shs: f32;"
                                                   "\nvar<private> xr_prev: vec4f;"
                                                   "\nfn gx_proj(p: vec3f) -> vec4f {{"
                                                   "\n    xr_cam = p;"
@@ -2748,31 +2774,52 @@ fn xr_room_sh_w() -> vec3f {
     return vec3f(1.0 - wl - wr, wl, wr);
 }
 
-// A light's direction (camera space, toward it) and its colour's factor here.
+// The blended SH at a room-space normal, as its even part (constant and
+// quadratic) and odd part (linear): SH(n) = e + o, SH(-n) = e - o.
+struct XrShEo { e: vec3f, o: vec3f };
+fn xr_room_sh_eo(n: vec3f) -> XrShEo {
+    let w = xr_room_sh_w();
+    var r: XrShEo;
+    r.e = vec3f(0.0);
+    r.o = vec3f(0.0);
+    for (var p = 0u; p < 3u; p++) {
+        let k = w[p];
+        if (k <= 0.0) { continue; }
+        let b = p * 9u;
+        r.o += k * (xr.room_sh[b + 1u].rgb * n.y + xr.room_sh[b + 2u].rgb * n.z + xr.room_sh[b + 3u].rgb * n.x);
+        r.e += k * (xr.room_sh[b].rgb + xr.room_sh[b + 4u].rgb * (n.x * n.y) + xr.room_sh[b + 5u].rgb * (n.y * n.z)
+            + xr.room_sh[b + 6u].rgb * (3.0 * n.z * n.z - 1.0) + xr.room_sh[b + 7u].rgb * (n.x * n.z)
+            + xr.room_sh[b + 8u].rgb * (n.x * n.x - n.y * n.y));
+    }
+    return r;
+}
+
+// A light's direction (game camera space, unit, toward it) and its colour's
+// factor here: a point light's falloff from where its colour applies.
 fn xr_room_light(i: u32) -> vec4f {
     let lp = xr.room_lp[i];
-    if (lp.w <= 0.0) { return vec4f((xr.room_m * vec4f(xr.room_dir[i].xyz, 0.0)).xyz, 1.0); }
+    if (lp.w <= 0.0) { return vec4f(lp.xyz, 1.0); }
     let d = lp.xyz - xr_rp;
     let d2 = max(dot(d, d), 1e-6);
     return vec4f(d * inverseSqrt(d2), min(lp.w / d2, 4.0));
 }
 
+// The room's light on a camera-space normal (none: the room's up): the SH
+// per vertex where the vertex stage made it (xr_vsh), else here; the key
+// lights here, in camera space (the room's placement turns and scales
+// evenly, so angles hold).
 fn xr_room_diffuse(n_cam: vec3f) -> vec3f {
-    let n = xr_room_n(n_cam);
-    let w = xr_room_sh_w();
-    var e = vec3f(0.0);
-    for (var p = 0u; p < 3u; p++) {
-        let k = w[p];
-        if (k <= 0.0) { continue; }
-        let b = p * 9u;
-        e += k * (xr.room_sh[b].rgb + xr.room_sh[b + 1u].rgb * n.y + xr.room_sh[b + 2u].rgb * n.z
-            + xr.room_sh[b + 3u].rgb * n.x + xr.room_sh[b + 4u].rgb * (n.x * n.y) + xr.room_sh[b + 5u].rgb * (n.y * n.z)
-            + xr.room_sh[b + 6u].rgb * (3.0 * n.z * n.z - 1.0) + xr.room_sh[b + 7u].rgb * (n.x * n.z)
-            + xr.room_sh[b + 8u].rgb * (n.x * n.x - n.y * n.y));
+    var e: vec3f;
+    if (xr_vsh) {
+        e = xr_she + xr_shs * xr_sho;
+    } else {
+        let r = xr_room_sh_eo(xr_room_n(n_cam));
+        e = r.e + r.o;
     }
+    let nc = select(normalize((xr.room_m * vec4f(0.0, 1.0, 0.0, 0.0)).xyz), normalize(n_cam), dot(n_cam, n_cam) > 1e-12);
     for (var i = 0u; i < 2u; i++) {
         let l = xr_room_light(i);
-        e += max(dot(n, xr_room_n(l.xyz)), 0.0) * l.w * xr.room_col[i].rgb;
+        e += max(dot(nc, l.xyz), 0.0) * l.w * xr.room_col[i].rgb;
     }
     return clamp(e, vec3f(0.0), vec3f(1.0));
 }
@@ -2785,9 +2832,8 @@ fn xr_room_spec(n: vec3f, v_in: vec3f, gloss: f32) -> vec3f {
     var s = vec3f(0.0);
     for (var i = 0u; i < 2u; i++) {
         let lk = xr_room_light(i);
-        let l = lk.xyz;
-        if (dot(l, l) < 1e-30) { continue; }
-        let ln = normalize(l);
+        let ln = lk.xyz;
+        if (dot(ln, ln) < 1e-30) { continue; }
         let h = normalize(ln + v);
         s += pow(max(dot(n, h), 0.0), 32.0) * max(dot(n, ln), 0.0) * lk.w * xr.room_col[i].rgb;
     }

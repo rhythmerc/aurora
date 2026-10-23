@@ -8176,9 +8176,16 @@ bool render_xr_frame() {
     g_arena.yaw = g_defaultArena.yaw + yaw;
     // From the head's spot on the floor, at the default height; unattended
     // runs (AURORA_XR_ARENA_AT_HEAD) from the head itself, wherever it lies
-    // and looks, up or down too (a headset on a desk may face anywhere).
-    g_arena.pos = atHead ? B.head + qrot(B.headOrientation, g_defaultArena.pos)
-                         : XrVector3f{B.head.x, 0.f, B.head.z} + rot_y(g_defaultArena.pos, yaw);
+    // and looks, up or down too (a headset on a desk may face anywhere). =2:
+    // straight ahead at the default distance, as a player looking at the
+    // stage sees it (the default's 25 cm under the eyes put it at the bottom
+    // of a lying headset's view: 2% of the eye, the per-pixel costs a
+    // player's view has hidden; 2026-10-23).
+    static const bool ahead = env_float("AURORA_XR_ARENA_AT_HEAD", 0.f) >= 2.f;
+    const XrVector3f& d = g_defaultArena.pos;
+    g_arena.pos = !atHead ? XrVector3f{B.head.x, 0.f, B.head.z} + rot_y(d, yaw)
+                  : ahead ? B.head + qrot(B.headOrientation, {0.f, 0.f, -std::sqrt(vdot(d, d))})
+                          : B.head + qrot(B.headOrientation, d);
     Log.info("Arena placed at the head: {:.2f},{:.2f},{:.2f}, yaw {:.0f} deg", g_arena.pos.x, g_arena.pos.y,
              g_arena.pos.z, g_arena.yaw * 57.2958f);
   }
@@ -10599,13 +10606,28 @@ bool render_eyes(const wgpu::CommandEncoder& cmd, gfx::detail::FramePacket& fram
           std::copy(q.begin(), q.end(), u.roomProbe[i]);
           u.roomProbe[i][3] = 0.f;
         }
+        // A point light's place, w the squared distance its colour applies
+        // at; a directional one's direction (unit), w 0.
         for (int l = 0; l < 2; ++l) {
-          const auto q = to_camera(room.pos[l]);
-          std::copy(q.begin(), q.end(), u.roomLp[l]);
-          float d2 = 0.f;
-          for (int c = 0; c < 3; ++c)
-            d2 += (q[c] - u.roomProbe[0][c]) * (q[c] - u.roomProbe[0][c]);
-          u.roomLp[l][3] = room.range[l] > 0.f ? d2 : 0.f;
+          if (room.range[l] > 0.f) {
+            const auto q = to_camera(room.pos[l]);
+            std::copy(q.begin(), q.end(), u.roomLp[l]);
+            float d2 = 0.f;
+            for (int c = 0; c < 3; ++c)
+              d2 += (q[c] - u.roomProbe[0][c]) * (q[c] - u.roomProbe[0][c]);
+            u.roomLp[l][3] = d2;
+          } else {
+            const auto& d = room.dir[l];
+            float v[3], n2 = 0.f;
+            for (int c = 0; c < 3; ++c) {
+              v[c] = toCamera[c * 4] * d[0] + toCamera[c * 4 + 1] * d[1] + toCamera[c * 4 + 2] * d[2];
+              n2 += v[c] * v[c];
+            }
+            const float k = n2 > 1e-24f ? 1.f / std::sqrt(n2) : 0.f;
+            for (int c = 0; c < 3; ++c)
+              u.roomLp[l][c] = v[c] * k;
+            u.roomLp[l][3] = 0.f;
+          }
         }
         for (int eye = 0; eye < 2; ++eye) {
           const XrVector3f p = views[eye].pose.position;
