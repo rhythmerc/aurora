@@ -26,7 +26,9 @@ inline constexpr uint64_t TextureUploadSize = 12582912; // 12 MiB
 inline constexpr uint64_t UniformBufferSize = 50331648; // 48 MiB
 inline constexpr uint64_t VertexBufferSize = 5242880;   // 5 MiB
 inline constexpr uint64_t IndexBufferSize = 2097152;    // 2 MiB
-inline constexpr uint64_t StorageBufferSize = 8388608;  // 8 MiB
+// 8 MiB overflowed on Venom with the whole stage in view (XR, decoded
+// vertices: 8388884 bytes), as the Quest's 16 MiB holds.
+inline constexpr uint64_t StorageBufferSize = 16777216; // 16 MiB
 inline constexpr uint64_t TextureUploadSize = 25165824; // 24 MiB
 #endif
 

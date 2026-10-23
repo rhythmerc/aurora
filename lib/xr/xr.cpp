@@ -6203,7 +6203,30 @@ constexpr int64_t kCaptureNs = 20'000'000'000;
 constexpr float kCapFighters = 0.7f;
 constexpr int kRoomSourceCaptured = static_cast<int>(kRoomPresets.size()) + 1;
 
+// The points the light is made for: across the stage's width (its
+// footprint's 20%, 50% and 80%, the middle first: it sets the level's
+// exposure), each lifted to about a fighter's middle (the stage's origin
+// is on the table, whose own surface Roomtone leaves out within 15 cm).
+// The shader blends their SH by where a pixel is along them.
+constexpr int kCapPoints = 3;
+constexpr float kCapLift = 0.04f;
+
+// The captured light for room_frame (tracking space): the SH at each point,
+// the two lights at the middle one, with their places and the distance at
+// which their colours apply (the shader's point lights), the reference's
+// mean light and the level.
+struct CapLight {
+  std::array<std::array<std::array<float, 3>, 9>, kCapPoints> sh{};
+  std::array<XrVector3f, kCapPoints> at{};
+  std::array<std::array<float, 3>, 2> dir{}, col{};
+  std::array<bool, 2> placed{};
+  std::array<XrVector3f, 2> pos{};
+  std::array<float, 2> range{};
+  float mean = 1.f, level = 1.f;
+};
+
 struct Capture {
+  // When a capture runs (quick: the XR thread's, every frame).
   std::mutex mutex;
   bool requested = false;
   int64_t untilNs = 0; // steady clock; 0: not started (no head pose yet)
@@ -6213,13 +6236,21 @@ struct Capture {
   bool room = false, ambientOk = false;
   uint32_t ambientFrames = 0; // since the last log
   uint32_t casts = 0;
+  bool any = false; // the estimate has a frame (capture_resume)
+  // The latest depth image (room_depth_feed, the XR thread), for the capture
+  // thread's next frame.
+  bool depthPending = false;
+  roomtone::DepthImage depth;
+  std::vector<uint16_t> depthPx;
+  // The estimate: a make takes milliseconds (a build per point, with
+  // voxels), on the capture thread; the XR thread only try-locks it.
+  std::mutex estMutex;
   roomtone::Room est;
   roomtone::Recorder rec;
   bool recTried = false;
-  // capture_light's last answer, for frames the capture thread holds the
-  // mutex (a make with voxels takes milliseconds).
+  // capture_light's last answer, for frames the capture thread holds it.
   bool haveLast = false;
-  roomtone::Lighting last;
+  CapLight last;
 } g_capture;
 
 int64_t steady_ns() {
@@ -6230,7 +6261,7 @@ int64_t steady_ns() {
 roomtone::Vec3 rt(const XrVector3f& v) { return {v.x, v.y, v.z}; }
 roomtone::Quat rt(const XrQuaternionf& q) { return {q.x, q.y, q.z, q.w}; }
 
-// AURORA_XR_ROOM_RECORD: opened with the first capture. Under g_capture.mutex.
+// AURORA_XR_ROOM_RECORD: opened with the first capture. Under estMutex.
 void capture_record_open_locked() {
   auto& c = g_capture;
   if (std::exchange(c.recTried, true))
@@ -6241,14 +6272,19 @@ void capture_record_open_locked() {
 
 // Starts a capture (choosing ROOM), what was seen dropped.
 void capture_start() {
-  std::lock_guard lock{g_capture.mutex};
   auto& c = g_capture;
+  {
+    std::lock_guard lock{c.mutex};
+    c.requested = true;
+    c.room = true;
+    c.ambientFrames = 0;
+    c.untilNs = 0;
+    c.casts = 0;
+    c.any = false;
+    c.depthPending = false;
+  }
+  std::lock_guard lock{c.estMutex};
   capture_record_open_locked();
-  c.requested = true;
-  c.room = true;
-  c.ambientFrames = 0;
-  c.untilNs = 0;
-  c.casts = 0;
   c.est.reset();
   c.rec.reset();
   c.haveLast = false;
@@ -6260,7 +6296,7 @@ void capture_start() {
 void capture_resume() {
   {
     std::lock_guard lock{g_capture.mutex};
-    if (g_capture.est.made() || g_capture.est.frames() > 0) {
+    if (g_capture.any) {
       g_capture.room = true;
       return;
     }
@@ -6277,8 +6313,8 @@ void capture_stop() {
 // Under g_arenaMutex (move_arenas): the room moved in LOCAL, (p0, y0) to
 // (p1, y1); the capture and its light move with it.
 void capture_moved(XrVector3f p0, float y0, XrVector3f p1, float y1) {
-  std::lock_guard lock{g_capture.mutex};
   auto& c = g_capture;
+  std::lock_guard lock{c.estMutex};
   c.rec.moved(rt(p0), y0, rt(p1), y1);
   if (c.est.moved(rt(p0), y0, rt(p1), y1))
     Log.info("Room capture: the room turned {:.0f} deg in tracking space; its lights kept their place",
@@ -6296,7 +6332,7 @@ int capture_mode_locked() {
 int capture_casting() {
   std::lock_guard lock{g_capture.mutex};
   const int mode = capture_mode_locked();
-  return mode == 1 ? (g_capture.untilNs != 0 ? 1 : 0) : mode == 2 && g_capture.est.frames() > 0 ? 2 : 0;
+  return mode == 1 ? (g_capture.untilNs != 0 ? 1 : 0) : mode == 2 && g_capture.any ? 2 : 0;
 }
 
 void capture_note_cast() {
@@ -6304,42 +6340,50 @@ void capture_note_cast() {
   ++g_capture.casts;
 }
 
+// The surface worker's: blocks while a make runs (milliseconds), not the XR thread.
 void capture_note_hit(const XrVector3f& origin, const XrVector3f& point) {
-  std::lock_guard lock{g_capture.mutex};
+  std::lock_guard lock{g_capture.estMutex};
   g_capture.est.addHit(rt(origin), rt(point));
   g_capture.rec.hit(rt(origin), rt(point));
 }
 
-// The captured light for room_frame, at the stage (its origin, lifted to
-// about a fighter's middle: the origin is on the table, whose own surface
-// Roomtone leaves out within 15 cm): false while none is made.
-constexpr float kCapLift = 0.04f;
-bool capture_light(std::array<std::array<float, 3>, 9>& sh, std::array<std::array<float, 3>, 2>& dirs,
-                   std::array<std::array<float, 3>, 2>& lights, float& mean, float& level,
-                   const XrVector3f& stage) {
+// The captured light at the points (room_frame, the XR thread): false while
+// none is made; while the capture thread makes it, the last answer.
+bool capture_light(const std::array<XrVector3f, kCapPoints>& points, CapLight& out) {
   auto& c = g_capture;
-  roomtone::Lighting l;
-  if (std::unique_lock lock{c.mutex, std::try_to_lock}; lock.owns_lock()) {
-    const roomtone::Vec3 at{stage.x, stage.y + kCapLift, stage.z};
+  if (std::unique_lock lock{c.estMutex, std::try_to_lock}; lock.owns_lock()) {
+    std::array<roomtone::Vec3, kCapPoints> pts;
+    for (int i = 0; i < kCapPoints; ++i)
+      pts[i] = rt(points[i]);
     if (c.rec.isOpen())
-      c.rec.query(at, steady_ns());
-    c.haveLast = c.est.lightAt(at, l);
-    if (c.haveLast)
-      c.last = l;
-    else
-      return false;
-  } else if (c.haveLast) {
-    l = c.last;
-  } else {
+      c.rec.points(pts.data(), kCapPoints, steady_ns());
+    c.est.setPoints(pts.data(), kCapPoints);
+    std::array<roomtone::Lighting, kCapPoints> l;
+    for (int i = 0; i < kCapPoints; ++i)
+      if (!c.est.lightAt(static_cast<size_t>(i), l[i])) {
+        c.haveLast = false;
+        return false;
+      }
+    CapLight& r = c.last;
+    for (int i = 0; i < kCapPoints; ++i) {
+      r.sh[i] = l[i].sh;
+      r.at[i] = points[i];
+    }
+    for (int k = 0; k < 2; ++k) {
+      const roomtone::Light& li = l[0].lights[k];
+      r.dir[k] = {li.dir.x, li.dir.y, li.dir.z};
+      r.col[k] = li.color;
+      r.placed[k] = li.placed && li.range > 0.f;
+      r.pos[k] = {li.pos.x, li.pos.y, li.pos.z};
+      r.range[k] = li.range;
+    }
+    r.mean = l[0].mean;
+    r.level = l[0].level;
+    c.haveLast = true;
+  }
+  if (!c.haveLast)
     return false;
-  }
-  sh = l.sh;
-  for (int i = 0; i < 2; ++i) {
-    dirs[i] = {l.lights[i].dir.x, l.lights[i].dir.y, l.lights[i].dir.z};
-    lights[i] = l.lights[i].color;
-  }
-  mean = l.mean;
-  level = l.level;
+  out = c.last;
   return true;
 }
 
@@ -6477,9 +6521,12 @@ void room_depth_feed() {
   di.tanUp = std::tan(v.fov.angleUp), di.tanDown = std::tan(v.fov.angleDown);
   di.view = {rt(v.pose.orientation), rt(v.pose.position)};
   di.timeNs = d.copiedNs;
+  // For the capture thread's next frame (the estimate may be mid-make).
   std::lock_guard lock{g_capture.mutex};
-  g_capture.est.addDepth(di);
-  g_capture.rec.depth(di);
+  g_capture.depthPx = d.small;
+  g_capture.depth = di;
+  g_capture.depth.depth = nullptr;
+  g_capture.depthPending = true;
   ++d.fed;
 }
 
@@ -6688,6 +6735,21 @@ void init_room_light() {
   }
   if (r.source == kRoomSourceCaptured)
     capture_start();
+  // AURORA_XR_ROOM_REPLAY=recording (AURORA_XR_ROOM_RECORD's, a desktop's
+  // test of a headset's room): the capture made from it, no camera needed.
+  if (const char* path = std::getenv("AURORA_XR_ROOM_REPLAY"); path && *path && r.source == kRoomSourceCaptured) {
+    auto& c = g_capture;
+    uint32_t frames = 0;
+    {
+      std::lock_guard lock{c.estMutex};
+      roomtone::replay(path, c.est, [&](const roomtone::ReplayEvent& e) { frames += e.kind == roomtone::ReplayEvent::Frame; });
+      c.est.make();
+      Log.info("Room capture: replayed {} ({} frames): {}", path, frames, c.est.summary());
+    }
+    std::lock_guard lock{c.mutex};
+    c.requested = false;
+    c.any = c.est.made();
+  }
   g_room.value = g_room.defaults = r;
   room_light_apply(r);
 }
@@ -6696,9 +6758,17 @@ void init_room_light() {
 struct RoomFrame {
   bool on = false;
   float w[4]{}, up[4]{};
-  float sh[9][4]{};
-  std::array<float, 3> dir[2]{}; // in the room
+  // The SH at each point across the stage (kCapPoints: the middle, then
+  // its left and right), where the points are (the room), for the shader
+  // to blend between by a pixel's place.
+  float sh[kCapPoints][9][4]{};
+  std::array<XrVector3f, kCapPoints> at{};
+  std::array<float, 3> dir[2]{}; // in the room, from the middle point
   float col[2][4]{};
+  // A light with a place (the room) and the distance from the middle point
+  // its colour applies at: the shader's point light (range 0: directional).
+  std::array<XrVector3f, 2> pos{};
+  float range[2]{};
   float delight = 0.f;
   float gloss[2]{}; // fighters', the stage's
 };
@@ -6707,21 +6777,39 @@ struct RoomFrame {
 RoomFrame room_frame(const std::array<float, 16>& arena) {
   RoomFrame f;
   RoomLight r;
-  std::array<std::array<float, 3>, 9> sh;
+  CapLight cap;
   {
     std::lock_guard lock{g_room.mutex};
     r = g_room.value;
     if (r.source == 0)
       return f;
     if (r.source != kRoomSourceCaptured)
-      sh = g_room.sh[r.source - 1];
+      cap.sh.fill(g_room.sh[r.source - 1]);
   }
-  // The captured room: its two lights, already in the room.
-  std::array<std::array<float, 3>, 2> capDirs, capLights;
-  float capMean = 1.f, capLevel = 1.f;
+  // The points across the stage: its footprint's 20%, 50% and 80% along x
+  // in the game's world (its centre's height and depth; 60 units either side
+  // without a footprint), into the room, lifted.
+  {
+    std::array<float, 3> ctr;
+    Footprint fp;
+    {
+      std::lock_guard lock{g_arenaMutex};
+      ctr = g_arenaCenter;
+      fp = g_footprint;
+    }
+    const float x0 = fp.valid ? fp.xmin : ctr[0] - 75.f, x1 = fp.valid ? fp.xmax : ctr[0] + 75.f;
+    const float xs[kCapPoints] = {0.5f * (x0 + x1), x0 + 0.2f * (x1 - x0), x1 - 0.2f * (x1 - x0)};
+    for (int i = 0; i < kCapPoints; ++i) {
+      const float x = xs[i], y = ctr[1], z = ctr[2];
+      cap.at[i] = {arena[0] * x + arena[1] * y + arena[2] * z + arena[3],
+                   arena[4] * x + arena[5] * y + arena[6] * z + arena[7] + kCapLift,
+                   arena[8] * x + arena[9] * y + arena[10] * z + arena[11]};
+    }
+  }
   const bool captured = r.source == kRoomSourceCaptured;
-  if (captured && !capture_light(sh, capDirs, capLights, capMean, capLevel, arena_pose().pos))
+  if (captured && !capture_light(cap.at, cap))
     return f;
+  const float capMean = cap.mean, capLevel = captured ? cap.level : 1.f;
   // The captured room's level (ABL, by STRENGTH), and the fighters' scale:
   // the room's mean light to kCapFighters times it. Roomtone's light is in
   // the units of its reference (the room as the head saw it: up-facing 1,
@@ -6735,9 +6823,11 @@ RoomFrame room_frame(const std::array<float, 16>& arena) {
   f.delight = r.delight;
   f.gloss[0] = r.gloss * kFighterGloss;
   f.gloss[1] = r.gloss * stage_gloss(g_roomStage);
-  for (int k = 0; k < 9; ++k)
-    for (int c = 0; c < 3; ++c)
-      f.sh[k][c] = sh[k][c] * gain;
+  for (int i = 0; i < kCapPoints; ++i)
+    for (int k = 0; k < 9; ++k)
+      for (int c = 0; c < 3; ++c)
+        f.sh[i][k][c] = cap.sh[i][k][c] * gain;
+  f.at = cap.at;
   // The lights' directions: turned by YAW about the stage's up, then by the
   // stage's placement into the room.
   const float yaw = r.yaw * 0.017453292f, cy = std::cos(yaw), sy = std::sin(yaw);
@@ -6757,13 +6847,16 @@ RoomFrame room_frame(const std::array<float, 16>& arena) {
   }
   if (captured)
     for (int l = 0; l < 2; ++l) {
-      f.dir[l] = capDirs[l];
+      f.dir[l] = cap.dir[l];
       for (int c = 0; c < 3; ++c)
-        f.col[l][c] = capLights[l][c] * gain;
+        f.col[l][c] = cap.col[l][c] * gain;
+      f.pos[l] = cap.pos[l];
+      f.range[l] = cap.placed[l] ? cap.range[l] : 0.f;
     }
-  // An up-facing surface's light, for unlit draws (as xr_room_diffuse at up).
+  // An up-facing surface's light at the middle, for unlit draws (as
+  // xr_room_diffuse at up).
   for (int c = 0; c < 3; ++c) {
-    float e = f.sh[0][c] + f.sh[1][c] - f.sh[6][c] - f.sh[8][c];
+    float e = f.sh[0][0][c] + f.sh[0][1][c] - f.sh[0][6][c] - f.sh[0][8][c];
     for (int l = 0; l < 2; ++l)
       e += std::max(f.dir[l][1], 0.f) * f.col[l][c];
     f.up[c] = std::clamp(e, 0.f, 1.f);
@@ -9144,10 +9237,10 @@ static_assert(gfx::XrMaxClipPlanes == AURORA_XR_MAX_CLIPS && gfx::XrMaxClipPlane
 // Last, for Application SpaceWarp's motion vectors, both eyes' previous
 // frame matrices: for a point fixed in the game world (from this frame's
 // game camera space), then last frame's own (from last frame's).
-// Then the room light's fields (shader.cpp's XrEye: room_m to room_col).
-constexpr uint64_t kMultiviewEyeSize =
-    2 * 64 + 16 + gfx::XrMaxClipPlanes * 16 + gfx::XrMaxClipPlanes * 4 + 4 * 64 + 64 + 4 * 16 + 9 * 16 + 4 * 16 +
-    2 * 16;
+// Then the room light's fields (shader.cpp's XrEye: room_m to room_probe).
+constexpr uint64_t kMultiviewEyeSize = 2 * 64 + 16 + gfx::XrMaxClipPlanes * 16 + gfx::XrMaxClipPlanes * 4 + 4 * 64 +
+                                       64 + 4 * 16 + kCapPoints * 9 * 16 + 4 * 16 + 2 * 16 + 2 * 16 +
+                                       kCapPoints * 16;
 
 struct Renderer3D {
   uint64_t layoutKey = 0;
@@ -10368,11 +10461,16 @@ bool render_eyes(const wgpu::CommandEncoder& cmd, gfx::detail::FramePacket& fram
     // two lights' directions in the room and their colours.
     Mat4 roomM;
     float roomW[4], roomUp[4], roomL[4], roomH[4];
-    float roomSh[9][4];
+    float roomSh[kCapPoints][9][4];
     float roomDir[2][4], roomCol[2][4];
     // Each eye in game camera space (the highlight's view vector); w: the
     // fighters' gloss, then the stage's.
     float roomEye[2][4];
+    // The point lights in game camera space, w the squared distance (game
+    // units) their colour applies at (0: directional); the points the SH is
+    // made at, in game camera space (the middle, its left, its right).
+    float roomLp[2][4];
+    float roomProbe[kCapPoints][4];
   } mv[gfx::XrMaxTransforms]{};
   static_assert(sizeof(mv[0]) == kMultiviewEyeSize);
   std::array<Mat4, gfx::XrMaxTransforms> worldToRoom{}, cameraToRoom{};
@@ -10490,6 +10588,25 @@ bool render_eyes(const wgpu::CommandEncoder& cmd, gfx::detail::FramePacket& fram
         }
         u.roomH[3] = room.delight;
         const Mat4 toCamera = inverse_affine({m[0], m[1], m[2], m[3], m[4], m[5], m[6], m[7], m[8], m[9], m[10], m[11]});
+        const auto to_camera = [&](const XrVector3f& p) {
+          std::array<float, 3> o;
+          for (int c = 0; c < 3; ++c)
+            o[c] = toCamera[c * 4] * p.x + toCamera[c * 4 + 1] * p.y + toCamera[c * 4 + 2] * p.z + toCamera[c * 4 + 3];
+          return o;
+        };
+        for (int i = 0; i < kCapPoints; ++i) {
+          const auto q = to_camera(room.at[i]);
+          std::copy(q.begin(), q.end(), u.roomProbe[i]);
+          u.roomProbe[i][3] = 0.f;
+        }
+        for (int l = 0; l < 2; ++l) {
+          const auto q = to_camera(room.pos[l]);
+          std::copy(q.begin(), q.end(), u.roomLp[l]);
+          float d2 = 0.f;
+          for (int c = 0; c < 3; ++c)
+            d2 += (q[c] - u.roomProbe[0][c]) * (q[c] - u.roomProbe[0][c]);
+          u.roomLp[l][3] = room.range[l] > 0.f ? d2 : 0.f;
+        }
         for (int eye = 0; eye < 2; ++eye) {
           const XrVector3f p = views[eye].pose.position;
           for (int c = 0; c < 3; ++c)
@@ -11249,40 +11366,70 @@ extern "C" void aurora_xr_set_stage_top(float y) {
 
 namespace aurora::xr {
 namespace {
-// The capture's log line, as just made (under g_capture.mutex).
-void capture_log(const char* what, uint32_t frames) {
-  auto& c = g_capture;
-  Log.info("Room capture{}: {} frames, {} casts; {}", what, frames, c.casts, c.est.summary());
+// The capture's log line, as just made (under estMutex; casts from the
+// policy's).
+void capture_log(const char* what, uint32_t frames, uint32_t casts) {
+  Log.info("Room capture{}: {} frames, {} casts; {}", what, frames, casts, g_capture.est.summary());
 }
 
+// Asked of the capture thread's next poll (aurora_xr_room_capture_wanted):
+// a make and its log, off the XR thread.
+bool g_captureMakePending = false, g_captureLogPending = false;
+uint32_t g_captureLogFrames = 0;
+
 // XR thread, every frame: whether ambient capture may run (the menus, the
-// stage being placed, a pause). Leaving them logs what it gathered.
+// stage being placed, a pause). Leaving them, the light is made again (the
+// stage may have moved since the last frame) and what ambient capture
+// gathered logged, by the capture thread.
 void capture_ambient(bool ok) {
   std::lock_guard lock{g_capture.mutex};
   auto& c = g_capture;
-  if (c.ambientOk && !ok && c.ambientFrames > 0 && !c.requested) {
-    c.est.make();
-    capture_log(" (ambient)", c.ambientFrames);
-    c.ambientFrames = 0;
-  } else if (c.ambientOk && !ok && c.est.stale()) {
-    c.est.make(); // the stage moved since the capture's last frame
+  if (c.ambientOk && !ok) {
+    g_captureMakePending = true;
+    if (c.ambientFrames > 0 && !c.requested) {
+      g_captureLogPending = true;
+      g_captureLogFrames = c.ambientFrames;
+      c.ambientFrames = 0;
+    }
   }
   c.ambientOk = ok;
 }
 } // namespace
 } // namespace aurora::xr
 
+// The capture thread's poll (every 250 ms): the mode, and the makes and logs
+// the other threads asked for.
 extern "C" int aurora_xr_room_capture_wanted(void) {
   using namespace aurora::xr;
-  std::lock_guard lock{g_capture.mutex};
   auto& c = g_capture;
-  if (c.requested && c.untilNs != 0 && steady_ns() >= c.untilNs) {
-    c.requested = false;
-    c.est.make();
-    capture_log("", c.est.frames());
-    c.ambientFrames = 0;
+  bool make, log;
+  const char* what = "";
+  uint32_t frames = 0, casts;
+  int mode;
+  {
+    std::lock_guard lock{c.mutex};
+    make = std::exchange(g_captureMakePending, false);
+    log = std::exchange(g_captureLogPending, false);
+    if (log)
+      what = " (ambient)", frames = g_captureLogFrames;
+    if (c.requested && c.untilNs != 0 && steady_ns() >= c.untilNs) {
+      c.requested = false;
+      make = log = true;
+      what = "";
+      frames = 0; // the estimate's own count
+      c.ambientFrames = 0;
+    }
+    casts = c.casts;
+    mode = capture_mode_locked();
   }
-  return capture_mode_locked();
+  if (make || log) {
+    std::lock_guard lock{c.estMutex};
+    if (make && (log || c.est.stale()))
+      c.est.make();
+    if (log)
+      capture_log(what, frames != 0 ? frames : c.est.frames(), casts);
+  }
+  return mode;
 }
 
 extern "C" void aurora_xr_room_capture_camera(const float rotation[4], const float translation[3],
@@ -11290,7 +11437,7 @@ extern "C" void aurora_xr_room_capture_camera(const float rotation[4], const flo
                                               int height) {
   using namespace aurora::xr;
   (void)translation; // the room's light is at a distance
-  std::lock_guard lock{g_capture.mutex};
+  std::lock_guard lock{g_capture.estMutex};
   auto& c = g_capture;
   roomtone::Camera cam;
   cam.lensRotation = {rotation[0], rotation[1], rotation[2], rotation[3]};
@@ -11318,20 +11465,46 @@ extern "C" void aurora_xr_room_capture_frame(const float* rgb, int cols, int row
     head = B.headOrientation;
     headAt = B.head;
   }
-  std::lock_guard lock{g_capture.mutex};
   auto& c = g_capture;
-  const int mode = capture_mode_locked();
-  if (mode == 0 || !c.est.hasCamera() || cols <= 0 || rows <= 0 || !(exposure_ms > 0.f && iso > 0.f))
-    return;
-  if (mode == 1 && c.untilNs == 0)
-    c.untilNs = steady_ns() + kCaptureNs;
-  const roomtone::Frame f{rgb, cols, rows, exposure_ms, iso, {rt(head), rt(headAt)}, steady_ns()};
-  c.rec.frame(f);
-  const roomtone::FrameResult r = c.est.addFrame(f);
+  int mode;
+  bool haveDepth;
+  roomtone::DepthImage depth;
+  std::vector<uint16_t> depthPx;
+  {
+    std::lock_guard lock{c.mutex};
+    mode = capture_mode_locked();
+    if (mode == 0 || cols <= 0 || rows <= 0 || !(exposure_ms > 0.f && iso > 0.f))
+      return;
+    if (mode == 1 && c.untilNs == 0)
+      c.untilNs = steady_ns() + kCaptureNs;
+    haveDepth = std::exchange(c.depthPending, false);
+    if (haveDepth) {
+      depth = c.depth;
+      depthPx.swap(c.depthPx);
+    }
+  }
+  roomtone::FrameResult r;
+  {
+    std::lock_guard lock{c.estMutex};
+    if (!c.est.hasCamera())
+      return;
+    if (haveDepth) {
+      depth.depth = depthPx.data();
+      c.est.addDepth(depth);
+      c.rec.depth(depth);
+    }
+    const roomtone::Frame f{rgb, cols, rows, exposure_ms, iso, {rt(head), rt(headAt)}, steady_ns()};
+    c.rec.frame(f);
+    r = c.est.addFrame(f);
+  }
   if (r.restarted)
     Log.info("Room capture: the room changed ({:.2f}x the capture where it saw well); starting over", r.change);
-  if (r.used && mode == 2)
-    ++c.ambientFrames;
+  std::lock_guard lock{c.mutex};
+  if (r.used) {
+    c.any = true;
+    if (mode == 2)
+      ++c.ambientFrames;
+  }
 }
 
 extern "C" void aurora_xr_set_stage_footprint(float xmin, float xmax, float zmin, float zmax, float ybottom) {

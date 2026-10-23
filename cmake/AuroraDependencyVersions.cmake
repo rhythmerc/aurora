@@ -27,6 +27,6 @@ _aurora_dependency_version(AURORA_NOD_VERSION "v2.0.0-alpha.12" "nod version tag
 # OpenXR loader for Android (AURORA_ENABLE_OPENXR): Khronos AAR from Maven Central
 _aurora_dependency_version(AURORA_OPENXR_ANDROID_VERSION "1.1.63" "org.khronos.openxr:openxr_loader_for_android version")
 # Roomtone (AURORA_ENABLE_OPENXR): the room capture's light estimation
-_aurora_dependency_version(AURORA_ROOMTONE_COMMIT "952c1544dae4110fb9effb1e278a44b1ac56f74e" "Roomtone commit (https://github.com/rhythmerc/roomtone)"
-        "dd6e0f581dcd23b32907131077717a3b0babcf20") # Previous versions
+_aurora_dependency_version(AURORA_ROOMTONE_COMMIT "09e30de6dc8f5d230d748d519ea11efe980eaaf1" "Roomtone commit (https://github.com/rhythmerc/roomtone)"
+        "dd6e0f581dcd23b32907131077717a3b0babcf20" "952c1544dae4110fb9effb1e278a44b1ac56f74e") # Previous versions
 set(AURORA_OPENXR_ANDROID_SHA256 "622419d2f6741c3443a3beb4779af0764318edd01830de967f24c741ebcded73")

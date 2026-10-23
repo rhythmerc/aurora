@@ -1524,6 +1524,15 @@ std::string build_shader_source(const ShaderConfig& config, uint32_t normalAttac
     vtxOutAttrs += fmt::format("\n    @location({}) xr_v: vec3f,", vtxOutIdx++);
     vtxXfrAttrsPre += "\n    out.xr_v = xr.room_eye[xr_view].xyz - mv_pos;";
   }
+  // Where a pixel is (game camera space), for the room's point lights and
+  // the blend between its points' SH (xr_rp, set in both stages).
+  if (xrRoom) {
+    vtxXfrAttrsPre += "\n    xr_rp = mv_pos;";
+    if (!xrRoomFacetNrm) {
+      vtxOutAttrs += fmt::format("\n    @location({}) xr_p: vec3f,", vtxOutIdx++);
+      vtxXfrAttrsPre += "\n    out.xr_p = mv_pos;";
+    }
+  }
   if (xrRoomNrmOut) {
     vtxOutAttrs += fmt::format("\n    @location({}) xr_n: vec3f,", vtxOutIdx++);
     vtxXfrAttrsPre += "\n    out.xr_n = mv_nrm;";
@@ -1634,6 +1643,9 @@ std::string build_shader_source(const ShaderConfig& config, uint32_t normalAttac
     }
   }
 
+  if (xrRoom) {
+    fragmentFnPre += "\n    xr_rp = in.xr_p;";
+  }
   if (xrRoomNrmOut) {
     fragmentFnPre += "\n    let xr_n = select(vec3f(0.0), normalize(in.xr_n), dot(in.xr_n, in.xr_n) > 1e-12);";
   } else if (xrRoomFacetNrm) {
@@ -1651,9 +1663,10 @@ std::string build_shader_source(const ShaderConfig& config, uint32_t normalAttac
   if (xrRoom && config.xrRoomFacet && !xrRoomSmoothNrm) {
     fragmentFnPre += "\n    let xr_dl = 1.0;";
   }
-  // A stage draw whose TEV colour reads no lit colour channel (unlit ones,
-  // or none: textures and constants alone) takes the room's unlit light on
-  // its final colour (below, at fragReturn), not on the channel: an unlit
+  // A room draw (the stage's, or an item's: Yoshi's Story's Fly Guys) whose
+  // TEV colour reads no lit colour channel (unlit ones, or none: textures and
+  // constants alone) takes the room's unlit light on its final colour
+  // (below, at fragReturn), not on the channel: an unlit
   // channel's light is a factor on its colour, the same as a factor on the
   // final colour where the TEV multiplies by it, but where it mixes textures
   // in (Fountain of Dreams' water particles: lerp(C1, C0, TEXC), lerp(RASC,
@@ -1661,7 +1674,7 @@ std::string build_shader_source(const ShaderConfig& config, uint32_t normalAttac
   // channel and kept its own light in a dark room. Per pixel only (VERTEX
   // keeps the channel's).
   bool xrStageFinal = false;
-  if (xrRoom && config.xrRoom == 2 && (config.xrRoomPixel || !xrReadsRasAny(config))) {
+  if (xrRoom && (config.xrRoomPixel || !xrReadsRasAny(config))) {
     xrStageFinal = true;
     for (u32 s = 0; s < config.tevStageCount; ++s) {
       const auto& st = config.tevStages[s];
@@ -2277,7 +2290,7 @@ std::string build_shader_source(const ShaderConfig& config, uint32_t normalAttac
                                      "prev.a);",
                                      config.xrRoom == 1 ? 0 : 1, config.xrRoom == 1 ? "xr.room_w.x" : "xr.room_w.y"));
   }
-  // The room's unlit light on a stage draw's final colour (xrStageFinal:
+  // The room's unlit light on a room draw's final colour (xrStageFinal:
   // its TEV reads no lit channel; textures or constant colours alone, FD's
   // floor, much of Battlefield and Brinstar, have nowhere else for it to
   // go), as xr_room_mix gives an unlit channel (before the debug views).
@@ -2688,11 +2701,12 @@ fn fs_main(in: VertexOutput) -> {10} {{{6}{5}{11}
       shaderSource.insert(at + anchor.size(),
                           multiview ? fmt::format("\nstruct XrEye {{ m: array<mat4x4f, {0}>, enabled: vec4u, clip: array<vec4f, 8>, fade: array<vec4f, 2>, prev: array<mat4x4f, {0}>, prev_m: array<mat4x4f, {0}>,"
                                                   " room_m: mat4x4f, room_w: vec4f, room_up: vec4f, room_l: vec4f, room_h: vec4f,"
-                                                  " room_sh: array<vec4f, 9>, room_dir: array<vec4f, 2>, room_col: array<vec4f, 2>,"
-                                                  " room_eye: array<vec4f, 2> }};"
+                                                  " room_sh: array<vec4f, 27>, room_dir: array<vec4f, 2>, room_col: array<vec4f, 2>,"
+                                                  " room_eye: array<vec4f, 2>, room_lp: array<vec4f, 2>, room_probe: array<vec4f, 3> }};"
                                                   "\n@group(3) @binding(0)\nvar<uniform> xr: XrEye;"
                                                   "\nvar<private> xr_view: u32;"
                                                   "\nvar<private> xr_cam: vec3f;"
+                                                  "\nvar<private> xr_rp: vec3f;"
                                                   "\nvar<private> xr_prev: vec4f;"
                                                   "\nfn gx_proj(p: vec3f) -> vec4f {{"
                                                   "\n    xr_cam = p;"
@@ -2709,7 +2723,13 @@ fn fs_main(in: VertexOutput) -> {10} {{{6}{5}{11}
     // XR room lighting (lib/xr fills the room_* fields): a camera-space
     // normal into the room, and the room's diffuse light on it (SH L2
     // irradiance, its coefficients premultiplied by the basis and cosine
-    // lobe constants, plus two directional lights), clamped as GX clamps.
+    // lobe constants, plus two lights), clamped as GX clamps. The SH is
+    // made at three points across the stage (room_probe: the middle, its
+    // left, its right) and blended by where the pixel is along them
+    // (xr_rp); a light with a place (room_lp.w, the squared distance its
+    // colour applies at) is a point light: its direction and its inverse
+    // square falloff (up to 4x) per pixel, so the near side of the stage is
+    // lit more than the far.
     if (const auto at = shaderSource.find("struct VertexOutput {");
         multiview && config.xrRoom != 0 && at != std::string::npos) {
       shaderSource.insert(at, R"""(
@@ -2718,14 +2738,42 @@ fn xr_room_n(n_cam: vec3f) -> vec3f {
     return select(vec3f(0.0, 1.0, 0.0), normalize(r), dot(r, r) > 1e-12);
 }
 
+fn xr_room_sh_w() -> vec3f {
+    let axis = xr.room_probe[2].xyz - xr.room_probe[1].xyz;
+    let len2 = dot(axis, axis);
+    if (len2 < 1e-6) { return vec3f(1.0, 0.0, 0.0); }
+    let t = clamp(dot(xr_rp - xr.room_probe[1].xyz, axis) / len2, 0.0, 1.0);
+    let wl = max(1.0 - 2.0 * t, 0.0);
+    let wr = max(2.0 * t - 1.0, 0.0);
+    return vec3f(1.0 - wl - wr, wl, wr);
+}
+
+// A light's direction (camera space, toward it) and its colour's factor here.
+fn xr_room_light(i: u32) -> vec4f {
+    let lp = xr.room_lp[i];
+    if (lp.w <= 0.0) { return vec4f((xr.room_m * vec4f(xr.room_dir[i].xyz, 0.0)).xyz, 1.0); }
+    let d = lp.xyz - xr_rp;
+    let d2 = max(dot(d, d), 1e-6);
+    return vec4f(d * inverseSqrt(d2), min(lp.w / d2, 4.0));
+}
+
 fn xr_room_diffuse(n_cam: vec3f) -> vec3f {
     let n = xr_room_n(n_cam);
-    var e = xr.room_sh[0].rgb + xr.room_sh[1].rgb * n.y + xr.room_sh[2].rgb * n.z + xr.room_sh[3].rgb * n.x
-        + xr.room_sh[4].rgb * (n.x * n.y) + xr.room_sh[5].rgb * (n.y * n.z)
-        + xr.room_sh[6].rgb * (3.0 * n.z * n.z - 1.0) + xr.room_sh[7].rgb * (n.x * n.z)
-        + xr.room_sh[8].rgb * (n.x * n.x - n.y * n.y);
-    e += max(dot(n, xr.room_dir[0].xyz), 0.0) * xr.room_col[0].rgb;
-    e += max(dot(n, xr.room_dir[1].xyz), 0.0) * xr.room_col[1].rgb;
+    let w = xr_room_sh_w();
+    var e = vec3f(0.0);
+    for (var p = 0u; p < 3u; p++) {
+        let k = w[p];
+        if (k <= 0.0) { continue; }
+        let b = p * 9u;
+        e += k * (xr.room_sh[b].rgb + xr.room_sh[b + 1u].rgb * n.y + xr.room_sh[b + 2u].rgb * n.z
+            + xr.room_sh[b + 3u].rgb * n.x + xr.room_sh[b + 4u].rgb * (n.x * n.y) + xr.room_sh[b + 5u].rgb * (n.y * n.z)
+            + xr.room_sh[b + 6u].rgb * (3.0 * n.z * n.z - 1.0) + xr.room_sh[b + 7u].rgb * (n.x * n.z)
+            + xr.room_sh[b + 8u].rgb * (n.x * n.x - n.y * n.y));
+    }
+    for (var i = 0u; i < 2u; i++) {
+        let l = xr_room_light(i);
+        e += max(dot(n, xr_room_n(l.xyz)), 0.0) * l.w * xr.room_col[i].rgb;
+    }
     return clamp(e, vec3f(0.0), vec3f(1.0));
 }
 
@@ -2736,11 +2784,12 @@ fn xr_room_spec(n: vec3f, v_in: vec3f, gloss: f32) -> vec3f {
     let v = normalize(v_in);
     var s = vec3f(0.0);
     for (var i = 0u; i < 2u; i++) {
-        let l = (xr.room_m * vec4f(xr.room_dir[i].xyz, 0.0)).xyz;
+        let lk = xr_room_light(i);
+        let l = lk.xyz;
         if (dot(l, l) < 1e-30) { continue; }
         let ln = normalize(l);
         let h = normalize(ln + v);
-        s += pow(max(dot(n, h), 0.0), 32.0) * max(dot(n, ln), 0.0) * xr.room_col[i].rgb;
+        s += pow(max(dot(n, h), 0.0), 32.0) * max(dot(n, ln), 0.0) * lk.w * xr.room_col[i].rgb;
     }
     return s * (gloss * 5.0);
 }
