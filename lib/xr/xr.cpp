@@ -6723,7 +6723,10 @@ RoomFrame room_frame(const std::array<float, 16>& arena) {
   if (captured && !capture_light(sh, capDirs, capLights, capMean, capLevel, arena_pose().pos))
     return f;
   // The captured room's level (ABL, by STRENGTH), and the fighters' scale:
-  // the room's mean light to kCapFighters times it.
+  // the room's mean light to kCapFighters times it. Roomtone's light is in
+  // the units of its reference (the room as the head saw it: up-facing 1,
+  // capMean its mean), so content nearer a light is lit brighter than the
+  // reference and farther dimmer.
   const float level = r.strength * capLevel;
   const float gain = captured ? level * kCapFighters / std::max(capMean, 1e-3f) : r.strength;
   const RoomPreset& p = kRoomPresets[captured ? 0 : r.source - 1];
@@ -6773,8 +6776,10 @@ RoomFrame room_frame(const std::array<float, 16>& arena) {
   {
     const float s = std::max(r.strength, 1e-3f);
     const float upLum = 0.2126f * f.up[0] + 0.7152f * f.up[1] + 0.0722f * f.up[2];
-    // The captured room's: its tops the baked colour times the level.
-    f.w[3] = captured ? level / std::max(upLum, 0.05f * gain) : 1.f / std::max(upLum / s, 0.05f);
+    // The captured room's: its tops the baked colour times the level, times
+    // the light from above at the stage over the reference's (Roomtone's 1;
+    // divided by the stage's own, a light's falloff cancelled on the tops).
+    f.w[3] = captured ? level / std::max(gain, 1e-3f) : 1.f / std::max(upLum / s, 0.05f);
   }
   return f;
 }

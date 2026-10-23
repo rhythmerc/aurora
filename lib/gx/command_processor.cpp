@@ -25,6 +25,7 @@
 #include <cstdint>
 #include <span>
 #include <limits>
+#include <map>
 #include <unordered_map>
 #include <vector>
 
@@ -1352,7 +1353,19 @@ static bool xr_room_smooth(const ShaderConfig& sc) noexcept {
 // additive draws (glows) apart. Every 5000 of them.
 static void xr_room_census(u16 vtxCount) noexcept {
   static const bool on = std::getenv("AURORA_XR_ROOM_CENSUS") != nullptr;
-  if (!on || sLinkTag == 0 || sLinkTag - 1 > 4)
+  if (!on)
+    return;
+  // The world's draws the room doesn't light, by link (unmarked as -1) and
+  // whether additive: effects (link 7 and up) and glows by design, anything
+  // else a stage part left out.
+  static std::map<int, std::array<u64, 2>> skipped; // link * 2 + additive: draws, vertices
+  const bool skip = sLinkTag == 0 || sLinkTag - 1 > 6 || xr_additive(sDrawCache.config);
+  if (skip) {
+    auto& e = skipped[(static_cast<int>(sLinkTag) - 1) * 2 + (xr_additive(sDrawCache.config) ? 1 : 0)];
+    ++e[0];
+    e[1] += vtxCount;
+  }
+  if (sLinkTag == 0 || sLinkTag - 1 > 4)
     return;
   const auto& c = sDrawCache.config;
   const auto& sc = c.shaderConfig;
@@ -1394,8 +1407,12 @@ static void xr_room_census(u16 vtxCount) noexcept {
       line += fmt::format(" {} {:.0f}% ({} draws{});", names[k], 100.0 * verts[k] / std::max<u64>(total, 1), draws[k],
                           nrms[k] != 0 && k > LitNoNrm ? fmt::format(", {:.0f}% with normals", 100.0 * nrms[k] / verts[k])
                                                        : std::string{});
-  Log.info("XR room census: stage draws by vertices:{}", line);
+  std::string out;
+  for (const auto& [key, e] : skipped)
+    out += fmt::format(" link {}{} {} draws ({} vertices);", key < 0 ? -1 : key / 2, key < 0 ? (key % 2 != 0 ? " additive" : "") : key % 2 != 0 ? " additive" : "", e[0], e[1]);
+  Log.info("XR room census: stage draws by vertices:{} not lit by the room:{}", line, out);
   verts = {}, draws = {}, nrms = {};
+  skipped.clear();
 }
 
 // What the eye config adds to the twins' cache keys (0 with the room light
