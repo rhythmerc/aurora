@@ -145,6 +145,28 @@ void aurora_xr_set_stage_footprint(float xmin, float xmax, float zmin, float zma
  * sized for Melee's stages around the arena center. Any thread. */
 void aurora_xr_set_grab_box(float xmin, float xmax, float ymin, float ymax, float zmin, float zmax);
 
+/* A stage that is a board standing on a real surface (a table, the floor):
+ * its proxy, in meters at the default arena scale, drawn while it's placed.
+ * With AURORA_XR_PLACE_AT_START=1 the player places it once the headset is
+ * tracked, before anything else shows: a spot on a level surface, a size, a
+ * height on a stand. That placement becomes every stage's start (as
+ * aurora_xr_adopt_stage); the arena position is the board's foot. Any
+ * thread. */
+typedef struct AuroraXrBoardProxy {
+  float pitchHalfX, pitchHalfZ; /* the pitch drawn on the top */
+  float topHalfX, topHalfZ;     /* the board's top */
+  float footHalfX, footHalfZ;   /* its foot, what stands on the stand or the surface */
+  float depth;                  /* from the top down to the foot */
+  float standHalfX, standHalfZ; /* the stand's column */
+} AuroraXrBoardProxy;
+void aurora_xr_set_board_proxy(const AuroraXrBoardProxy* proxy);
+/* Whether the board is being placed now (the game sees an idle pad). */
+bool aurora_xr_board_placing(void);
+/* The stand under the board: from the arena position down to the surface the
+ * board was placed on, in the current stage's game units; 0 when there's
+ * none (not placed, or resting on the surface). Any thread. */
+float aurora_xr_stand_height(void);
+
 /* The room's colour grade for the current stage's fights in mixed reality:
  * passthrough tinted toward the stage's palette, a gain per channel (linear
  * light) and a saturation; 1, 1, 1, 1 is none. It fades in as a fight starts

@@ -429,6 +429,10 @@ struct PlacingClip {
 };
 std::array<PlacingClip, 6> g_placingClips;
 
+// The board is being placed on a real surface (board_place_frame): the
+// controllers place it, and the game sees a pad with nothing pressed.
+std::atomic<bool> g_boardPlacing{false};
+
 // Set by the game (aurora_xr_set_passthrough): mixed reality shows the room,
 // full VR doesn't. The XR thread pauses or starts passthrough to match.
 std::atomic<bool> g_passthroughWanted{true};
@@ -576,6 +580,8 @@ struct Bridge {
   bool triggersClick = false; // last frame: a laser on the screen, so the triggers click instead of pressing L and R
   int reelHand = -1;        // last frame: the controller dragging the screen; its stick pushes and pulls it
   std::array<float, 2> stickY{}; // each controller's raw thumbstick Y (left: control stick, right: C-stick)
+  std::array<float, 2> stickX{}; // and X
+  bool backButton = false;       // B or Y held (placing the board: back a step)
   // Hand tracking (XR_EXT_hand_tracking): pinches grab the arena too.
   bool hasHandTrackingExt = false;
   PFN_xrCreateHandTrackerEXT createHandTracker = nullptr;
@@ -1534,6 +1540,14 @@ void update_input() {
   const XrVector2f main = action_vec2(B.stickMain);
   const XrVector2f c = action_vec2(B.stickC);
   B.stickY = {main.y, c.y};
+  B.stickX = {main.x, c.x};
+  B.backButton = action_bool(B.btnB) || action_bool(B.btnY);
+  if (g_boardPlacing) {
+    std::lock_guard lock{g_padMutex};
+    g_pad = {};
+    g_padValid = true;
+    return;
+  }
   // A controller dragging the screen reels it in and out with its stick
   // instead of steering the menu.
   if (B.reelHand != 0) {
@@ -3854,6 +3868,18 @@ struct SurfaceShared {
   XrTime displayTime = 0;           // the latest predicted display time, for the rays
   std::array<XrVector3f, 2> hands{}; // each hand's or controller's touch point
   std::array<bool, 2> handValid{};
+  // Placing the board on a surface (board_place_frame): each hand's laser,
+  // cast against the room about 45 times a second, and what it hit.
+  bool pointing = false;
+  std::array<XrVector3f, 2> rayOrigin{}, rayDir{};
+  std::array<bool, 2> rayValid{};
+  struct PointHit {
+    bool hit = false, level = false; // something within reach; a level surface
+    XrVector3f p{};
+    int64_t ns = 0; // monotonic_ns; 0: never cast
+  };
+  std::array<PointHit, 2> pointHits{};
+  bool casterReady = false, casterGone = false; // the raycaster is up; it never will be
 };
 SurfaceShared g_surface;
 std::thread g_surfaceThread;
@@ -4530,6 +4556,40 @@ RoomSurvey room_finish(const RoomSamples& rs, const XrPosef& head, XrTime time) 
   return out;
 }
 
+// One laser against the room's depth: what it hits within 6 m, and whether
+// that is a level surface (within about 20 degrees). False: no information
+// (out of the depth cameras' view, or the hand in the way): keep the last.
+bool cast_pointer(SurfaceWorker& w, XrVector3f origin, XrVector3f dir, XrTime time, SurfaceShared::PointHit& out) {
+  XrEnvironmentRaycastFilterDistanceMETA reach{XR_TYPE_ENVIRONMENT_RAYCAST_FILTER_DISTANCE_META};
+  reach.maxDistance = 6.f;
+  const XrEnvironmentRaycastFilterBaseHeaderMETA* filters[] = {
+      reinterpret_cast<const XrEnvironmentRaycastFilterBaseHeaderMETA*>(&reach)};
+  XrEnvironmentRaycastHitGetInfoMETA gi{XR_TYPE_ENVIRONMENT_RAYCAST_HIT_GET_INFO_META};
+  gi.baseSpace = B.space;
+  gi.time = time;
+  gi.origin = origin;
+  gi.direction = dir;
+  gi.filterCount = 1;
+  gi.filters = filters;
+  XrEnvironmentRaycastHitMETA hit{XR_TYPE_ENVIRONMENT_RAYCAST_HIT_META};
+  const XrResult r = B.performRaycast(w.raycaster, &gi, &hit);
+  if (XR_FAILED(r) || hit.status == XR_ENVIRONMENT_RAYCAST_HIT_STATUS_HIT_POINT_OUTSIDE_OF_FOV_META ||
+      hit.status == XR_ENVIRONMENT_RAYCAST_HIT_STATUS_RAY_OCCLUDED_META)
+    return false;
+  out = {};
+  out.ns = monotonic_ns();
+  if (hit.status != XR_ENVIRONMENT_RAYCAST_HIT_STATUS_HIT_META &&
+      hit.status != XR_ENVIRONMENT_RAYCAST_HIT_STATUS_HIT_POINT_OCCLUDED_META &&
+      hit.status != XR_ENVIRONMENT_RAYCAST_HIT_STATUS_HIT_INVALID_ORIENTATION_META)
+    return true; // nothing within reach
+  out.hit = true;
+  out.p = hit.pose.position;
+  // The normal is +Z turned by the pose.
+  out.level = hit.status != XR_ENVIRONMENT_RAYCAST_HIT_STATUS_HIT_INVALID_ORIENTATION_META &&
+              qrot(hit.pose.orientation, {0.f, 0.f, 1.f}).y > 0.94f;
+  return true;
+}
+
 void surface_main() {
   using State = SurfaceEstimate::State;
   SurfaceWorker w;
@@ -4543,6 +4603,9 @@ void surface_main() {
     XrTime time;
     std::array<XrVector3f, 2> hands;
     std::array<bool, 2> handValid;
+    bool pointing;
+    std::array<XrVector3f, 2> rayOrigin, rayDir;
+    std::array<bool, 2> rayValid;
     {
       std::unique_lock lock{g_surface.mutex};
       // 15 casts a second while casting, the raycaster's future polled every
@@ -4550,7 +4613,8 @@ void surface_main() {
       // second to let an idle raycaster go).
       const bool surveyDue = g_surface.surveyWanted && !g_surface.survey.done;
       if (!g_surface.stop && !g_surface.reset)
-        g_surface.cv.wait_for(lock, w.caster == Caster::Creating ? std::chrono::milliseconds(50)
+        g_surface.cv.wait_for(lock, g_surface.pointing                   ? std::chrono::milliseconds(22)
+                                    : w.caster == Caster::Creating ? std::chrono::milliseconds(50)
                                     : w.active || surveyDue      ? std::chrono::milliseconds(66)
                                                                  : std::chrono::milliseconds(1000));
       if (g_surface.stop)
@@ -4565,8 +4629,34 @@ void surface_main() {
       time = g_surface.displayTime;
       hands = g_surface.hands;
       handValid = g_surface.handValid;
+      pointing = g_surface.pointing;
+      rayOrigin = g_surface.rayOrigin;
+      rayDir = g_surface.rayDir;
+      rayValid = g_surface.rayValid;
     }
     const int64_t now = monotonic_ns();
+    if (pointing && time != 0 && B.envRaycast &&
+        (w.caster == Caster::Off || w.caster == Caster::Creating || w.caster == Caster::Ready)) {
+      raycaster_step(w);
+      if (w.caster == Caster::Ready) {
+        std::array<SurfaceShared::PointHit, 2> got{};
+        std::array<bool, 2> cast{};
+        for (int h = 0; h < 2; ++h)
+          if (rayValid[h])
+            cast[h] = cast_pointer(w, rayOrigin[h], rayDir[h], time, got[h]);
+        w.lastCastNs = now;
+        std::lock_guard lock{g_surface.mutex};
+        for (int h = 0; h < 2; ++h)
+          if (cast[h])
+            g_surface.pointHits[h] = got[h];
+      }
+    }
+    {
+      std::lock_guard lock{g_surface.mutex};
+      g_surface.casterReady = w.caster == Caster::Ready;
+      g_surface.casterGone = !B.envRaycast || w.caster == Caster::Declined || w.caster == Caster::Unsupported ||
+                             w.caster == Caster::Failed;
+    }
     if (reset) {
       w.est = {};
       w.recent.clear();
@@ -7278,6 +7368,736 @@ void poll_tweaks() {
 
 void log_slots(const char* why);
 
+// ---------------------------------------------------------------- XR thread: placing the board on a surface
+//
+// A game whose stage is a board on a real table or the floor
+// (aurora_xr_set_board_proxy) has it placed in three steps, once at launch
+// (AURORA_XR_PLACE_AT_START), before anything else shows:
+//   where   a laser on a level surface (the floor, a table) stands the
+//           board there, broadside to the head; the trigger or a pinch
+//           puts it down
+//   size    the board grows or shrinks so that its edge follows the laser
+//           on that surface
+//   height  the board rises off the surface on a stand, its top where the
+//           laser meets the upright plane through it
+// In every step the stick turns the board, and B, Y or the grip goes back a
+// step (B on the first skips placing). The board shown is a proxy: quad
+// layers (its top with the pitch, the sides, the stand's), drawn by the
+// compositor, so it shows over the menus before any 3D frame exists. The
+// placement becomes every stage's start (as aurora_xr_adopt_stage), and the
+// game draws the stand from aurora_xr_stand_height.
+//
+// Surfaces come from XR_META_environment_raycast (the surface worker casts
+// each hand's laser), then from planes: the floor (XR_EXT_local_floor) and,
+// on the desktop, tables given as AURORA_XR_PLACE_TABLE=x,y,z,halfX,halfZ
+// (LOCAL meters; several separated by ';'). AURORA_XR_PLACE_AUTO=k,height[,d]
+// places unattended (a pointer aimed by the code: the first table, or the
+// floor d meters ahead (1.4), then that size and stand height) and, with
+// AURORA_XR_DUMP, writes each step as seen from the eye, turned to look at
+// the board (xr_place1-3).
+
+constexpr size_t kMaxBoardLayers = 14;
+
+struct BoardLayers {
+  std::array<XrCompositionLayerQuad, kMaxBoardLayers> quads;
+  std::array<XrCompositionLayerColorScaleBiasKHR, kMaxBoardLayers> tints;
+  std::array<const PlacingImage*, kMaxBoardLayers> images{}; // for the dump; null: a laser
+  uint32_t count = 0;
+};
+
+struct BoardPlacer {
+  enum class Step { Off, Where, Size, Height, Done };
+  Step step = Step::Off;
+  AuroraXrBoardProxy proxy{};
+  bool haveProxy = false;
+  int hand = 1; // the laser that places: the last whose trigger or pinch went
+  // The placement so far (LOCAL meters): the spot on the surface, the
+  // surface's height, the board's turn, its size against the proxy's, and
+  // the stand's height (the surface to the board's foot).
+  XrVector3f spot{};
+  float surfaceY = 0.f, yaw = 0.f, turn = 0.f, k = 1.f, height = 0.f;
+  bool aimed = false; // this frame the active laser is on a level surface (where) or its plane
+  XrVector3f aim{};
+  std::array<float, 2> planeY{};     // each laser's surface, smoothed
+  std::array<bool, 2> planeKnown{};
+  bool backWas = false;
+  int64_t stepNs = 0;
+  // The card: where it floats, and what it says.
+  XrPosef card{{0.f, 0.f, 0.f, 1.f}, {}};
+  float cardYaw = 0.f;
+  bool cardPlaced = false;
+  int cardDrawn = -1; // the step and input it was drawn for
+  PlacingImage cardImg, topImg;
+  std::array<PlacingImage, 4> sideImg, standImg;
+  bool imagesMade = false;
+  struct Table {
+    XrVector3f c;
+    float hx, hz;
+  };
+  std::vector<Table> tables;
+  // Unattended (AURORA_XR_PLACE_AUTO).
+  bool autoOn = false;
+  float autoK = 0.8f, autoHeight = 0.15f, autoDist = 1.4f;
+  std::array<bool, 4> dumped{};
+};
+BoardPlacer BP;
+std::mutex g_boardProxyMutex; // BP.proxy and haveProxy, set by the game
+
+// The surface the placement stands on, for the stand's height (game threads).
+bool g_boardPlaced = false; // under g_arenaMutex
+float g_boardSurfaceY = 0.f;
+
+bool board_place_wanted() {
+  static const bool on = env_flag("AURORA_XR_PLACE_AT_START", false);
+  return on;
+}
+
+XrVector3f board_axis_x(float yaw) { return rot_y({1.f, 0.f, 0.f}, yaw); }
+XrVector3f board_axis_z(float yaw) { return rot_y({0.f, 0.f, 1.f}, yaw); }
+
+// The laser of hand h on the horizontal plane y: false if it points up or away.
+bool ray_plane_y(const Hand& hand, float y, XrVector3f& out) {
+  if (hand.dir.y > -0.02f)
+    return false;
+  const float t = (y - hand.origin.y) / hand.dir.y;
+  if (t <= 0.f || t > 12.f)
+    return false;
+  out = hand.origin + hand.dir * t;
+  return true;
+}
+
+// Without the raycaster: the nearest of the tables and the floor.
+bool plane_hit(const Hand& hand, XrTime time, XrVector3f& out, float& y) {
+  float best = 1e9f;
+  for (const auto& t : BP.tables) {
+    XrVector3f p;
+    if (ray_plane_y(hand, t.c.y, p) && std::fabs(p.x - t.c.x) <= t.hx && std::fabs(p.z - t.c.z) <= t.hz) {
+      const float d = vlen(p - hand.origin);
+      if (d < best) {
+        best = d;
+        out = p;
+        y = t.c.y;
+      }
+    }
+  }
+  float floorY;
+  if (best > 1e8f && locate_floor(time, floorY)) {
+    XrVector3f p;
+    if (ray_plane_y(hand, floorY, p)) {
+      out = p;
+      y = floorY;
+      best = 0.f;
+    }
+  }
+  return best < 1e8f;
+}
+
+// Where hand h's laser meets a level surface, and that surface's height.
+bool surface_hit(int h, XrTime time, XrVector3f& out, float& y) {
+  const Hand& hand = G.hands[h];
+  if (!hand.valid)
+    return false;
+  SurfaceShared::PointHit hit;
+  bool ready, gone;
+  {
+    std::lock_guard lock{g_surface.mutex};
+    hit = g_surface.pointHits[h];
+    ready = g_surface.casterReady;
+    gone = g_surface.casterGone || !g_surfaceThread.joinable();
+  }
+  if (!ready) {
+    // Until the raycaster is up (and for good without one), the planes.
+    if (!gone && BP.tables.empty() && !B.floorSpace)
+      return false;
+    return plane_hit(hand, time, out, y);
+  }
+  if (hit.ns == 0 || monotonic_ns() - hit.ns > 300 * kMsNs || !hit.hit || !hit.level) {
+    BP.planeKnown[h] = false;
+    return false;
+  }
+  // The latest cast says which surface; the laser meets it now (the casts
+  // lag the hand), at a height smoothed against the depth's jitter.
+  if (!BP.planeKnown[h] || std::fabs(hit.p.y - BP.planeY[h]) > 0.03f)
+    BP.planeY[h] = hit.p.y;
+  else
+    BP.planeY[h] += (hit.p.y - BP.planeY[h]) * 0.2f;
+  BP.planeKnown[h] = true;
+  y = BP.planeY[h];
+  return ray_plane_y(hand, y, out) && vlen(out - hit.p) < 0.5f;
+}
+
+// The proxy's pictures: the top (the pitch on the board), the sides lit four
+// ways (+x, +z, -x, -z) and the stand's.
+void make_board_images() {
+  const AuroraXrBoardProxy& p = BP.proxy;
+  const int tw = 512, th = std::clamp(static_cast<int>(std::lround(512.f * p.footHalfZ / p.footHalfX)), 64, 1024);
+  Canvas c{tw, th};
+  const auto px = [&](float x) { return static_cast<int>(std::lround((x / p.footHalfX * 0.5f + 0.5f) * tw)); };
+  const auto pz = [&](float z) { return static_cast<int>(std::lround((z / p.footHalfZ * 0.5f + 0.5f) * th)); };
+  c.fill(0, 0, tw, th, {40, 43, 50, 255});                                           // the flared foot
+  c.fill(px(-p.topHalfX), pz(-p.topHalfZ), px(p.topHalfX), pz(p.topHalfZ), {104, 108, 116, 255}); // bevel
+  c.fill(px(-p.topHalfX) + 3, pz(-p.topHalfZ) + 3, px(p.topHalfX) - 3, pz(p.topHalfZ) - 3, {46, 49, 56, 255});
+  const int x0 = px(-p.pitchHalfX), x1 = px(p.pitchHalfX), z0 = pz(-p.pitchHalfZ), z1 = pz(p.pitchHalfZ);
+  const int stripes = 10;
+  for (int i = 0; i < stripes; ++i)
+    c.fill(x0 + (x1 - x0) * i / stripes, z0, x0 + (x1 - x0) * (i + 1) / stripes, z1,
+           i % 2 ? Rgba{58, 132, 62, 255} : Rgba{50, 118, 55, 255});
+  const Rgba white{235, 240, 235, 255};
+  const int lw = std::max(2, tw / 200);
+  c.fill(x0, z0, x1, z0 + lw, white);
+  c.fill(x0, z1 - lw, x1, z1, white);
+  c.fill(x0, z0, x0 + lw, z1, white);
+  c.fill(x1 - lw, z0, x1, z1, white);
+  const int mx = (x0 + x1) / 2, mz = (z0 + z1) / 2;
+  c.fill(mx - lw / 2, z0, mx - lw / 2 + lw, z1, white);
+  const float r = (z1 - z0) * 0.17f;
+  for (int y = static_cast<int>(mz - r - lw); y <= mz + r + lw; ++y)
+    for (int x = static_cast<int>(mx - r - lw); x <= mx + r + lw; ++x) {
+      const float d = std::hypot(static_cast<float>(x - mx), static_cast<float>(y - mz));
+      if (d >= r - lw * 0.5f && d <= r + lw * 0.5f)
+        c.fill(x, y, x + 1, y + 1, white);
+    }
+  // The goal boxes, and the goals behind the lines.
+  const int bx = (x1 - x0) / 9, bz = (z1 - z0) * 3 / 10, gz = (z1 - z0) / 7, gd = std::max(4, (x1 - x0) / 60);
+  for (int end = 0; end < 2; ++end) {
+    const int xa = end ? x1 - bx : x0, xb = end ? x1 : x0 + bx;
+    c.fill(xa, mz - bz, xb, mz - bz + lw, white);
+    c.fill(xa, mz + bz - lw, xb, mz + bz, white);
+    c.fill(end ? xa : xb - lw, mz - bz, end ? xa + lw : xb, mz + bz, white);
+    c.fill(end ? x1 : x0 - gd, mz - gz, end ? x1 + gd : x0, mz + gz, {210, 210, 220, 255});
+  }
+  BP.topImg.rgba = std::move(c.px);
+  BP.topImg.width = static_cast<uint32_t>(tw);
+  BP.topImg.height = static_cast<uint32_t>(th);
+  // Sides: a bright bevel along the top, the side darkening downwards, a
+  // dark foot band; each side its own light so the block reads as solid.
+  constexpr float kLight[4] = {0.95f, 0.8f, 0.7f, 1.05f};
+  for (int i = 0; i < 4; ++i) {
+    for (int stand = 0; stand < 2; ++stand) {
+      Canvas s{8, 64};
+      for (int y = 0; y < 64; ++y) {
+        const float t = y / 63.f;
+        float v;
+        if (stand)
+          v = (34.f + 14.f * (1.f - t)) * kLight[i];
+        else if (t < 0.18f)
+          v = 108.f * kLight[i] * (1.f - 0.15f * t / 0.18f);
+        else if (t < 0.82f)
+          v = 58.f * kLight[i] * (1.1f - 0.4f * (t - 0.18f) / 0.64f);
+        else
+          v = 20.f * kLight[i];
+        const uint8_t g = static_cast<uint8_t>(std::clamp(v, 0.f, 255.f));
+        s.fill(0, y, 8, y + 1, {g, static_cast<uint8_t>(std::min(255.f, g * 1.06f)),
+                                static_cast<uint8_t>(std::min(255.f, g * 1.18f)), 255});
+      }
+      PlacingImage& img = stand ? BP.standImg[i] : BP.sideImg[i];
+      img.rgba = std::move(s.px);
+      img.width = 8;
+      img.height = 64;
+    }
+  }
+  BP.imagesMade = true;
+}
+
+constexpr int kCardW = 640, kCardH = 200;
+
+void draw_board_card() {
+  const bool hands = G.hands[BP.hand].tracked;
+  const int key = static_cast<int>(BP.step) * 2 + (hands ? 1 : 0);
+  if (key == BP.cardDrawn && BP.cardImg.swapchain)
+    return;
+  Canvas c{kCardW, kCardH};
+  c.fill(0, 0, kCardW, kCardH, {18, 20, 26, 225});
+  c.fill(0, 0, kCardW, 4, {120, 200, 255, 255});
+  const char* press = hands ? "PINCH" : "TRIGGER";
+  std::string title, line1, line2, line3;
+  switch (BP.step) {
+  case BoardPlacer::Step::Where:
+    title = "STEP 1 OF 3: WHERE";
+    line1 = "POINT AT THE FLOOR OR A TABLE";
+    line2 = std::string(press) + ": PUT IT HERE";
+    line3 = hands ? "" : "STICK: TURN    B: SKIP";
+    break;
+  case BoardPlacer::Step::Size:
+    title = "STEP 2 OF 3: SIZE";
+    line1 = "POINT WHERE ITS EDGE GOES";
+    line2 = std::string(press) + ": THIS SIZE";
+    line3 = hands ? "" : "STICK: TURN    B OR GRIP: BACK";
+    break;
+  default:
+    title = "STEP 3 OF 3: HEIGHT";
+    line1 = "POINT WHERE ITS TOP GOES";
+    line2 = std::string(press) + ": DONE";
+    line3 = hands ? "" : "STICK: TURN    B OR GRIP: BACK";
+    break;
+  }
+  c.text(24, 22, 5, title, {255, 255, 255, 255});
+  c.text(24, 82, 3, line1, {220, 226, 235, 255});
+  c.text(24, 118, 3, line2, {220, 226, 235, 255});
+  c.text(24, 154, 3, line3, {160, 168, 180, 255});
+  if (BP.cardImg.swapchain)
+    xrDestroySwapchain(BP.cardImg.swapchain);
+  BP.cardImg.swapchain = XR_NULL_HANDLE;
+  BP.cardImg.rgba = std::move(c.px);
+  BP.cardImg.width = kCardW;
+  BP.cardImg.height = kCardH;
+  upload_placing_image(BP.cardImg);
+  BP.cardDrawn = key;
+}
+
+void board_go(BoardPlacer::Step step) {
+  static const char* const kNames[] = {"off", "where", "size", "height", "done"};
+  BP.step = step;
+  BP.stepNs = monotonic_ns();
+  Log.info("Board placement: {}", kNames[static_cast<int>(step)]);
+}
+
+// Every stage starts where the board was put (as aurora_xr_adopt_stage).
+void board_adopt() {
+  std::lock_guard lock{g_arenaMutex};
+  init_arena();
+  g_adoptedArena.pos = BP.spot + XrVector3f{0.f, BP.height, 0.f};
+  g_adoptedArena.yaw = BP.yaw;
+  g_adoptedArena.scale = g_defaultArena.scale * BP.k;
+  g_adoptedSet = true;
+  g_stageArenas.clear();
+  g_arenaToHead = false;
+  g_boardPlaced = true;
+  g_boardSurfaceY = BP.surfaceY;
+  if (g_stage >= 0) {
+    g_arena = g_adoptedArena;
+    g_arena.scale *= g_stageScale;
+  }
+  Log.info("Board placed: at {:.2f},{:.2f},{:.2f} on a surface at y {:.3f}, yaw {:.0f} deg, {:.2f} m long, on a "
+           "{:.2f} m stand",
+           BP.spot.x, BP.spot.y, BP.spot.z, BP.surfaceY, BP.yaw * 57.2958f, 2.f * BP.proxy.pitchHalfX * BP.k,
+           BP.height);
+}
+
+// The broadside turn: the board's length across the line from the head.
+float board_facing(XrVector3f spot) {
+  const XrVector3f f = spot - B.head;
+  return std::atan2(-f.x, -f.z) + BP.turn;
+}
+
+// Unattended: a right hand a little under and ahead of the head, aimed at
+// this step's target, pressing its trigger 1.2 s into the step.
+void board_auto_hand(XrTime time) {
+  Hand& hand = G.hands[1];
+  const XrVector3f fwd = qrot(B.headOrientation, {0.f, 0.f, -1.f});
+  const float headYaw = std::atan2(-fwd.x, -fwd.z);
+  hand.valid = true;
+  hand.tracked = false;
+  hand.origin = B.head + rot_y({0.15f, -0.3f, -0.25f}, headYaw);
+  XrVector3f target;
+  if (BP.step == BoardPlacer::Step::Where) {
+    float floorY = B.head.y - 1.6f;
+    locate_floor(time, floorY);
+    target = BP.tables.empty() ? B.head + rot_y({0.f, 0.f, -BP.autoDist}, headYaw) : BP.tables[0].c;
+    if (BP.tables.empty())
+      target.y = floorY;
+  } else if (BP.step == BoardPlacer::Step::Size) {
+    target = BP.spot + board_axis_x(BP.yaw) * (BP.proxy.footHalfX * BP.autoK);
+  } else {
+    target = BP.spot + XrVector3f{0.f, BP.autoHeight + BP.proxy.depth * BP.k, 0.f};
+  }
+  hand.dir = vnorm(target - hand.origin);
+  // One frame's press per step.
+  static int64_t pressedIn = 0;
+  hand.wasSel = false;
+  hand.sel = monotonic_ns() - BP.stepNs > 1200 * kMsNs && pressedIn != BP.stepNs;
+  if (hand.sel)
+    pressedIn = BP.stepNs;
+}
+
+void dump_board_view(int step, const BoardLayers& layers, XrTime time);
+
+// XR thread, every frame: runs the placement while it's on; true while it
+// shows (nothing else does then).
+bool board_place_frame(XrTime time, bool viewsValid) {
+  {
+    std::lock_guard lock{g_boardProxyMutex};
+    if (BP.step == BoardPlacer::Step::Off) {
+      if (!board_place_wanted() || !BP.haveProxy || !B.focused || !viewsValid)
+        return false;
+      static bool once = false;
+      if (std::exchange(once, true))
+        return false;
+      if (const char* v = std::getenv("AURORA_XR_PLACE_TABLE")) {
+        for (std::string_view rest{v}; !rest.empty();) {
+          const size_t semi = rest.find(';');
+          const std::string one{rest.substr(0, semi)};
+          BoardPlacer::Table t{};
+          if (std::sscanf(one.c_str(), "%f,%f,%f,%f,%f", &t.c.x, &t.c.y, &t.c.z, &t.hx, &t.hz) == 5)
+            BP.tables.push_back(t);
+          rest = semi == std::string_view::npos ? std::string_view{} : rest.substr(semi + 1);
+        }
+      }
+      if (const char* v = std::getenv("AURORA_XR_PLACE_AUTO")) {
+        BP.autoOn = true;
+        std::sscanf(v, "%f,%f,%f", &BP.autoK, &BP.autoHeight, &BP.autoDist);
+      }
+      board_go(BoardPlacer::Step::Where);
+    }
+  }
+  if (BP.step == BoardPlacer::Step::Done)
+    return false;
+  if (!BP.imagesMade)
+    make_board_images();
+  g_boardPlacing = true;
+
+  static auto last = std::chrono::steady_clock::now();
+  const auto now = std::chrono::steady_clock::now();
+  const float dt = std::min(std::chrono::duration<float>(now - last).count(), 0.1f);
+  last = now;
+
+  if (BP.autoOn && B.focused)
+    board_auto_hand(time);
+  // The laser that places: the one whose trigger or pinch went last.
+  int pressed = -1;
+  for (int h = 0; h < 2; ++h) {
+    const Hand& hand = G.hands[h];
+    if (hand.valid && (hand.tracked ? hand.held && !hand.wasHeld : hand.sel && !hand.wasSel))
+      pressed = h;
+  }
+  if (pressed >= 0)
+    BP.hand = pressed;
+  else if (!G.hands[BP.hand].valid && G.hands[1 - BP.hand].valid)
+    BP.hand = 1 - BP.hand;
+  const Hand& hand = G.hands[BP.hand];
+  const bool gripBack = !hand.tracked && hand.held && !hand.wasHeld;
+  const bool back = (B.backButton && !BP.backWas) || gripBack;
+  BP.backWas = B.backButton;
+  BP.turn -= B.stickX[BP.hand] * 1.5f * dt; // radians a second at full tilt
+
+  // Each laser to the worker, for the room's surfaces.
+  {
+    std::lock_guard lock{g_surface.mutex};
+    const bool pointing = BP.step == BoardPlacer::Step::Where;
+    if (pointing && !g_surface.pointing)
+      g_surface.cv.notify_one(); // it may be asleep for a second
+    g_surface.pointing = pointing;
+    g_surface.displayTime = time;
+    for (int h = 0; h < 2; ++h) {
+      g_surface.rayOrigin[h] = G.hands[h].origin;
+      g_surface.rayDir[h] = G.hands[h].dir;
+      g_surface.rayValid[h] = G.hands[h].valid;
+    }
+  }
+
+  BP.aimed = false;
+  switch (BP.step) {
+  case BoardPlacer::Step::Where: {
+    float y;
+    if (surface_hit(BP.hand, time, BP.aim, y)) {
+      BP.aimed = true;
+      BP.spot = BP.aim;
+      BP.surfaceY = y;
+      BP.yaw = board_facing(BP.spot);
+    }
+    if (back && !gripBack) {
+      Log.info("Board placement skipped: stages start in front of the head");
+      board_go(BoardPlacer::Step::Done);
+    } else if (pressed >= 0 && BP.aimed) {
+      board_go(BoardPlacer::Step::Size);
+    }
+    break;
+  }
+  case BoardPlacer::Step::Size: {
+    BP.yaw = board_facing(BP.spot);
+    if (ray_plane_y(hand, BP.surfaceY, BP.aim)) {
+      BP.aimed = true;
+      const XrVector3f d = BP.aim - BP.spot;
+      const float lx = std::fabs(vdot(d, board_axis_x(BP.yaw))), lz = std::fabs(vdot(d, board_axis_z(BP.yaw)));
+      BP.k = std::clamp(std::max(lx / BP.proxy.footHalfX, lz / BP.proxy.footHalfZ), 0.25f, 4.f);
+    }
+    if (back)
+      board_go(BoardPlacer::Step::Where);
+    else if (pressed >= 0)
+      board_go(BoardPlacer::Step::Height);
+    break;
+  }
+  case BoardPlacer::Step::Height: {
+    BP.yaw = board_facing(BP.spot);
+    XrVector3f n = B.head - BP.spot;
+    n.y = 0.f;
+    n = vnorm(n);
+    const float den = vdot(hand.dir, n);
+    if (hand.valid && std::fabs(den) > 0.05f) {
+      const float t = vdot(BP.spot - hand.origin, n) / den;
+      if (t > 0.f) {
+        BP.aimed = true;
+        BP.aim = hand.origin + hand.dir * t;
+        BP.height = std::clamp(BP.aim.y - BP.surfaceY - BP.proxy.depth * BP.k, 0.f, 2.f);
+        if (BP.height < 0.01f)
+          BP.height = 0.f; // resting on the surface
+      }
+    }
+    if (back) {
+      BP.height = 0.f;
+      board_go(BoardPlacer::Step::Size);
+    } else if (pressed >= 0) {
+      board_adopt();
+      board_go(BoardPlacer::Step::Done);
+    }
+    break;
+  }
+  default:
+    break;
+  }
+  if (BP.step == BoardPlacer::Step::Done) {
+    g_boardPlacing = false;
+    std::lock_guard lock{g_surface.mutex};
+    g_surface.pointing = false;
+    return false;
+  }
+
+  // The card: ahead of the head and a little over it, facing it; it follows
+  // once the head has turned well away.
+  const XrVector3f fwd = qrot(B.headOrientation, {0.f, 0.f, -1.f});
+  const float headYaw = std::atan2(-fwd.x, -fwd.z);
+  float off = std::remainder(headYaw - BP.cardYaw, 6.2831853f);
+  if (!BP.cardPlaced || std::fabs(off) > 0.6f) {
+    BP.cardYaw = headYaw;
+    BP.cardPlaced = true;
+    const XrVector3f pos = B.head + rot_y({0.f, 0.22f, -1.1f}, headYaw);
+    const XrVector3f z = vnorm(B.head - pos);
+    const XrVector3f x = vnorm(vcross({0.f, 1.f, 0.f}, z));
+    BP.card = {quat_from_axes(x, vcross(z, x), z), pos};
+  }
+  draw_board_card();
+  return true;
+}
+
+void add_board_quad(BoardLayers& out, const PlacingImage& img, XrVector3f center, XrVector3f x, XrVector3f y,
+                    XrVector3f z, XrExtent2Df size) {
+  if (out.count >= kMaxBoardLayers || !img.swapchain)
+    return;
+  auto& q = out.quads[out.count];
+  q = {XR_TYPE_COMPOSITION_LAYER_QUAD};
+  q.layerFlags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT;
+  q.space = B.space;
+  q.eyeVisibility = XR_EYE_VISIBILITY_BOTH;
+  q.subImage.swapchain = img.swapchain;
+  q.subImage.imageRect = {{0, 0}, {static_cast<int32_t>(img.width), static_cast<int32_t>(img.height)}};
+  q.pose = {quat_from_axes(x, y, z), center};
+  q.size = size;
+  out.images[out.count] = &img;
+  ++out.count;
+}
+
+// A box's sides that face the head (those facing away are hidden by it):
+// half extents hx, hz about `foot` (the middle of its underside), h tall.
+void add_board_box(BoardLayers& out, const std::array<PlacingImage, 4>& sides, XrVector3f foot, float yaw, float hx,
+                   float hz, float h) {
+  const XrVector3f up{0.f, 1.f, 0.f};
+  const XrVector3f ax = board_axis_x(yaw), az = board_axis_z(yaw);
+  const std::array<XrVector3f, 4> normals{ax, az, ax * -1.f, az * -1.f};
+  const std::array<float, 4> reach{hx, hz, hx, hz}, across{hz, hx, hz, hx};
+  for (int i = 0; i < 4; ++i) {
+    const XrVector3f c = foot + normals[i] * reach[i] + up * (h * 0.5f);
+    if (vdot(B.head - c, normals[i]) <= 0.f)
+      continue;
+    add_board_quad(out, sides[i], c, vcross(up, normals[i]), up, normals[i], {across[i] * 2.f, h});
+  }
+}
+
+void build_board_layers(BoardLayers& out) {
+  for (PlacingImage* img : {&BP.topImg, &BP.sideImg[0], &BP.sideImg[1], &BP.sideImg[2], &BP.sideImg[3],
+                            &BP.standImg[0], &BP.standImg[1], &BP.standImg[2], &BP.standImg[3]})
+    if (!img->swapchain && !img->rgba.empty())
+      upload_placing_image(*img);
+  const AuroraXrBoardProxy& p = BP.proxy;
+  const bool shown = BP.step != BoardPlacer::Step::Where || BP.aimed;
+  if (shown) {
+    const float k = BP.k, depth = p.depth * k;
+    const XrVector3f foot = BP.spot + XrVector3f{0.f, BP.height, 0.f};
+    // From under the board (a tall stand, a low head) the stand is in front
+    // of its underside: drawn after it.
+    const bool under = B.head.y < foot.y;
+    const auto stand = [&] {
+      if (BP.height > 0.f)
+        add_board_box(out, BP.standImg, BP.spot, BP.yaw, p.standHalfX * k, p.standHalfZ * k, BP.height);
+    };
+    if (!under)
+      stand();
+    add_board_box(out, BP.sideImg, foot, BP.yaw, p.footHalfX * k, p.footHalfZ * k, depth);
+    const XrVector3f top = foot + XrVector3f{0.f, depth, 0.f};
+    if (B.head.y > top.y) {
+      const XrVector3f up{0.f, 1.f, 0.f}, ax = board_axis_x(BP.yaw);
+      add_board_quad(out, BP.topImg, top, ax, vcross(up, ax), up, {p.footHalfX * k * 2.f, p.footHalfZ * k * 2.f});
+    }
+    if (under)
+      stand();
+  }
+  if (BP.cardImg.swapchain) {
+    const float w = 0.5f;
+    add_board_quad(out, BP.cardImg, BP.card.position, qrot(BP.card.orientation, {1.f, 0.f, 0.f}),
+                   qrot(BP.card.orientation, {0.f, 1.f, 0.f}), qrot(BP.card.orientation, {0.f, 0.f, 1.f}),
+                   {w, w * kCardH / kCardW});
+  }
+  // The lasers: the placing one to where it meets the surface (or 2 m, faint,
+  // while it's on none), the other faint and short.
+  if (!B.beamSwapchain || !B.dotSwapchain)
+    return;
+  for (int h = 0; h < 2; ++h) {
+    const Hand& hand = G.hands[h];
+    if (!hand.valid || out.count + 2 > kMaxBoardLayers)
+      continue;
+    const bool placing = h == BP.hand;
+    const bool on = placing && BP.aimed;
+    const float length = on ? vlen(BP.aim - hand.origin) : placing ? 2.f : 0.5f;
+    const XrColor4f color = on ? XrColor4f{0.45f, 0.85f, 1.f, 1.f} : XrColor4f{0.85f, 0.9f, 1.f, placing ? 0.5f : 0.3f};
+    const XrVector3f center = hand.origin + hand.dir * (length * 0.5f);
+    const XrVector3f toHead = B.head - center;
+    const XrVector3f z = vnorm(toHead - hand.dir * vdot(toHead, hand.dir));
+    const auto tinted = [&](XrSwapchain sc, uint32_t w, uint32_t hgt, XrVector3f c, XrQuaternionf q, XrExtent2Df size) {
+      auto& l = out.quads[out.count];
+      l = {XR_TYPE_COMPOSITION_LAYER_QUAD};
+      l.layerFlags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT;
+      l.space = B.space;
+      l.eyeVisibility = XR_EYE_VISIBILITY_BOTH;
+      l.subImage.swapchain = sc;
+      l.subImage.imageRect = {{0, 0}, {static_cast<int32_t>(w), static_cast<int32_t>(hgt)}};
+      l.pose = {q, c};
+      l.size = size;
+      if (B.hasColorScaleBias) {
+        auto& t = out.tints[out.count];
+        t = {XR_TYPE_COMPOSITION_LAYER_COLOR_SCALE_BIAS_KHR};
+        t.colorScale = {color.r * color.a, color.g * color.a, color.b * color.a, color.a};
+        l.next = &t;
+      }
+      out.images[out.count] = nullptr;
+      ++out.count;
+    };
+    if (vlen(z) > 0.5f)
+      tinted(B.beamSwapchain, kBeamW, kBeamH, center, quat_from_axes(vcross(hand.dir, z), hand.dir, z),
+             {0.004f, length});
+    if (on) {
+      const XrVector3f dz = vnorm(B.head - BP.aim);
+      const XrVector3f dx = vnorm(vcross({0.f, 1.f, 0.f}, dz));
+      if (vlen(dx) > 0.5f)
+        tinted(B.dotSwapchain, kDotSize, kDotSize, BP.aim, quat_from_axes(dx, vcross(dz, dx), dz), {0.025f, 0.025f});
+    }
+  }
+}
+
+// AURORA_XR_DUMP with AURORA_XR_PLACE_AUTO: what the left eye sees of the
+// placement's layers (lasers left out, the aim a red cross), over the
+// planes the desktop stands in for the room: a checked floor, brown tables.
+void dump_board_view(int step, const BoardLayers& layers, XrTime time) {
+  if (B.dumpDir.empty() || BP.dumped[step])
+    return;
+  XrView view;
+  {
+    std::lock_guard lock{g_viewMutex};
+    if (!g_viewsValid)
+      return;
+    view = g_latestViews[0];
+  }
+  BP.dumped[step] = true;
+  // From the eye, turned to look at the board (the eye looks level, the
+  // board is well under it), 60 degrees across.
+  const XrVector3f look = BP.spot + XrVector3f{0.f, BP.height + BP.proxy.depth * BP.k * 0.5f, 0.f};
+  {
+    const XrVector3f z = vnorm(view.pose.position - look);
+    const XrVector3f x = vnorm(vcross({0.f, 1.f, 0.f}, z));
+    view.pose.orientation = quat_from_axes(x, vcross(z, x), z);
+    view.fov = {-0.5236f, 0.5236f, 0.5236f, -0.5236f};
+  }
+  constexpr int W = 640, H = 640;
+  std::vector<uint8_t> out(W * H * 3);
+  float floorY = -100.f;
+  locate_floor(time, floorY);
+  const XrVector3f o = view.pose.position;
+  const float tl = std::tan(view.fov.angleLeft), tr = std::tan(view.fov.angleRight);
+  const float tu = std::tan(view.fov.angleUp), td = std::tan(view.fov.angleDown);
+  for (int py = 0; py < H; ++py)
+    for (int px = 0; px < W; ++px) {
+      const float u = (px + 0.5f) / W, v = (py + 0.5f) / H;
+      const XrVector3f d = vnorm(qrot(view.pose.orientation, {tl + (tr - tl) * u, tu + (td - tu) * v, -1.f}));
+      float col[3] = {70.f, 74.f, 80.f};
+      // The room: the nearest of the floor and the tables.
+      float best = 1e9f;
+      if (d.y < 0.f) {
+        const float t = (floorY - o.y) / d.y;
+        if (t > 0.f) {
+          const XrVector3f p = o + d * t;
+          best = t;
+          const bool chk = (static_cast<int>(std::floor(p.x * 2.f)) + static_cast<int>(std::floor(p.z * 2.f))) & 1;
+          col[0] = col[1] = col[2] = chk ? 120.f : 100.f;
+        }
+        for (const auto& tb : BP.tables) {
+          const float t2 = (tb.c.y - o.y) / d.y;
+          const XrVector3f p = o + d * t2;
+          if (t2 > 0.f && t2 < best && std::fabs(p.x - tb.c.x) <= tb.hx && std::fabs(p.z - tb.c.z) <= tb.hz) {
+            best = t2;
+            col[0] = 120.f, col[1] = 84.f, col[2] = 52.f;
+          }
+        }
+      }
+      // The layers in order, each over what's under it.
+      for (uint32_t i = 0; i < layers.count; ++i) {
+        const PlacingImage* img = layers.images[i];
+        if (!img)
+          continue;
+        const auto& q = layers.quads[i];
+        const XrVector3f n = qrot(q.pose.orientation, {0.f, 0.f, 1.f});
+        const float den = vdot(d, n);
+        if (std::fabs(den) < 1e-6f)
+          continue;
+        const float t = vdot(q.pose.position - o, n) / den;
+        if (t <= 0.f)
+          continue;
+        const XrVector3f rel = o + d * t - q.pose.position;
+        const float lx = vdot(rel, qrot(q.pose.orientation, {1.f, 0.f, 0.f})) / q.size.width + 0.5f;
+        const float ly = 0.5f - vdot(rel, qrot(q.pose.orientation, {0.f, 1.f, 0.f})) / q.size.height;
+        if (lx < 0.f || lx >= 1.f || ly < 0.f || ly >= 1.f)
+          continue;
+        const size_t at = (static_cast<size_t>(ly * img->height) * img->width + static_cast<size_t>(lx * img->width)) * 4;
+        const float a = img->rgba[at + 3] / 255.f;
+        for (int ch = 0; ch < 3; ++ch)
+          col[ch] = col[ch] * (1.f - a) + img->rgba[at + ch] * a;
+      }
+      for (int ch = 0; ch < 3; ++ch)
+        out[(py * W + px) * 3 + ch] = static_cast<uint8_t>(std::clamp(col[ch], 0.f, 255.f));
+    }
+  // The aim: a red cross where it projects.
+  if (BP.aimed) {
+    const XrVector3f rel = BP.aim - o;
+    const XrQuaternionf inv = qconj(view.pose.orientation);
+    const XrVector3f e = qrot(inv, rel);
+    if (e.z < -0.01f) {
+      const float u = (e.x / -e.z - tl) / (tr - tl), v = (e.y / -e.z - tu) / (td - tu);
+      const int cx = static_cast<int>(u * W), cy = static_cast<int>(v * H);
+      for (int i = -8; i <= 8; ++i)
+        for (int w = -1; w <= 1; ++w)
+          for (const auto [x, y] : {std::pair{cx + i, cy + w}, std::pair{cx + w, cy + i}})
+            if (x >= 0 && x < W && y >= 0 && y < H) {
+              uint8_t* p = &out[(y * W + x) * 3];
+              p[0] = 255, p[1] = 40, p[2] = 40;
+            }
+    }
+  }
+  const std::string path = B.dumpDir + "/xr_place" + std::to_string(step) + ".ppm";
+  if (FILE* f = std::fopen(path.c_str(), "wb")) {
+    std::fprintf(f, "P6\n%d %d\n255\n", W, H);
+    std::fwrite(out.data(), 1, out.size(), f);
+    std::fclose(f);
+    Log.info("Dumped place{} ({})", step, path);
+  }
+}
+
+void destroy_board_placer() {
+  for (PlacingImage* img : {&BP.cardImg, &BP.topImg, &BP.sideImg[0], &BP.sideImg[1], &BP.sideImg[2], &BP.sideImg[3],
+                            &BP.standImg[0], &BP.standImg[1], &BP.standImg[2], &BP.standImg[3]}) {
+    if (img->swapchain)
+      xrDestroySwapchain(img->swapchain);
+    img->swapchain = XR_NULL_HANDLE;
+  }
+  BP.cardDrawn = -1;
+}
+
 bool render_xr_frame() {
   XrFrameState fs{XR_TYPE_FRAME_STATE};
   {
@@ -7470,11 +8290,13 @@ bool render_xr_frame() {
   const bool pointing = fight && held && B.focused;
   const bool screenPointing = screenShown && B.focused;
   locate_hands(fs.predictedDisplayTime);
+  // Placing the board on a surface (at launch): it alone shows.
+  const bool boardPlacing = board_place_frame(fs.predictedDisplayTime, viewsValid);
   // The dev tools panel, whatever shows, but for the hold before a fight.
   const bool roomWanted = B.passthroughLayer && B.passthroughRunning && g_passthroughWanted;
-  update_dev_panel(dev_tools_wanted() && placing == 0 && B.focused && (fight || screenShown),
+  update_dev_panel(dev_tools_wanted() && placing == 0 && !boardPlacing && B.focused && (fight || screenShown),
                    roomWanted && B.hasColorLutExt, screenShown);
-  update_grab(fight ? Target::Arena : Target::Screen, pointing || screenPointing);
+  update_grab(fight ? Target::Arena : Target::Screen, (pointing || screenPointing) && !boardPlacing);
   if (const int h = dev_panel_reel_hand(); h >= 0)
     B.reelHand = h;
   bool onPanel = false;
@@ -7488,9 +8310,9 @@ bool render_xr_frame() {
   const bool onScreen = screenPointing && std::any_of(G.hands.begin(), G.hands.end(), [](const Hand& h) {
                           return h.engaged || h.clicking || h.inside || h.hit >= 0.f;
                         });
-  B.pointerMode = pointing || onScreen || onPanel;
+  B.pointerMode = pointing || onScreen || onPanel || boardPlacing;
   // The triggers click the screen or the panel instead of pressing L and R.
-  B.triggersClick = onScreen || onPanel;
+  B.triggersClick = onScreen || onPanel || boardPlacing;
   // The surface under the stage is measured while it's being placed: the
   // hold before a fight, or a grab in a pause.
   surface_frame(fight, fight && (placing > 0 || (G.target == Target::Arena && (G.oneHand >= 0 || G.twoHands))),
@@ -7500,7 +8322,8 @@ bool render_xr_frame() {
 
   // The passthrough, the shadow, the HUD and the 3D view, the HUD on top in
   // full VR, then the placing cards and the lasers.
-  std::array<const XrCompositionLayerBaseHeader*, 5 + kMaxPlacingLayers + kMaxPointerLayers> layers{};
+  std::array<const XrCompositionLayerBaseHeader*, 5 + std::max(kMaxPlacingLayers + kMaxPointerLayers, kMaxBoardLayers)>
+      layers{};
   uint32_t layerCount = 0;
   XrCompositionLayerPassthroughFB ptLayer{XR_TYPE_COMPOSITION_LAYER_PASSTHROUGH_FB};
   sync_passthrough();
@@ -7526,7 +8349,15 @@ bool render_xr_frame() {
   PlacingLayers placingLayers;
   XrCompositionLayerQuad panelQuad{XR_TYPE_COMPOSITION_LAYER_QUAD};
   const bool panel = build_dev_panel_layer(panelQuad);
-  if (fs.shouldRender && fight) {
+  BoardLayers boardLayers;
+  if (fs.shouldRender && boardPlacing) {
+    build_board_layers(boardLayers);
+    for (uint32_t i = 0; i < boardLayers.count; ++i)
+      layers[layerCount++] = reinterpret_cast<const XrCompositionLayerBaseHeader*>(&boardLayers.quads[i]);
+    // Unattended: each step as it's about to be pressed.
+    if (BP.autoOn && monotonic_ns() - BP.stepNs > 1100 * kMsNs)
+      dump_board_view(static_cast<int>(BP.step), boardLayers, fs.predictedDisplayTime);
+  } else if (fs.shouldRender && fight) {
     // Premultiplied alpha (no UNPREMULTIPLIED bit): the arena's coverage
     // hides the room, effects outside it add light over passthrough.
     // Multiview: one layer per eye. Otherwise the eyes sit side by side.
@@ -7946,6 +8777,7 @@ void teardown() {
     *sc = XR_NULL_HANDLE;
   }
   destroy_dev_panel();
+  destroy_board_placer();
   {
     std::lock_guard lock{g_placingMutex};
     for (auto& clip : g_placingClips) {
@@ -10437,6 +11269,26 @@ extern "C" void aurora_xr_adopt_stage(void) {
   Log.info("Arena adopted as every stage's start: {:.2f},{:.2f},{:.2f}, yaw {:.0f} deg, scale {:.5f}",
            g_adoptedArena.pos.x, g_adoptedArena.pos.y, g_adoptedArena.pos.z, g_adoptedArena.yaw * 57.2958f,
            g_adoptedArena.scale);
+}
+
+extern "C" void aurora_xr_set_board_proxy(const AuroraXrBoardProxy* proxy) {
+  using namespace aurora::xr;
+  if (!proxy || proxy->footHalfX <= 0.f || proxy->footHalfZ <= 0.f || proxy->depth <= 0.f)
+    return;
+  std::lock_guard lock{g_boardProxyMutex};
+  BP.proxy = *proxy;
+  BP.haveProxy = true;
+}
+
+extern "C" bool aurora_xr_board_placing(void) { return aurora::xr::g_boardPlacing; }
+
+extern "C" float aurora_xr_stand_height(void) {
+  using namespace aurora::xr;
+  std::lock_guard lock{g_arenaMutex};
+  const float s = g_arena.scale * g_stageZoom;
+  if (!g_boardPlaced || s <= 0.f)
+    return 0.f;
+  return std::max(g_arena.pos.y - g_boardSurfaceY, 0.f) / s;
 }
 
 extern "C" bool aurora_xr_stage_adopted(void) {
