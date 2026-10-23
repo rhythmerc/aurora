@@ -6586,6 +6586,7 @@ struct RoomLight {
   int view = 0;
   float delight = 1.f;
   float gloss = 1.f; // the room's specular highlight: fighters by kFighterGloss, the stage by stage_gloss
+  float keys = 1.f;  // the key and fill lights' strength, on top of STRENGTH (0-2)
 };
 
 // The fighters' share of GLOSS (tuned on the headset: at 1 they looked too
@@ -7134,8 +7135,8 @@ std::array<std::array<float, 3>, 9> room_sh(const RoomPreset& p) {
 }
 
 std::string room_light_value(const RoomLight& r) {
-  return fmt::format("{},{:.2f},{:.2f},{:.2f},{:.2f},{:.0f},{},{},{:.2f},{:.2f}", r.source, r.fighters, r.stage,
-                     r.unlit, r.strength, r.yaw, r.shading, r.view, r.delight, r.gloss);
+  return fmt::format("{},{:.2f},{:.2f},{:.2f},{:.2f},{:.0f},{},{},{:.2f},{:.2f},{:.2f}", r.source, r.fighters,
+                     r.stage, r.unlit, r.strength, r.yaw, r.shading, r.view, r.delight, r.gloss, r.keys);
 }
 
 // The eye pipelines' variant bits (gfx::set_xr_room_light).
@@ -7152,9 +7153,9 @@ void init_room_light() {
     g_room.sh[i] = room_sh(kRoomPresets[i]);
   RoomLight r;
   if (const char* v = std::getenv("AURORA_XR_ROOM_LIGHT")) {
-    float f[10] = {0.f, r.fighters, r.stage, r.unlit, r.strength, r.yaw, 0.f, 0.f, r.delight, r.gloss};
-    std::sscanf(v, "%f,%f,%f,%f,%f,%f,%f,%f,%f,%f", &f[0], &f[1], &f[2], &f[3], &f[4], &f[5], &f[6], &f[7], &f[8],
-                &f[9]);
+    float f[11] = {0.f, r.fighters, r.stage, r.unlit, r.strength, r.yaw, 0.f, 0.f, r.delight, r.gloss, r.keys};
+    std::sscanf(v, "%f,%f,%f,%f,%f,%f,%f,%f,%f,%f,%f", &f[0], &f[1], &f[2], &f[3], &f[4], &f[5], &f[6], &f[7],
+                &f[8], &f[9], &f[10]);
     r.source = std::clamp(static_cast<int>(f[0]), 0, kRoomSourceCaptured);
     r.fighters = std::clamp(f[1], 0.f, 1.f);
     r.stage = std::clamp(f[2], 0.f, 1.f);
@@ -7165,6 +7166,7 @@ void init_room_light() {
     r.view = std::clamp(static_cast<int>(f[7]), 0, 3);
     r.delight = std::clamp(f[8], 0.f, 1.f);
     r.gloss = std::clamp(f[9], 0.f, 1.f);
+    r.keys = std::clamp(f[10], 0.f, 2.f);
     Log.info("Room light: AURORA_XR_ROOM_LIGHT={}", room_light_value(r));
   }
   if (r.source == kRoomSourceCaptured)
@@ -7277,13 +7279,13 @@ RoomFrame room_frame(const std::array<float, 16>& arena) {
       c = len > 1e-12f ? c / len : 0.f;
     f.dir[l] = v;
     for (int c = 0; c < 3; ++c)
-      f.col[l][c] = (*cols[l])[c] * r.strength;
+      f.col[l][c] = (*cols[l])[c] * r.strength * r.keys;
   }
   if (captured)
     for (int l = 0; l < 2; ++l) {
       f.dir[l] = cap.dir[l];
       for (int c = 0; c < 3; ++c)
-        f.col[l][c] = cap.col[l][c] * gain;
+        f.col[l][c] = cap.col[l][c] * gain * r.keys;
       f.pos[l] = cap.pos[l];
       f.range[l] = cap.placed[l] ? cap.range[l] : 0.f;
     }
@@ -7340,7 +7342,8 @@ RoomFrame room_frame(const std::array<float, 16>& arena) {
 //
 // Light, which the eye shaders apply (room lighting, above): the room's
 // source (off or a preset), the blend toward it for fighters, stage and
-// unlit draws, its strength, the turn of its lights about the stage, the
+// unlit draws, its strength, its key lights' strength (KEY, on top), the
+// turn of its lights about the stage, the
 // room's part per vertex or per pixel, and a debug view. Reset puts back
 // the launch settings; each change is logged as an AURORA_XR_ROOM_LIGHT
 // value.
@@ -7493,14 +7496,15 @@ enum {
   kRlDelight,
   kRlGloss,
   kRlStrength,
+  kRlKeys,
   kRlYaw,
   kRlShading,
   kRlView,
   kRlRows
 };
-constexpr int kLightRowY0 = 70, kLightRowStep = 40;
-constexpr std::array<const char*, kRlRows> kLightNames{"SOURCE", "FIGHTERS", "STAGE", "UNLIT",   "DELIGHT",
-                                                       "GLOSS",  "STRENGTH", "YAW",   "SHADING", "VIEW"};
+constexpr int kLightRowY0 = 70, kLightRowStep = 37;
+constexpr std::array<const char*, kRlRows> kLightNames{"SOURCE",   "FIGHTERS", "STAGE", "UNLIT",   "DELIGHT", "GLOSS",
+                                                       "STRENGTH", "KEY",      "YAW",   "SHADING", "VIEW"};
 constexpr std::array<const char*, 4> kShadingNames{"VERTEX", "PIXEL", "FACET", "SMOOTH"};
 constexpr std::array<const char*, 4> kViewNames{"OFF", "LIT", "CLASS", "NORMALS"};
 
@@ -7893,12 +7897,13 @@ std::vector<const char*> light_choices(int row) {
     return {kViewNames.begin(), kViewNames.end()};
   return {};
 }
-float light_max(int row) { return row == kRlStrength ? 2.f : row == kRlYaw ? 360.f : 1.f; }
+float light_max(int row) { return row == kRlStrength || row == kRlKeys ? 2.f : row == kRlYaw ? 360.f : 1.f; }
 float& light_slider(RoomLight& r, int row) {
   return row == kRlFighters ? r.fighters : row == kRlStage ? r.stage : row == kRlUnlit ? r.unlit
                                          : row == kRlDelight  ? r.delight
                                          : row == kRlGloss    ? r.gloss
-                                         : row == kRlStrength ? r.strength : r.yaw;
+                                         : row == kRlStrength ? r.strength
+                                         : row == kRlKeys     ? r.keys : r.yaw;
 }
 
 void light_log() {
@@ -7931,7 +7936,7 @@ void draw_light(Canvas& c) {
       const int kx = kTrackX0 + static_cast<int>(std::lround(t * (kTrackX1 - kTrackX0)));
       c.fill(kTrackX0, y + 10, kTrackX1, y + kTrackH - 10, {52, 56, 68, 255});
       c.fill(kTrackX0, y + 10, kx, y + kTrackH - 10, usable ? Rgba{70, 110, 150, 255} : Rgba{60, 64, 74, 255});
-      if (row == kRlStrength) { // 1x
+      if (row == kRlStrength || row == kRlKeys) { // 1x
         const int k1 = kTrackX0 + (kTrackX1 - kTrackX0) / 2;
         c.fill(k1 - 1, y + 4, k1 + 1, y + kTrackH - 4, {150, 156, 168, 255});
       }
