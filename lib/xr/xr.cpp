@@ -11893,9 +11893,14 @@ extern "C" int aurora_xr_room_capture_wanted(void) {
     casts = c.casts;
     mode = capture_mode_locked();
   }
-  if (make || log) {
+  {
+    // Made again whenever the stage moved since the last make (Roomtone's
+    // stale: a point moved 5 cm), capture or not: a recenter mid-fight
+    // moved the stage across the room with no capture running, and it kept
+    // the old spot's light, nearer a window, until the next pause
+    // (2026-10-23). A make costs ~15 ms here, at most every poll.
     std::lock_guard lock{c.estMutex};
-    if (make && (log || c.est.stale()))
+    if ((make && log) || c.est.stale())
       c.est.make();
     if (log)
       capture_log(what, frames != 0 ? frames : c.est.frames(), casts);
