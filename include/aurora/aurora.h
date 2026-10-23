@@ -136,6 +136,12 @@ typedef struct {
    * it); AURORA_XR_RAYCAST and AURORA_XR_SURFACE_SHADOW override it.
    */
   bool xrNoStageShadow;
+  /*
+   * OpenXR builds: fixed foveated rendering for the 3D eyes, 0 (off) to 3
+   * (most): the edges of each eye drawn at a lower density. Off leaves the
+   * eyes' pass as it was. AURORA_XR_FOVEATION overrides it.
+   */
+  int32_t xrFoveation;
 } AuroraConfig;
 
 typedef struct {

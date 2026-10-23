@@ -1004,6 +1004,43 @@ bool create_instance() {
   return true;
 }
 
+// Fixed foveated rendering (AuroraConfig::xrFoveation, AURORA_XR_FOVEATION
+// 0-3): the eyes' pass gets a fragment density map of ours
+// (VK_EXT_fragment_density_map, through the Dawn fork's
+// RenderPassMultiview::vkFragmentDensityMapView), full density around each
+// lens' centre and less towards the edges, where the tiles then hold fewer,
+// bigger fragments. A map is the whole image's size in 32-pixel density
+// texels, and with dynamic resolution the eye is drawn in the image's corner,
+// so there is one map per eye size: the XR thread makes them on its queue
+// (density_frame), the eye sizes dynamic resolution can pick ahead of the
+// fights and any other size the render worker asks for; until a size's map
+// is ready the nearest one stands in. Level 0 leaves the pass and its
+// pipelines as they were.
+struct DensityMaps {
+  int level = 0;              // for the session, decided with the device (hook_create_device)
+  std::atomic_bool on{false}; // the eyes' pass has a map (multiview, the extension on: begin_frame)
+  VkExtent2D texel{32, 32};   // the density texel size the maps are made for
+  struct Map {
+    uint32_t w = 0, h = 0;    // the eye size (render area) it's for
+    VkImage image = VK_NULL_HANDLE;
+    VkDeviceMemory memory = VK_NULL_HANDLE;
+    VkImageView view = VK_NULL_HANDLE;
+    bool ready = false;       // filled, and its upload's fence signalled
+  };
+  std::mutex mutex;           // maps, asked
+  std::deque<Map> maps;       // never freed before shutdown (a few kB each)
+  std::vector<std::pair<uint32_t, uint32_t>> asked; // sizes the render worker found missing
+  bool primed = false;        // dynamic resolution's sizes asked for (XR thread)
+  bool failed = false;        // a map couldn't be made: no more tries (XR thread)
+  // The upload in flight (XR thread): its staging buffer, and the maps it fills.
+  Bridge::Upload pending{};
+  std::vector<size_t> pendingMaps;
+} g_density;
+
+// The instance the runtime made for Dawn (hook_create_instance), for the
+// device hook's queries.
+VkInstance g_hookInstance = VK_NULL_HANDLE;
+
 // Dawn's Vulkan instance and device, created through the runtime
 // (XR_KHR_vulkan_enable2) so it can add what it needs and pick the GPU.
 // Called by Dawn on the main thread during adapter discovery and device
@@ -1020,6 +1057,8 @@ VkResult hook_create_instance(void*, PFN_vkGetInstanceProcAddr getProcAddr, cons
     Log.error("xrCreateVulkanInstanceKHR failed: XrResult {}", static_cast<int>(r));
     return VK_ERROR_INITIALIZATION_FAILED;
   }
+  if (vr == VK_SUCCESS)
+    g_hookInstance = *out;
   return vr;
 }
 
@@ -1033,13 +1072,81 @@ VkPhysicalDevice hook_physical_device(void*, VkInstance instance) {
   return phys;
 }
 
+// Foveation's needs: the extension, its feature, and RG8 density maps.
+// (Vulkan 1.1 queries through the instance: Android's libvulkan exports 1.0.)
+bool density_supported(PFN_vkGetInstanceProcAddr getProcAddr, VkPhysicalDevice phys) {
+  const auto features2 = reinterpret_cast<PFN_vkGetPhysicalDeviceFeatures2>(
+      getProcAddr(g_hookInstance, "vkGetPhysicalDeviceFeatures2"));
+  const auto properties2 = reinterpret_cast<PFN_vkGetPhysicalDeviceProperties2>(
+      getProcAddr(g_hookInstance, "vkGetPhysicalDeviceProperties2"));
+  if (!features2 || !properties2) {
+    Log.info("Foveation: no vkGetPhysicalDeviceFeatures2/Properties2");
+    return false;
+  }
+  uint32_t n = 0;
+  vkEnumerateDeviceExtensionProperties(phys, nullptr, &n, nullptr);
+  std::vector<VkExtensionProperties> exts(n);
+  vkEnumerateDeviceExtensionProperties(phys, nullptr, &n, exts.data());
+  if (std::none_of(exts.begin(), exts.end(), [](const VkExtensionProperties& e) {
+        return !std::strcmp(e.extensionName, VK_EXT_FRAGMENT_DENSITY_MAP_EXTENSION_NAME);
+      })) {
+    Log.info("Foveation: no {}", VK_EXT_FRAGMENT_DENSITY_MAP_EXTENSION_NAME);
+    return false;
+  }
+  VkPhysicalDeviceFragmentDensityMapFeaturesEXT ff{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_DENSITY_MAP_FEATURES_EXT};
+  VkPhysicalDeviceFeatures2 f2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
+  f2.pNext = &ff;
+  features2(phys, &f2);
+  VkPhysicalDeviceFragmentDensityMapPropertiesEXT fp{
+      VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_DENSITY_MAP_PROPERTIES_EXT};
+  VkPhysicalDeviceProperties2 p2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2};
+  p2.pNext = &fp;
+  properties2(phys, &p2);
+  VkFormatProperties format{};
+  vkGetPhysicalDeviceFormatProperties(phys, VK_FORMAT_R8G8_UNORM, &format);
+  const bool formatOk = (format.optimalTilingFeatures & VK_FORMAT_FEATURE_FRAGMENT_DENSITY_MAP_BIT_EXT) != 0;
+  // Dawn's attachments and the swapchain's images aren't subsampled.
+  Log.info("Foveation: fragment density map {}, with plain attachments {}, texels {}x{} to {}x{}, extra "
+           "invocations {}, RG8 maps {}",
+           ff.fragmentDensityMap ? "available" : "unavailable",
+           ff.fragmentDensityMapNonSubsampledImages ? "yes" : "no", fp.minFragmentDensityTexelSize.width,
+           fp.minFragmentDensityTexelSize.height, fp.maxFragmentDensityTexelSize.width,
+           fp.maxFragmentDensityTexelSize.height, fp.fragmentDensityInvocations != 0, formatOk ? "yes" : "no");
+  if (!ff.fragmentDensityMap || !ff.fragmentDensityMapNonSubsampledImages || !formatOk)
+    return false;
+  // 32-pixel density texels, or the nearest the GPU takes.
+  g_density.texel = {std::clamp(32u, fp.minFragmentDensityTexelSize.width, fp.maxFragmentDensityTexelSize.width),
+                     std::clamp(32u, fp.minFragmentDensityTexelSize.height, fp.maxFragmentDensityTexelSize.height)};
+  return true;
+}
+
 VkResult hook_create_device(void*, PFN_vkGetInstanceProcAddr getProcAddr, VkPhysicalDevice phys,
                             const VkDeviceCreateInfo* info, VkDevice* out) {
+  // Foveation: VK_EXT_fragment_density_map on Dawn's device as well.
+  auto& fd = g_density;
+  fd.level = std::clamp(
+      static_cast<int>(env_float("AURORA_XR_FOVEATION", static_cast<float>(g_config.xrFoveation))), 0, 3);
+  VkDeviceCreateInfo dci = *info;
+  std::vector<const char*> exts(info->ppEnabledExtensionNames,
+                                info->ppEnabledExtensionNames + info->enabledExtensionCount);
+  VkPhysicalDeviceFragmentDensityMapFeaturesEXT densityFeatures{
+      VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_DENSITY_MAP_FEATURES_EXT};
+  if (fd.level > 0 && density_supported(getProcAddr, phys)) {
+    exts.push_back(VK_EXT_FRAGMENT_DENSITY_MAP_EXTENSION_NAME);
+    dci.enabledExtensionCount = static_cast<uint32_t>(exts.size());
+    dci.ppEnabledExtensionNames = exts.data();
+    densityFeatures.fragmentDensityMap = VK_TRUE;
+    densityFeatures.fragmentDensityMapNonSubsampledImages = VK_TRUE;
+    densityFeatures.pNext = const_cast<void*>(dci.pNext);
+    dci.pNext = &densityFeatures;
+  } else {
+    fd.level = 0;
+  }
   XrVulkanDeviceCreateInfoKHR xdci{XR_TYPE_VULKAN_DEVICE_CREATE_INFO_KHR};
   xdci.systemId = B.systemId;
   xdci.pfnGetInstanceProcAddr = getProcAddr;
   xdci.vulkanPhysicalDevice = phys;
-  xdci.vulkanCreateInfo = info;
+  xdci.vulkanCreateInfo = &dci;
   VkResult vr = VK_SUCCESS;
   const XrResult r = B.createVulkanDevice(B.instance, &xdci, out, &vr);
   if (XR_FAILED(r)) {
@@ -1272,6 +1379,333 @@ bool size_stereo_stream() {
     g_streams[kMotionDepth].depth = true; // its format: create_session, from the runtime's
   }
   return true;
+}
+
+// The eye size (each eye's render area) at a share of the recommended size,
+// as render_eyes picks it for dynamic resolution.
+std::pair<uint32_t, uint32_t> dynres_eye_size(float scale) {
+  const auto even = [](float v) { return (static_cast<uint32_t>(v + 0.5f) + 1u) & ~1u; };
+  const auto& stereo = g_streams[kStereo];
+  return {std::min(stereo.width, even(static_cast<float>(g_dynres.recWidth) * scale)),
+          std::min(stereo.height, even(static_cast<float>(g_dynres.recHeight) * scale))};
+}
+
+// Foveation levels: full density inside r0, `mid` density out to r1, `out`
+// beyond (per axis: 1, 1/2 or 1/4). r is the distance from the lens' centre
+// in the eye's tangent space, 1 at the image's edge in each direction (the
+// corners are ~1.4).
+struct FoveationLevel {
+  float r0, r1;
+  float midX, midY, outX, outY;
+};
+constexpr std::array<FoveationLevel, 3> kFoveation{{
+    {0.70f, 1.00f, 0.5f, 1.f, 0.5f, 0.5f},
+    {0.55f, 0.85f, 0.5f, 0.5f, 0.25f, 0.5f},
+    {0.45f, 0.75f, 0.5f, 0.5f, 0.25f, 0.25f},
+}};
+
+// A density as the map's UNORM8: the fragment area is 1/density, rounded
+// down to a size the GPU has, so 1/2 is stored just under (127 is 2.008 px).
+uint8_t density_byte(float d) { return d >= 1.f ? 255 : d >= 0.5f ? 127 : 63; }
+
+// The map for an eye size (the render area, w x h): one RG8 texel per
+// density texel of the whole image, one layer per eye, for that eye's fov.
+std::vector<uint8_t> density_texels(uint32_t w, uint32_t h, uint32_t mapW, uint32_t mapH, uint32_t layers,
+                                    const std::array<XrView, 2>& views) {
+  const auto& lv = kFoveation[static_cast<size_t>(std::clamp(g_density.level, 1, 3) - 1)];
+  const auto& T = g_density.texel;
+  std::vector<uint8_t> out(static_cast<size_t>(mapW) * mapH * 2 * layers);
+  for (uint32_t layer = 0; layer < layers; ++layer) {
+    const XrFovf& fov = views[std::min(layer, 1u)].fov;
+    const float l = std::tan(fov.angleLeft), r = std::tan(fov.angleRight);
+    const float u = std::tan(fov.angleUp), d = std::tan(fov.angleDown);
+    for (uint32_t y = 0; y < mapH; ++y) {
+      for (uint32_t x = 0; x < mapW; ++x) {
+        // The texel's centre in the eye's tangent space (image top is up).
+        const float fx = std::min((static_cast<float>(x) + 0.5f) * T.width / static_cast<float>(w), 1.f);
+        const float fy = std::min((static_cast<float>(y) + 0.5f) * T.height / static_cast<float>(h), 1.f);
+        const float tx = l + fx * (r - l), ty = u - fy * (u - d);
+        const float nx = tx >= 0.f ? tx / r : tx / -l, ny = ty >= 0.f ? ty / u : ty / -d;
+        const float dist = std::sqrt(nx * nx + ny * ny);
+        const float dx = dist < lv.r0 ? 1.f : dist < lv.r1 ? lv.midX : lv.outX;
+        const float dy = dist < lv.r0 ? 1.f : dist < lv.r1 ? lv.midY : lv.outY;
+        uint8_t* p = &out[((static_cast<size_t>(layer) * mapH + y) * mapW + x) * 2];
+        p[0] = density_byte(dx);
+        p[1] = density_byte(dy);
+      }
+    }
+  }
+  return out;
+}
+
+// XR thread: makes the maps for `sizes` and starts their upload (on the XR
+// queue, never waited on: density_frame picks them up once it's done).
+bool density_build(const std::vector<std::pair<uint32_t, uint32_t>>& sizes, const std::array<XrView, 2>& views) {
+  auto& fd = g_density;
+  const auto& stereo = g_streams[kStereo];
+  const uint32_t layers = stereo.layers;
+  struct Part {
+    DensityMaps::Map map;
+    uint32_t mapW, mapH;
+    size_t offset;
+  };
+  std::vector<Part> parts;
+  std::vector<uint8_t> staging;
+  const auto destroyParts = [&] {
+    for (auto& p : parts) {
+      if (p.map.view)
+        vkDestroyImageView(B.dev, p.map.view, nullptr);
+      if (p.map.image)
+        vkDestroyImage(B.dev, p.map.image, nullptr);
+      if (p.map.memory)
+        vkFreeMemory(B.dev, p.map.memory, nullptr);
+    }
+  };
+  for (const auto& [w, h] : sizes) {
+    // Every map covers the whole image, not only the render area: the spec
+    // sizes a density texel from the render area (and a map that size), but
+    // the Quest 3's driver went by the image, so a corner-sized map was read
+    // at twice the texel size, stretched right and down (2026-10-23). With
+    // the whole image's size either reading gives 32-pixel texels while the
+    // render area is over half the image (dynamic resolution's least is 0.6).
+    Part p{};
+    p.map.w = w;
+    p.map.h = h;
+    p.mapW = (stereo.width + fd.texel.width - 1) / fd.texel.width;
+    p.mapH = (stereo.height + fd.texel.height - 1) / fd.texel.height;
+    VkImageCreateInfo ici{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+    ici.imageType = VK_IMAGE_TYPE_2D;
+    ici.format = VK_FORMAT_R8G8_UNORM;
+    ici.extent = {p.mapW, p.mapH, 1};
+    ici.mipLevels = 1;
+    ici.arrayLayers = layers;
+    ici.samples = VK_SAMPLE_COUNT_1_BIT;
+    ici.tiling = VK_IMAGE_TILING_OPTIMAL;
+    ici.usage = VK_IMAGE_USAGE_FRAGMENT_DENSITY_MAP_BIT_EXT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+    ici.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    ici.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    if (vkCreateImage(B.dev, &ici, nullptr, &p.map.image) != VK_SUCCESS) {
+      destroyParts();
+      return false;
+    }
+    parts.push_back(p);
+    auto& m = parts.back().map;
+    VkMemoryRequirements mr;
+    vkGetImageMemoryRequirements(B.dev, m.image, &mr);
+    VkMemoryAllocateInfo mai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+    mai.allocationSize = mr.size;
+    mai.memoryTypeIndex = find_memory_type(mr.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+    if (vkAllocateMemory(B.dev, &mai, nullptr, &m.memory) != VK_SUCCESS ||
+        vkBindImageMemory(B.dev, m.image, m.memory, 0) != VK_SUCCESS) {
+      destroyParts();
+      return false;
+    }
+    VkImageViewCreateInfo vci{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+    vci.image = m.image;
+    vci.viewType = layers > 1 ? VK_IMAGE_VIEW_TYPE_2D_ARRAY : VK_IMAGE_VIEW_TYPE_2D;
+    vci.format = VK_FORMAT_R8G8_UNORM;
+    vci.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, layers};
+    if (vkCreateImageView(B.dev, &vci, nullptr, &m.view) != VK_SUCCESS) {
+      destroyParts();
+      return false;
+    }
+    parts.back().offset = staging.size();
+    const auto texels = density_texels(w, h, p.mapW, p.mapH, layers, views);
+    staging.insert(staging.end(), texels.begin(), texels.end());
+  }
+  if (parts.empty())
+    return true;
+
+  auto& up = fd.pending;
+  const auto fail = [&] {
+    destroyParts();
+    if (up.fence)
+      vkDestroyFence(B.dev, up.fence, nullptr);
+    if (up.cmd)
+      vkFreeCommandBuffers(B.dev, B.pool, 1, &up.cmd);
+    if (up.buf)
+      vkDestroyBuffer(B.dev, up.buf, nullptr);
+    if (up.mem)
+      vkFreeMemory(B.dev, up.mem, nullptr);
+    up = {};
+    return false;
+  };
+  VkBufferCreateInfo bci{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+  bci.size = staging.size();
+  bci.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
+  if (vkCreateBuffer(B.dev, &bci, nullptr, &up.buf) != VK_SUCCESS)
+    return fail();
+  VkMemoryRequirements req;
+  vkGetBufferMemoryRequirements(B.dev, up.buf, &req);
+  VkMemoryAllocateInfo mai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+  mai.allocationSize = req.size;
+  mai.memoryTypeIndex =
+      find_memory_type(req.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+  if (mai.memoryTypeIndex == UINT32_MAX || vkAllocateMemory(B.dev, &mai, nullptr, &up.mem) != VK_SUCCESS ||
+      vkBindBufferMemory(B.dev, up.buf, up.mem, 0) != VK_SUCCESS)
+    return fail();
+  void* mapped = nullptr;
+  if (vkMapMemory(B.dev, up.mem, 0, staging.size(), 0, &mapped) != VK_SUCCESS)
+    return fail();
+  std::memcpy(mapped, staging.data(), staging.size());
+  vkUnmapMemory(B.dev, up.mem);
+
+  VkCommandBufferAllocateInfo cai{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+  cai.commandPool = B.pool;
+  cai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+  cai.commandBufferCount = 1;
+  if (vkAllocateCommandBuffers(B.dev, &cai, &up.cmd) != VK_SUCCESS)
+    return fail();
+  VkCommandBufferBeginInfo cbi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+  cbi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+  vkBeginCommandBuffer(up.cmd, &cbi);
+  for (const auto& p : parts) {
+    VkImageMemoryBarrier bar{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+    bar.srcQueueFamilyIndex = bar.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    bar.image = p.map.image;
+    bar.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, layers};
+    bar.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    bar.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    bar.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    vkCmdPipelineBarrier(up.cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0,
+                         nullptr, 1, &bar);
+    VkBufferImageCopy region{};
+    region.bufferOffset = p.offset;
+    region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, layers};
+    region.imageExtent = {p.mapW, p.mapH, 1};
+    vkCmdCopyBufferToImage(up.cmd, up.buf, p.map.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
+    // The layout the eyes' pass reads it in (Dawn's RenderPassMultiview).
+    bar.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    bar.newLayout = VK_IMAGE_LAYOUT_FRAGMENT_DENSITY_MAP_OPTIMAL_EXT;
+    bar.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    bar.dstAccessMask = VK_ACCESS_FRAGMENT_DENSITY_MAP_READ_BIT_EXT;
+    vkCmdPipelineBarrier(up.cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_DENSITY_PROCESS_BIT_EXT,
+                         0, 0, nullptr, 0, nullptr, 1, &bar);
+  }
+  if (vkEndCommandBuffer(up.cmd) != VK_SUCCESS)
+    return fail();
+  VkFenceCreateInfo fci{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+  if (vkCreateFence(B.dev, &fci, nullptr, &up.fence) != VK_SUCCESS)
+    return fail();
+  VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+  si.commandBufferCount = 1;
+  si.pCommandBuffers = &up.cmd;
+  if (vkQueueSubmit(B.queue, 1, &si, up.fence) != VK_SUCCESS)
+    return fail();
+  std::lock_guard lock{fd.mutex};
+  for (const auto& p : parts) {
+    fd.pendingMaps.push_back(fd.maps.size());
+    fd.maps.push_back(p.map);
+  }
+  return true;
+}
+
+// XR thread, every frame while foveation is on: finishes the upload in
+// flight, then makes the maps asked for (dynamic resolution's eye sizes
+// first) once the views' fovs are known.
+void density_frame() {
+  auto& fd = g_density;
+  if (!fd.on || fd.failed)
+    return;
+  auto& up = fd.pending;
+  if (up.fence) {
+    if (vkGetFenceStatus(B.dev, up.fence) != VK_SUCCESS)
+      return;
+    {
+      std::lock_guard lock{fd.mutex};
+      for (size_t i : fd.pendingMaps)
+        fd.maps[i].ready = true;
+      fd.pendingMaps.clear();
+    }
+    vkDestroyFence(B.dev, up.fence, nullptr);
+    vkFreeCommandBuffers(B.dev, B.pool, 1, &up.cmd);
+    vkDestroyBuffer(B.dev, up.buf, nullptr);
+    vkFreeMemory(B.dev, up.mem, nullptr);
+    up = {};
+  }
+  std::array<XrView, 2> views;
+  {
+    std::lock_guard lock{g_viewMutex};
+    if (!g_viewsValid)
+      return;
+    views = g_latestViews;
+  }
+  std::vector<std::pair<uint32_t, uint32_t>> sizes;
+  {
+    std::lock_guard lock{fd.mutex};
+    sizes.swap(fd.asked);
+  }
+  if (!fd.primed) {
+    fd.primed = true;
+    const auto& stereo = g_streams[kStereo];
+    if (g_dynres.on) {
+      const int levels = std::clamp(
+          static_cast<int>((g_dynres.maxScale - g_dynres.minScale) / kDynresStep + 0.5f) + 1, 1, kDynresLevels);
+      for (int i = 0; i < levels; ++i)
+        sizes.push_back(dynres_eye_size(
+            std::min(g_dynres.minScale + kDynresStep * static_cast<float>(i), g_dynres.maxScale)));
+    } else {
+      sizes.emplace_back(stereo.width, stereo.height);
+    }
+  }
+  {
+    std::lock_guard lock{fd.mutex};
+    std::erase_if(sizes, [&](const auto& s) {
+      return std::any_of(fd.maps.begin(), fd.maps.end(), [&](const auto& m) { return m.w == s.first && m.h == s.second; });
+    });
+  }
+  std::sort(sizes.begin(), sizes.end());
+  sizes.erase(std::unique(sizes.begin(), sizes.end()), sizes.end());
+  if (sizes.empty())
+    return;
+  if (!density_build(sizes, views)) {
+    Log.error("Foveation: couldn't make {} density maps", sizes.size());
+    fd.failed = true; // the nearest made stands in; with none, render_eyes skips the eyes
+    return;
+  }
+  static bool logged = false;
+  if (!logged) {
+    logged = true;
+    const XrFovf& f = views[0].fov;
+    Log.info("Foveation level {}: {} density maps of {}x{} texels (left eye fov {:.1f} {:.1f} {:.1f} {:.1f} deg)",
+             fd.level, sizes.size(), fd.texel.width, fd.texel.height, f.angleLeft * 57.2958f,
+             f.angleRight * 57.2958f, f.angleUp * 57.2958f, f.angleDown * 57.2958f);
+  }
+}
+
+// Render worker: whether any map is ready.
+bool density_ready() {
+  std::lock_guard lock{g_density.mutex};
+  return std::any_of(g_density.maps.begin(), g_density.maps.end(), [](const auto& m) { return m.ready; });
+}
+
+// Render worker: the map for an eye size, as a VkImageView for Dawn; one of
+// another size while it's being made (asked for here), 0 before any is ready.
+uint64_t density_view(uint32_t w, uint32_t h) {
+  auto& fd = g_density;
+  std::lock_guard lock{fd.mutex};
+  const DensityMaps::Map* best = nullptr;
+  int64_t bestCost = INT64_MAX;
+  bool known = false;
+  for (const auto& m : fd.maps) {
+    if (m.w == w && m.h == h) {
+      known = true;
+      if (m.ready)
+        return reinterpret_cast<uintptr_t>(m.view);
+    }
+    if (!m.ready)
+      continue;
+    // The nearest, one at least as big preferred (it covers the framebuffer).
+    const int64_t dw = static_cast<int64_t>(m.w) - w, dh = static_cast<int64_t>(m.h) - h;
+    const int64_t cost = std::abs(dw) + std::abs(dh) + (dw < 0 || dh < 0 ? 100000 : 0);
+    if (cost < bestCost) {
+      bestCost = cost;
+      best = &m;
+    }
+  }
+  if (!known && std::find(fd.asked.begin(), fd.asked.end(), std::pair{w, h}) == fd.asked.end())
+    fd.asked.emplace_back(w, h);
+  return best ? reinterpret_cast<uintptr_t>(best->view) : 0;
 }
 
 bool create_session() {
@@ -8319,6 +8753,7 @@ bool render_xr_frame() {
   room_survey_apply();
   spot_frame(fs.predictedDisplayTime);
   room_depth_frame(fs.predictedDisplayTime);
+  density_frame();
 
   // The passthrough, the shadow, the HUD and the 3D view, the HUD on top in
   // full VR, then the placing cards and the lasers.
@@ -9699,6 +10134,7 @@ bool ensure_direct(const gfx::RenderTargetLayout& layout) {
                                         .depthCompare = compare};
     wgpu::RenderPipelineMultiview multiview{};
     multiview.viewMask = (1u << stereo.layers) - 1u;
+    multiview.fragmentDensityMap = g_density.on.load(); // drawn in the eyes' pass
     const wgpu::RenderPipelineDescriptor rpd{
         .nextInChain = stereo.layers > 1 ? &multiview : nullptr,
         .label = "XR coverage",
@@ -10732,6 +11168,13 @@ bool render_eyes(const wgpu::CommandEncoder& cmd, gfx::detail::FramePacket& fram
       g_skipPresent = !env_flag("AURORA_XR_FIGHT_SCREEN", false);
       return false;
     }
+    // Foveation: the eyes' pipelines need a density map, and none is ready
+    // yet (they're made once the headset has views, long before a fight).
+    if (g_density.on && !density_ready()) {
+      R.missedStereo = true;
+      g_skipPresent = !env_flag("AURORA_XR_FIGHT_SCREEN", false);
+      return false;
+    }
     // After a tick that never went out: no draw pairs with its own previous
     // matrices (gap), for the early motion pass and the later one alike.
     struct ZeroPrev {
@@ -10776,6 +11219,8 @@ bool render_eyes(const wgpu::CommandEncoder& cmd, gfx::detail::FramePacket& fram
           t.renderAreaHeight = rh;
           R.renderedRect = {static_cast<int32_t>(rw), static_cast<int32_t>(rh)};
         }
+        if (g_density.on)
+          t.densityMap = density_view(static_cast<uint32_t>(vw), static_cast<uint32_t>(vh));
         t.views[0] = {R.mvGroups, 0.f, 0.f, vw, vh};
         t.viewCount = 1;
         t.viewMask = 0b11;
@@ -11176,6 +11621,10 @@ wgpu::Texture begin_frame(uint32_t width, uint32_t height) noexcept {
     auto mvLayout = gfx::scene_render_target_layout();
     mvLayout.viewCount = 2;
     mvLayout.sampleCount = g_xrSamples;
+    // Foveation: the eyes' pass has a density map, its pipelines are made for one.
+    mvLayout.xrDensityMap = g_density.level > 0 ? 1 : 0;
+    if (mvLayout.xrDensityMap != 0 && !g_density.on.exchange(true))
+      Log.info("Foveation: level {}", g_density.level);
     gfx::detail::finalize_render_target_layout(mvLayout);
     gfx::set_xr_multiview_layout(mvLayout);
     if (B.appSw) {

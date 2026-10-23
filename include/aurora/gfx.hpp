@@ -42,6 +42,9 @@ struct RenderTargetLayout {
   // XR batching: a batched twin (one draw for a run of draws; per-draw data
   // looked up per vertex, gx::xr_batch_*).
   uint32_t xrBatch = 0;
+  // XR foveation: the eyes' pass has a fragment density map, so its
+  // pipelines are made for one (Dawn fork, RenderPipelineMultiview).
+  uint32_t xrDensityMap = 0;
 };
 
 /// Generational handle: 0 is never valid, and IDs are not reused after unregister_draw_type.

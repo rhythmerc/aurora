@@ -512,6 +512,7 @@ wgpu::RenderPipeline build_pipeline(const PipelineConfig& config, const gfx::Ren
 #if defined(AURORA_ENABLE_OPENXR) && !defined(__EMSCRIPTEN__)
   wgpu::RenderPipelineMultiview multiview{};
   multiview.viewMask = (1u << layout.viewCount) - 1u;
+  multiview.fragmentDensityMap = layout.xrDensityMap != 0;
 #endif
   const wgpu::RenderPipelineDescriptor descriptor{
 #if defined(AURORA_ENABLE_OPENXR) && !defined(__EMSCRIPTEN__)

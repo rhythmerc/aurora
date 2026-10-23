@@ -1698,6 +1698,17 @@ static std::vector<RecordedPair> load_recorded_pairs(bool unbuiltOnly = false) {
           continue;
         RenderTargetLayout layout;
         std::memcpy(&layout, sqlite3_column_blob(stmt, 1), sizeof(layout));
+        // Layouts recorded before xrDensityMap have padding there: one whose
+        // key doesn't come out again is read as without a density map.
+        RenderTargetLayout check = layout;
+        detail::finalize_render_target_layout(check);
+        if (check.key != layout.key) {
+          layout.xrDensityMap = 0;
+          check = layout;
+          detail::finalize_render_target_layout(check);
+          if (check.key != layout.key)
+            continue;
+        }
         layouts.emplace(static_cast<uint64_t>(sqlite3_column_int64(stmt, 0)), layout);
       }
     }

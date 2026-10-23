@@ -155,6 +155,9 @@ inline void finalize_render_target_layout(RenderTargetLayout& layout) noexcept {
   if (layout.xrBatch != 0) {
     hasher.update(layout.xrBatch + 0x6c2du);
   }
+  if (layout.xrDensityMap != 0) {
+    hasher.update(layout.xrDensityMap + 0x1f0du);
+  }
   layout.key = hasher.digest();
 }
 

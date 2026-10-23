@@ -49,6 +49,9 @@ struct XrReplayTarget {
   // 2D-array attachments with one layer per view, using each world draw's
   // multiview twin pipeline (gx::DrawData::xrPipeline). Use one view then.
   uint32_t viewMask = 0;
+  // Multiview, foveation: the fragment density map (a VkImageView, filled
+  // and in its layout), for a layout with xrDensityMap. 0: none.
+  uint64_t densityMap = 0;
   // The passes to replay (null: all the frame's sealed passes).
   const std::vector<const detail::RenderPass*>* passes = nullptr;
   // Application SpaceWarp: replay the opaque world draws' motion twins

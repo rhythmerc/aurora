@@ -744,6 +744,7 @@ void encode_xr_replay(const wgpu::CommandEncoder& cmd, FramePacket& frame, XrCat
   };
   wgpu::RenderPassMultiview multiview{};
   multiview.viewMask = target.viewMask;
+  multiview.vkFragmentDensityMapView = target.densityMap;
   wgpu::RenderPassRenderAreaRect area{};
   area.size = {target.renderAreaWidth, target.renderAreaHeight};
   const bool partial = target.renderAreaWidth != 0 && target.renderAreaHeight != 0;
