@@ -874,6 +874,17 @@ auto lighting_func(const ShaderConfig& config, const ColorChannelConfig& cc, u8 
                      alpha ? "a"sv : ""sv);
 }
 
+// Whether a draw's TEV colour reads a colour channel (RASC or RASA).
+bool xrReadsRasAny(const ShaderConfig& config) {
+  for (u32 i = 0; i < config.tevStageCount; ++i) {
+    const auto& cp = config.tevStages[i].colorPass;
+    for (const auto arg : {cp.a, cp.b, cp.c, cp.d})
+      if (arg == GX_CC_RASC || arg == GX_CC_RASA)
+        return true;
+  }
+  return false;
+}
+
 // XR room lighting (ShaderConfig::xrRoom, multiview eyes only): colour
 // channel i's material colour in the vertex stage, as lighting_func reads it.
 std::string xr_room_mat_src(const ShaderConfig& config, const ColorChannelConfig& cc, u8 i) {
@@ -1640,6 +1651,30 @@ std::string build_shader_source(const ShaderConfig& config, uint32_t normalAttac
   if (xrRoom && config.xrRoomFacet && !xrRoomSmoothNrm) {
     fragmentFnPre += "\n    let xr_dl = 1.0;";
   }
+  // A stage draw whose TEV colour reads no lit colour channel (unlit ones,
+  // or none: textures and constants alone) takes the room's unlit light on
+  // its final colour (below, at fragReturn), not on the channel: an unlit
+  // channel's light is a factor on its colour, the same as a factor on the
+  // final colour where the TEV multiplies by it, but where it mixes textures
+  // in (Fountain of Dreams' water particles: lerp(C1, C0, TEXC), lerp(RASC,
+  // TEXC, KONST) and textures over them) most of the colour never passes the
+  // channel and kept its own light in a dark room. Per pixel only (VERTEX
+  // keeps the channel's).
+  bool xrStageFinal = false;
+  if (xrRoom && config.xrRoom == 2 && (config.xrRoomPixel || !xrReadsRasAny(config))) {
+    xrStageFinal = true;
+    for (u32 s = 0; s < config.tevStageCount; ++s) {
+      const auto& st = config.tevStages[s];
+      bool reads = false;
+      for (const auto arg : {st.colorPass.a, st.colorPass.b, st.colorPass.c, st.colorPass.d})
+        reads |= arg == GX_CC_RASC || arg == GX_CC_RASA;
+      const int ch = st.channelId == GX_COLOR0 || st.channelId == GX_COLOR0A0 ? 0
+                     : st.channelId == GX_COLOR1 || st.channelId == GX_COLOR1A1 ? 1
+                                                                                 : -1;
+      if (reads && ch >= 0 && config.colorChannels[ch].lightingEnabled)
+        xrStageFinal = false;
+    }
+  }
   for (int i = 0; i < info.sampledColorChannels.size(); ++i) {
     if (!info.sampledColorChannels.test(i)) {
       continue;
@@ -1680,7 +1715,9 @@ std::string build_shader_source(const ShaderConfig& config, uint32_t normalAttac
       fragmentFnPre += fmt::format("\n    var rast{0} = in.cc{0};", i);
       // XR room lighting: the room's version mixed in, per vertex or (the
       // material colour carried along) per pixel.
-      if (xrRoom && !config.xrRoomPixel) {
+      if (xrRoom && xrStageFinal && !cc.lightingEnabled) {
+        // the room's light on the final colour instead
+      } else if (xrRoom && !config.xrRoomPixel) {
         vtxXfrAttrs += xr_room_mix(config, cc, i, fmt::format("out.cc{}", i), xrRoomNrm,
                                    xr_room_mat_src(config, cc, i));
       } else if (xrRoom) {
@@ -2240,18 +2277,11 @@ std::string build_shader_source(const ShaderConfig& config, uint32_t normalAttac
                                      "prev.a);",
                                      config.xrRoom == 1 ? 0 : 1, config.xrRoom == 1 ? "xr.room_w.x" : "xr.room_w.y"));
   }
-  // A stage draw whose TEV colour never reads a colour channel (textures or
-  // constant colours alone: FD's floor, much of Battlefield and Brinstar)
-  // has nowhere for xr_room_mix's light to go: the room's unlit light, as
-  // xr_room_mix gives an unlit channel, multiplies its final colour instead
-  // (before the debug views).
-  bool xrReadsRas = false;
-  for (u32 i = 0; i < config.tevStageCount; ++i) {
-    const auto& cp = config.tevStages[i].colorPass;
-    for (const auto arg : {cp.a, cp.b, cp.c, cp.d})
-      xrReadsRas |= arg == GX_CC_RASC || arg == GX_CC_RASA;
-  }
-  if (xrRoom && config.xrRoom == 2 && !xrReadsRas) {
+  // The room's unlit light on a stage draw's final colour (xrStageFinal:
+  // its TEV reads no lit channel; textures or constant colours alone, FD's
+  // floor, much of Battlefield and Brinstar, have nowhere else for it to
+  // go), as xr_room_mix gives an unlit channel (before the debug views).
+  if (xrStageFinal) {
     const std::string room = config.xrRoomFacet && xrRoomNrmPx == "xr_n"sv
                                  ? "xr_room_diffuse(xr_n) * (xr.room_w.w * xr_dl)"s
                                  : "xr.room_up.rgb"s;
