@@ -1393,13 +1393,15 @@ std::pair<uint32_t, uint32_t> dynres_eye_size(float scale) {
 // Foveation levels: full density inside r0, `mid` density out to r1, `out`
 // beyond (per axis: 1, 1/2 or 1/4). r is the distance from the lens' centre
 // in the eye's tangent space, 1 at the image's edge in each direction (the
-// corners are ~1.4).
+// corners are ~1.4). Low was half density across only (2x1) out to 1.0: it
+// measured no cheaper than off (2026-10-23), so the Quest 3 likely clamps
+// 2x1 to 1x1; now it's Medium's 2x2 from further out, and no 4x2.
 struct FoveationLevel {
   float r0, r1;
   float midX, midY, outX, outY;
 };
 constexpr std::array<FoveationLevel, 3> kFoveation{{
-    {0.70f, 1.00f, 0.5f, 1.f, 0.5f, 0.5f},
+    {0.65f, 1.00f, 0.5f, 0.5f, 0.5f, 0.5f},
     {0.55f, 0.85f, 0.5f, 0.5f, 0.25f, 0.5f},
     {0.45f, 0.75f, 0.5f, 0.5f, 0.25f, 0.25f},
 }};
