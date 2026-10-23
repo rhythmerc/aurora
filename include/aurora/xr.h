@@ -250,6 +250,13 @@ void aurora_xr_camera(int category, const float view[3][4]);
  * FIFO ordering as aurora_xr_camera. */
 void aurora_xr_world_transform(const float m[3][4]);
 
+/* The room light's probe for the following draws: one point (game world
+ * units) they all take the room's SH at, as a moving light probe (a
+ * fighter's middle), instead of each vertex's own place. Key lights still
+ * fall off per pixel. NULL = none. Same thread and FIFO ordering as
+ * aurora_xr_camera. */
+void aurora_xr_light_probe(const float pos[3]);
+
 /* The following AURORA_XR_WORLD draws have no motion of their own for
  * Application SpaceWarp while on: their depth goes in as fixed in the game
  * world, moved by the head only, instead of each finding where it was last

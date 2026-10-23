@@ -2723,8 +2723,8 @@ fn fs_main(in: VertexOutput) -> {10} {{{6}{5}{11}
       shaderSource.insert(at + anchor.size(),
                           multiview ? fmt::format("\nstruct XrEye {{ m: array<mat4x4f, {0}>, enabled: vec4u, clip: array<vec4f, 8>, fade: array<vec4f, 2>, prev: array<mat4x4f, {0}>, prev_m: array<mat4x4f, {0}>,"
                                                   " room_m: mat4x4f, room_w: vec4f, room_up: vec4f, room_l: vec4f, room_h: vec4f,"
-                                                  " room_sh: array<vec4f, 27>, room_dir: array<vec4f, 2>, room_col: array<vec4f, 2>,"
-                                                  " room_eye: array<vec4f, 2>, room_lp: array<vec4f, 2>, room_probe: array<vec4f, 3> }};"
+                                                  " room_sh: array<vec4f, {1}>, room_dir: array<vec4f, 2>, room_col: array<vec4f, 2>,"
+                                                  " room_eye: array<vec4f, 2>, room_lp: array<vec4f, 2>, room_probe: array<vec4f, 4> }};"
                                                   "\n@group(3) @binding(0)\nvar<uniform> xr: XrEye;"
                                                   "\nvar<private> xr_view: u32;"
                                                   "\nvar<private> xr_cam: vec3f;"
@@ -2738,7 +2738,7 @@ fn fs_main(in: VertexOutput) -> {10} {{{6}{5}{11}
                                                   "\n    xr_cam = p;"
                                                   "\n    return vec4f(p, 1.0) * xr.m[xr_view];"
                                                   "\n}}",
-                                                  viewCount)
+                                                  viewCount, gfx::XrRoomProbes * 9)
                                     : std::string("\nstruct XrEye { m: mat4x4f, enabled: vec4u };"
                                                   "\n@group(3) @binding(0)\nvar<uniform> xr: XrEye;"
                                                   "\nfn gx_proj(p: vec3f) -> vec4f {"
@@ -2750,9 +2750,11 @@ fn fs_main(in: VertexOutput) -> {10} {{{6}{5}{11}
     // normal into the room, and the room's diffuse light on it (SH L2
     // irradiance, its coefficients premultiplied by the basis and cosine
     // lobe constants, plus two lights), clamped as GX clamps. The SH is
-    // made at three points across the stage (room_probe: the middle, its
-    // left, its right) and blended by where the pixel is along them
-    // (xr_rp); a light with a place (room_lp.w, the squared distance its
+    // made at a grid of points over the stage (room_probe: its first point,
+    // then its three axes, each the grid's whole span, w its size along
+    // each) and blended trilinearly by where the vertex or pixel is among
+    // them (xr_rp); a fighter's draws get one point, the blend at its
+    // middle (lib/xr's probe_blend). A light with a place (room_lp.w, the squared distance its
     // colour applies at) is a point light: its direction and its inverse
     // square falloff (up to 4x) per pixel, so the near side of the stage is
     // lit more than the far.
@@ -2764,28 +2766,32 @@ fn xr_room_n(n_cam: vec3f) -> vec3f {
     return select(vec3f(0.0, 1.0, 0.0), normalize(r), dot(r, r) > 1e-12);
 }
 
-fn xr_room_sh_w() -> vec3f {
-    let axis = xr.room_probe[2].xyz - xr.room_probe[1].xyz;
-    let len2 = dot(axis, axis);
-    if (len2 < 1e-6) { return vec3f(1.0, 0.0, 0.0); }
-    let t = clamp(dot(xr_rp - xr.room_probe[1].xyz, axis) / len2, 0.0, 1.0);
-    let wl = max(1.0 - 2.0 * t, 0.0);
-    let wr = max(2.0 * t - 1.0, 0.0);
-    return vec3f(1.0 - wl - wr, wl, wr);
-}
-
 // The blended SH at a room-space normal, as its even part (constant and
 // quadratic) and odd part (linear): SH(n) = e + o, SH(-n) = e - o.
 struct XrShEo { e: vec3f, o: vec3f };
 fn xr_room_sh_eo(n: vec3f) -> XrShEo {
-    let w = xr_room_sh_w();
+    let dims = vec3u(u32(xr.room_probe[0].w), u32(xr.room_probe[1].w), u32(xr.room_probe[2].w));
+    var c0 = vec3u(0u);
+    var f = vec3f(0.0);
+    for (var a = 0u; a < 3u; a++) {
+        let axis = xr.room_probe[a + 1u].xyz;
+        let len2 = dot(axis, axis);
+        if (dims[a] > 1u && len2 > 1e-12) {
+            let u = clamp(dot(xr_rp - xr.room_probe[0].xyz, axis) / len2, 0.0, 1.0) * f32(dims[a] - 1u);
+            c0[a] = min(u32(u), dims[a] - 1u);
+            f[a] = u - f32(c0[a]);
+        }
+    }
     var r: XrShEo;
     r.e = vec3f(0.0);
     r.o = vec3f(0.0);
-    for (var p = 0u; p < 3u; p++) {
-        let k = w[p];
+    for (var corner = 0u; corner < 8u; corner++) {
+        let up = vec3u(corner & 1u, (corner >> 1u) & 1u, (corner >> 2u) & 1u);
+        let w3 = select(vec3f(1.0) - f, f, up == vec3u(1u));
+        let k = w3.x * w3.y * w3.z;
         if (k <= 0.0) { continue; }
-        let b = p * 9u;
+        let ci = c0 + up;
+        let b = ((ci.z * dims.y + ci.y) * dims.x + ci.x) * 9u;
         r.o += k * (xr.room_sh[b + 1u].rgb * n.y + xr.room_sh[b + 2u].rgb * n.z + xr.room_sh[b + 3u].rgb * n.x);
         r.e += k * (xr.room_sh[b].rgb + xr.room_sh[b + 4u].rgb * (n.x * n.y) + xr.room_sh[b + 5u].rgb * (n.y * n.z)
             + xr.room_sh[b + 6u].rgb * (3.0 * n.z * n.z - 1.0) + xr.room_sh[b + 7u].rgb * (n.x * n.z)

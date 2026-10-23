@@ -251,7 +251,7 @@ struct FramePacket {
   // Command::xrTransform - 1 indexes this.
   // Then XrMaxClipPlanes clip planes (all must pass; 0,0,0,1 always passes),
   // their fade bands (game units; 0 = a hard cut) and the draw's opacity.
-  std::vector<std::array<float, 12 + XrClipFloats>> xrTransforms; // move 3x4, clip planes 8x4, fades 8, opacity
+  std::vector<std::array<float, XrTransformFloats>> xrTransforms; // move 3x4, clip planes 8x4, fades 8, opacity, probe
   // XR early eyes (set_xr_early_eyes): whether this frame may split
   // (earlyEyes); the world was split off and its eyes queued (xrEarlySplit),
   // the uploads after that going to a second staging buffer (stagingBuffer2,
@@ -272,7 +272,7 @@ struct FramePacket {
 // its world transforms then (both still growing on the FIFO thread).
 struct XrEarlyEyes {
   std::vector<const RenderPass*> passes;
-  std::vector<std::array<float, 12 + XrClipFloats>> transforms;
+  std::vector<std::array<float, XrTransformFloats>> transforms;
 };
 
 } // namespace aurora::gfx::detail

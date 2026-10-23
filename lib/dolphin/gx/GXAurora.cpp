@@ -50,6 +50,16 @@ void aurora_xr_camera(int category, const float view[3][4]) {
 
 void aurora_xr_world_transform(const float m[3][4]) { aurora_xr_camera(3, m); }
 
+// Category 10: the point in the first row, or none.
+void aurora_xr_light_probe(const float pos[3]) {
+  if (pos == nullptr) {
+    aurora_xr_camera(10, nullptr);
+    return;
+  }
+  const float m[3][4] = {{pos[0], pos[1], pos[2], 0.f}};
+  aurora_xr_camera(10, m);
+}
+
 // Category 9: on (a view) or off (none).
 void aurora_xr_world_still(bool on) {
   static const float kOn[3][4] = {};

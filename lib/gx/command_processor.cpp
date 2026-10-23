@@ -2532,6 +2532,8 @@ void handle_aurora(ByteReader& reader) noexcept {
       gfx::xr_set_world_clip_more(category == 5 ? 1 : category - 5, view.data());
     } else if (category == 9) { // aurora_xr_world_still
       sXrStill = hasView;
+    } else if (category == 10) { // aurora_xr_light_probe: the point in the view's first row
+      gfx::xr_set_light_probe(hasView ? view.data() : nullptr);
     } else {
       const auto cat = category <= 2 ? static_cast<gfx::XrCategory>(category)
                        : category == 6 ? gfx::XrCategory::Hidden // AURORA_XR_HIDDEN

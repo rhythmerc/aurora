@@ -42,6 +42,8 @@ namespace {
 std::optional<std::array<float, 12>> g_xrMove;
 // The planes (4 floats each), then their fade bands, then the opacity.
 std::optional<std::array<float, XrClipFloats>> g_xrClip;
+// The light probe for the following draws (game world).
+std::optional<std::array<float, 3>> g_xrProbe;
 constexpr int kClipFades = XrMaxClipPlanes * 4;
 constexpr int kClipOpacity = XrMaxClipPlanes * 5;
 // A clip whose planes all pass, solid.
@@ -628,6 +630,7 @@ void begin_recording(FramePacket& packet, size_t frameSlot) {
   g_recorder.xrTransform = 0;
   g_xrMove.reset();
   g_xrClip.reset();
+  g_xrProbe.reset();
   packet.xrHasWorld = false;
   packet.xrHasHud = false;
   packet.xrTransforms.clear();
@@ -1492,12 +1495,16 @@ namespace {
 
 void update_xr_transform() {
   uint8_t index = 0;
-  if (g_xrMove || g_xrClip) {
-    std::array<float, 12 + XrClipFloats> entry{1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0};
+  if (g_xrMove || g_xrClip || g_xrProbe) {
+    std::array<float, XrTransformFloats> entry{1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0};
     if (g_xrMove)
       std::copy_n(g_xrMove->begin(), 12, entry.begin());
     const auto clip = g_xrClip ? *g_xrClip : passing_clip();
     std::copy_n(clip.begin(), XrClipFloats, entry.begin() + 12);
+    if (g_xrProbe) {
+      std::copy_n(g_xrProbe->begin(), 3, entry.begin() + 12 + XrClipFloats);
+      entry[12 + XrClipFloats + 3] = 1.f;
+    }
     auto& list = g_recorder.frame().xrTransforms;
     const auto it = std::find(list.begin(), list.end(), entry);
     if (it != list.end()) {
@@ -1531,6 +1538,19 @@ void xr_set_world_transform(const float* m3x4) {
     std::copy_n(m3x4, 12, g_xrMove->begin());
   } else {
     g_xrMove.reset();
+  }
+  update_xr_transform();
+}
+
+void xr_set_light_probe(const float* pos) {
+  if (!g_recorder.active()) {
+    return;
+  }
+  if (pos != nullptr) {
+    g_xrProbe.emplace();
+    std::copy_n(pos, 3, g_xrProbe->begin());
+  } else {
+    g_xrProbe.reset();
   }
   update_xr_transform();
 }

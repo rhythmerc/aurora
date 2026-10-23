@@ -127,6 +127,9 @@ void xr_set_category(XrCategory category, const float* view3x4);
 // Placement for the following world draws in the 3D view (row-major 3x4,
 // game world units, applied before the arena transform); null = none.
 void xr_set_world_transform(const float* m3x4);
+// The point (game world) the following draws take the room light's SH at,
+// instead of each vertex's place; null = none.
+void xr_set_light_probe(const float* pos);
 // Clip plane (game world, 4 floats) then its fade band (game units, 0 = hard)
 // for the following world draws; null = none.
 void xr_set_world_clip(const float* plane);

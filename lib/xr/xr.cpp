@@ -6584,14 +6584,21 @@ void build_placing_layers(PlacingLayers& out, int mode) {
 // relative to the room's light from above: their baked light stays, and the
 // room adds its shading and colour.
 //
-// AURORA_XR_ROOM_LIGHT "source,fighters,stage,unlit,strength,yaw,shading,view,delight"
+// AURORA_XR_ROOM_LIGHT "source,fighters,stage,unlit,strength,yaw,shading,view,delight,gloss,keys,probes"
 // (any leading part; source 0 off, 1 lamp, 2 day, 3 office, 4 the room as a
 // capture saw it (room capture, below); shading 0 per
 // vertex, 1 per pixel, 2 facet, 3 smooth; view 0 off, 1 lit/unlit, 2 fighters/stage,
 // 3 normals; delight 0 to 1, how much of a fit of the stage's baked light
-// SMOOTH divides out of its vertex colours) sets it at launch;
+// SMOOTH divides out of its vertex colours; gloss 0 to 1; keys 0 to 2;
+// probes 0 a grid over the stage, 1 a line across it) sets it at launch;
 // the dev tools panel's LIGHT page sets it live and logs each change as
 // that value.
+
+#ifndef __ANDROID__
+// AURORA_XR_ROOM_REPLAY's capture poll (init_room_light).
+std::thread g_replayPoll;
+std::atomic<bool> g_replayPollStop{false};
+#endif
 
 struct RoomPreset {
   const char* name;
@@ -6618,6 +6625,7 @@ struct RoomLight {
   float delight = 1.f;
   float gloss = 1.f; // the room's specular highlight: fighters by kFighterGloss, the stage by stage_gloss
   float keys = 1.f;  // the key and fill lights' strength, on top of STRENGTH (0-2)
+  int probes = 0;    // where the light is made (ProbeGrid): 0 a grid over the stage, 1 a line across it
 };
 
 // The fighters' share of GLOSS (tuned on the headset: at 1 they looked too
@@ -6669,13 +6677,35 @@ constexpr int64_t kCaptureNs = 20'000'000'000;
 constexpr float kCapFighters = 0.7f;
 constexpr int kRoomSourceCaptured = static_cast<int>(kRoomPresets.size()) + 1;
 
-// The points the light is made for: across the stage's width (its
-// footprint's 20%, 50% and 80%, the middle first: it sets the level's
-// exposure), each lifted to about a fighter's middle (the stage's origin
-// is on the table, whose own surface Roomtone leaves out within 15 cm).
-// The shader blends their SH by where a pixel is along them.
-constexpr int kCapPoints = 3;
-constexpr float kCapLift = 0.04f;
+// The points the light is made for (room_frame's ProbeGrid), each lifted
+// to about a fighter's middle (kCapLift, game units, so it scales with the
+// stage: 4 cm at the default 0.0035; the stage's origin is on the table,
+// whose own surface Roomtone leaves out within 15 cm). GRID (PROBES, the
+// default): a grid over the stage's footprint and up to its highest floor,
+// a point about every kCapSpacing (3-6 across, 1-3 up, 1-2 deep). LINE:
+// three across its width (its footprint's 20%, 50% and 80%). The shader
+// blends their SH by where a vertex or pixel is among them; a fighter takes
+// the blend at its middle (aurora_xr_light_probe). The reference point
+// (the middle, low: the level's exposure and the key lights) is made first.
+constexpr int kCapPoints = gfx::XrRoomProbes;
+constexpr float kCapLift = 11.4f;
+constexpr float kCapSpacing = 0.6f; // metres
+constexpr std::array<int, 3> kCapGridMin{3, 1, 1}, kCapGridMax{6, 3, 2};
+
+// The probe points: n[0] x n[1] x n[2] of them, x fastest, from `origin`
+// along each axis (the whole span; zero where n is 1), in the room.
+struct ProbeGrid {
+  std::array<int, 3> n{1, 1, 1};
+  XrVector3f origin{};
+  std::array<XrVector3f, 3> axis{};
+  int ref = 0; // the reference point's index
+  int count() const { return n[0] * n[1] * n[2]; }
+  XrVector3f at(int i) const {
+    const int ix = i % n[0], iy = i / n[0] % n[1], iz = i / (n[0] * n[1]);
+    const auto f = [](int k, int m) { return m > 1 ? static_cast<float>(k) / static_cast<float>(m - 1) : 0.f; };
+    return origin + axis[0] * f(ix, n[0]) + axis[1] * f(iy, n[1]) + axis[2] * f(iz, n[2]);
+  }
+};
 
 // The captured light for room_frame (tracking space): the SH at each point,
 // the two lights at the middle one, with their places and the distance at
@@ -6683,7 +6713,7 @@ constexpr float kCapLift = 0.04f;
 // mean light and the level.
 struct CapLight {
   std::array<std::array<std::array<float, 3>, 9>, kCapPoints> sh{};
-  std::array<XrVector3f, kCapPoints> at{};
+  ProbeGrid grid;
   std::array<std::array<float, 3>, 2> dir{}, col{};
   std::array<bool, 2> placed{};
   std::array<XrVector3f, 2> pos{};
@@ -6806,46 +6836,60 @@ void capture_note_cast() {
   ++g_capture.casts;
 }
 
-// The surface worker's: blocks while a make runs (milliseconds), not the XR thread.
+// The surface worker's: dropped while a make runs (a grid's takes long
+// enough to stall the placing surface; there are hits to spare).
 void capture_note_hit(const XrVector3f& origin, const XrVector3f& point) {
-  std::lock_guard lock{g_capture.estMutex};
+  std::unique_lock lock{g_capture.estMutex, std::try_to_lock};
+  if (!lock.owns_lock())
+    return;
   g_capture.est.addHit(rt(origin), rt(point));
   g_capture.rec.hit(rt(origin), rt(point));
 }
 
 // The captured light at the points (room_frame, the XR thread): false while
 // none is made; while the capture thread makes it, the last answer.
-bool capture_light(const std::array<XrVector3f, kCapPoints>& points, CapLight& out) {
+// Roomtone takes the grid's reference point first, then the rest in order.
+bool capture_light(const ProbeGrid& grid, CapLight& out) {
   auto& c = g_capture;
   if (std::unique_lock lock{c.estMutex, std::try_to_lock}; lock.owns_lock()) {
+    const int n = grid.count();
+    std::array<int, kCapPoints> order; // Roomtone's point i is the grid's order[i]
+    order[0] = grid.ref;
+    for (int i = 0, k = 1; i < n; ++i)
+      if (i != grid.ref)
+        order[k++] = i;
     std::array<roomtone::Vec3, kCapPoints> pts;
-    for (int i = 0; i < kCapPoints; ++i)
-      pts[i] = rt(points[i]);
+    for (int i = 0; i < n; ++i)
+      pts[i] = rt(grid.at(order[i]));
     if (c.rec.isOpen())
-      c.rec.points(pts.data(), kCapPoints, steady_ns());
-    c.est.setPoints(pts.data(), kCapPoints);
+      c.rec.points(pts.data(), static_cast<size_t>(n), steady_ns());
+    c.est.setPoints(pts.data(), static_cast<size_t>(n));
     std::array<roomtone::Lighting, kCapPoints> l;
-    for (int i = 0; i < kCapPoints; ++i)
+    for (int i = 0; i < n; ++i)
       if (!c.est.lightAt(static_cast<size_t>(i), l[i])) {
+        // Made for another grid (PROBES changed, or the stage's size): the
+        // last answer until the next make.
+        if (c.haveLast && c.last.grid.count() != n)
+          break;
         c.haveLast = false;
         return false;
+      } else if (i + 1 == n) {
+        CapLight& r = c.last;
+        r.grid = grid;
+        for (int k = 0; k < n; ++k)
+          r.sh[order[k]] = l[k].sh;
+        for (int k = 0; k < 2; ++k) {
+          const roomtone::Light& li = l[0].lights[k];
+          r.dir[k] = {li.dir.x, li.dir.y, li.dir.z};
+          r.col[k] = li.color;
+          r.placed[k] = li.placed && li.range > 0.f;
+          r.pos[k] = {li.pos.x, li.pos.y, li.pos.z};
+          r.range[k] = li.range;
+        }
+        r.mean = l[0].mean;
+        r.level = l[0].level;
+        c.haveLast = true;
       }
-    CapLight& r = c.last;
-    for (int i = 0; i < kCapPoints; ++i) {
-      r.sh[i] = l[i].sh;
-      r.at[i] = points[i];
-    }
-    for (int k = 0; k < 2; ++k) {
-      const roomtone::Light& li = l[0].lights[k];
-      r.dir[k] = {li.dir.x, li.dir.y, li.dir.z};
-      r.col[k] = li.color;
-      r.placed[k] = li.placed && li.range > 0.f;
-      r.pos[k] = {li.pos.x, li.pos.y, li.pos.z};
-      r.range[k] = li.range;
-    }
-    r.mean = l[0].mean;
-    r.level = l[0].level;
-    c.haveLast = true;
   }
   if (!c.haveLast)
     return false;
@@ -7166,8 +7210,8 @@ std::array<std::array<float, 3>, 9> room_sh(const RoomPreset& p) {
 }
 
 std::string room_light_value(const RoomLight& r) {
-  return fmt::format("{},{:.2f},{:.2f},{:.2f},{:.2f},{:.0f},{},{},{:.2f},{:.2f},{:.2f}", r.source, r.fighters,
-                     r.stage, r.unlit, r.strength, r.yaw, r.shading, r.view, r.delight, r.gloss, r.keys);
+  return fmt::format("{},{:.2f},{:.2f},{:.2f},{:.2f},{:.0f},{},{},{:.2f},{:.2f},{:.2f},{}", r.source, r.fighters,
+                     r.stage, r.unlit, r.strength, r.yaw, r.shading, r.view, r.delight, r.gloss, r.keys, r.probes);
 }
 
 // The eye pipelines' variant bits (gfx::set_xr_room_light).
@@ -7184,9 +7228,9 @@ void init_room_light() {
     g_room.sh[i] = room_sh(kRoomPresets[i]);
   RoomLight r;
   if (const char* v = std::getenv("AURORA_XR_ROOM_LIGHT")) {
-    float f[11] = {0.f, r.fighters, r.stage, r.unlit, r.strength, r.yaw, 0.f, 0.f, r.delight, r.gloss, r.keys};
-    std::sscanf(v, "%f,%f,%f,%f,%f,%f,%f,%f,%f,%f,%f", &f[0], &f[1], &f[2], &f[3], &f[4], &f[5], &f[6], &f[7],
-                &f[8], &f[9], &f[10]);
+    float f[12] = {0.f, r.fighters, r.stage, r.unlit, r.strength, r.yaw, 0.f, 0.f, r.delight, r.gloss, r.keys, 0.f};
+    std::sscanf(v, "%f,%f,%f,%f,%f,%f,%f,%f,%f,%f,%f,%f", &f[0], &f[1], &f[2], &f[3], &f[4], &f[5], &f[6], &f[7],
+                &f[8], &f[9], &f[10], &f[11]);
     r.source = std::clamp(static_cast<int>(f[0]), 0, kRoomSourceCaptured);
     r.fighters = std::clamp(f[1], 0.f, 1.f);
     r.stage = std::clamp(f[2], 0.f, 1.f);
@@ -7198,6 +7242,7 @@ void init_room_light() {
     r.delight = std::clamp(f[8], 0.f, 1.f);
     r.gloss = std::clamp(f[9], 0.f, 1.f);
     r.keys = std::clamp(f[10], 0.f, 2.f);
+    r.probes = std::clamp(static_cast<int>(f[11]), 0, 1);
     Log.info("Room light: AURORA_XR_ROOM_LIGHT={}", room_light_value(r));
   }
   if (r.source == kRoomSourceCaptured)
@@ -7216,6 +7261,17 @@ void init_room_light() {
     std::lock_guard lock{c.mutex};
     c.requested = false;
     c.any = c.est.made();
+#ifndef __ANDROID__
+    // The capture poll Android's RoomCapture runs, so the light is made
+    // again as the stage moves (or its probe grid changes), as on a headset.
+    // Until the XR thread exits.
+    g_replayPoll = std::thread([] {
+      while (!g_replayPollStop.load()) {
+        aurora_xr_room_capture_wanted();
+        std::this_thread::sleep_for(std::chrono::milliseconds(250));
+      }
+    });
+#endif
   }
   g_room.value = g_room.defaults = r;
   room_light_apply(r);
@@ -7225,20 +7281,98 @@ void init_room_light() {
 struct RoomFrame {
   bool on = false;
   float w[4]{}, up[4]{};
-  // The SH at each point across the stage (kCapPoints: the middle, then
-  // its left and right), where the points are (the room), for the shader
-  // to blend between by a pixel's place.
+  // The SH at each point of the grid (the room), for the shader to blend
+  // between by a vertex's or pixel's place.
   float sh[kCapPoints][9][4]{};
-  std::array<XrVector3f, kCapPoints> at{};
-  std::array<float, 3> dir[2]{}; // in the room, from the middle point
+  ProbeGrid grid;
+  std::array<float, 3> dir[2]{}; // in the room, from the reference point
   float col[2][4]{};
-  // A light with a place (the room) and the distance from the middle point
-  // its colour applies at: the shader's point light (range 0: directional).
+  // A light with a place (the room) and the distance from the reference
+  // point its colour applies at: the shader's point light (range 0: directional).
   std::array<XrVector3f, 2> pos{};
   float range[2]{};
   float delight = 0.f;
   float gloss[2]{}; // fighters', the stage's
 };
+
+// The points the light is made at for the stage's placement (`arena`):
+// game units into the room (kCapPoints' comment).
+ProbeGrid probe_grid(const std::array<float, 16>& arena, bool line) {
+  std::array<float, 3> ctr;
+  Footprint fp;
+  float top;
+  {
+    std::lock_guard lock{g_arenaMutex};
+    ctr = g_arenaCenter;
+    fp = g_footprint;
+    top = g_stageTop;
+  }
+  const auto room = [&](float x, float y, float z) {
+    return XrVector3f{arena[0] * x + arena[1] * y + arena[2] * z + arena[3],
+                      arena[4] * x + arena[5] * y + arena[6] * z + arena[7],
+                      arena[8] * x + arena[9] * y + arena[10] * z + arena[11]};
+  };
+  const auto along = [&](float x, float y, float z) { return room(x, y, z) - room(0.f, 0.f, 0.f); };
+  // 75 units either side without a footprint.
+  const float x0 = fp.valid ? fp.xmin : ctr[0] - 75.f, x1 = fp.valid ? fp.xmax : ctr[0] + 75.f;
+  const float y0 = ctr[1] + kCapLift;
+  ProbeGrid g;
+  if (line) {
+    g.n = {3, 1, 1};
+    g.origin = room(x0 + 0.2f * (x1 - x0), y0, ctr[2]);
+    g.axis[0] = along(0.6f * (x1 - x0), 0.f, 0.f);
+    g.ref = 1;
+    return g;
+  }
+  const float y1 = std::isnan(top) ? y0 : std::max(top + kCapLift, y0);
+  const float z0 = fp.valid ? fp.zmin : ctr[2], z1 = fp.valid ? fp.zmax : ctr[2];
+  const std::array<float, 3> span{x1 - x0, y1 - y0, z1 - z0};
+  const float scale = vlen(along(1.f, 0.f, 0.f)); // metres a game unit
+  for (int a = 0; a < 3; ++a) {
+    const int n = static_cast<int>(std::lround(span[a] * scale / kCapSpacing)) + 1;
+    g.n[a] = std::clamp(n, kCapGridMin[a], kCapGridMax[a]);
+    if (span[a] <= 0.f)
+      g.n[a] = 1;
+  }
+  g.origin = room(x0, y0, z0);
+  g.axis = {g.n[0] > 1 ? along(span[0], 0.f, 0.f) : XrVector3f{}, g.n[1] > 1 ? along(0.f, span[1], 0.f) : XrVector3f{},
+            g.n[2] > 1 ? along(0.f, 0.f, span[2]) : XrVector3f{}};
+  // The middle across, the lowest, the nearest the middle deep.
+  g.ref = (g.n[0] - 1) / 2 + g.n[0] * g.n[1] * ((g.n[2] - 1) / 2);
+  return g;
+}
+
+// The SH blended at `p` (the room) among the grid's points' `sh`, as the
+// shader blends them (xr_room_sh_eo): trilinear in the grid's cell.
+void probe_blend(const ProbeGrid& g, const float (*sh)[9][4], const XrVector3f& p, float out[9][4]) {
+  std::array<int, 3> c0{};
+  std::array<float, 3> f{};
+  for (int a = 0; a < 3; ++a) {
+    const float l2 = vdot(g.axis[a], g.axis[a]);
+    const float t = g.n[a] > 1 && l2 > 1e-12f ? std::clamp(vdot(p - g.origin, g.axis[a]) / l2, 0.f, 1.f) : 0.f;
+    const float u = t * static_cast<float>(g.n[a] - 1);
+    c0[a] = std::min(static_cast<int>(u), g.n[a] - 1);
+    f[a] = u - static_cast<float>(c0[a]);
+  }
+  for (int k = 0; k < 9; ++k)
+    for (int c = 0; c < 4; ++c)
+      out[k][c] = 0.f;
+  for (int corner = 0; corner < 8; ++corner) {
+    float w = 1.f;
+    std::array<int, 3> ci{};
+    for (int a = 0; a < 3; ++a) {
+      const bool up = (corner >> a) & 1;
+      w *= up ? f[a] : 1.f - f[a];
+      ci[a] = c0[a] + (up ? 1 : 0);
+    }
+    if (w <= 0.f)
+      continue;
+    const int i = (ci[2] * g.n[1] + ci[1]) * g.n[0] + ci[0];
+    for (int k = 0; k < 9; ++k)
+      for (int c = 0; c < 3; ++c)
+        out[k][c] += w * sh[i][k][c];
+  }
+}
 
 // `arena`: the stage's placement (its rotation about y and scale).
 RoomFrame room_frame(const std::array<float, 16>& arena) {
@@ -7253,28 +7387,14 @@ RoomFrame room_frame(const std::array<float, 16>& arena) {
     if (r.source != kRoomSourceCaptured)
       cap.sh.fill(g_room.sh[r.source - 1]);
   }
-  // The points across the stage: its footprint's 20%, 50% and 80% along x
-  // in the game's world (its centre's height and depth; 60 units either side
-  // without a footprint), into the room, lifted.
-  {
-    std::array<float, 3> ctr;
-    Footprint fp;
-    {
-      std::lock_guard lock{g_arenaMutex};
-      ctr = g_arenaCenter;
-      fp = g_footprint;
-    }
-    const float x0 = fp.valid ? fp.xmin : ctr[0] - 75.f, x1 = fp.valid ? fp.xmax : ctr[0] + 75.f;
-    const float xs[kCapPoints] = {0.5f * (x0 + x1), x0 + 0.2f * (x1 - x0), x1 - 0.2f * (x1 - x0)};
-    for (int i = 0; i < kCapPoints; ++i) {
-      const float x = xs[i], y = ctr[1], z = ctr[2];
-      cap.at[i] = {arena[0] * x + arena[1] * y + arena[2] * z + arena[3],
-                   arena[4] * x + arena[5] * y + arena[6] * z + arena[7] + kCapLift,
-                   arena[8] * x + arena[9] * y + arena[10] * z + arena[11]};
-    }
+  cap.grid = probe_grid(arena, r.probes == 1);
+  if (static std::array<int, 3> logged{}; cap.grid.n != logged) {
+    logged = cap.grid.n;
+    Log.info("Room light probes: {} {}x{}x{} ({} points, {:.2f} m across)", r.probes == 1 ? "LINE" : "GRID",
+             logged[0], logged[1], logged[2], cap.grid.count(), vlen(cap.grid.axis[0]));
   }
   const bool captured = r.source == kRoomSourceCaptured;
-  if (captured && !capture_light(cap.at, cap))
+  if (captured && !capture_light(cap.grid, cap))
     return f;
   const float capMean = cap.mean, capLevel = captured ? cap.level : 1.f;
   // The captured room's level (ABL, by STRENGTH), and the fighters' scale:
@@ -7290,11 +7410,11 @@ RoomFrame room_frame(const std::array<float, 16>& arena) {
   f.delight = r.delight;
   f.gloss[0] = r.gloss * kFighterGloss;
   f.gloss[1] = r.gloss * stage_gloss(g_roomStage);
-  for (int i = 0; i < kCapPoints; ++i)
+  for (int i = 0; i < cap.grid.count(); ++i)
     for (int k = 0; k < 9; ++k)
       for (int c = 0; c < 3; ++c)
         f.sh[i][k][c] = cap.sh[i][k][c] * gain;
-  f.at = cap.at;
+  f.grid = cap.grid;
   // The lights' directions: turned by YAW about the stage's up, then by the
   // stage's placement into the room.
   const float yaw = r.yaw * 0.017453292f, cy = std::cos(yaw), sy = std::sin(yaw);
@@ -7320,10 +7440,11 @@ RoomFrame room_frame(const std::array<float, 16>& arena) {
       f.pos[l] = cap.pos[l];
       f.range[l] = cap.placed[l] ? cap.range[l] : 0.f;
     }
-  // An up-facing surface's light at the middle, for unlit draws (as
-  // xr_room_diffuse at up).
+  // An up-facing surface's light at the reference point, for unlit draws
+  // (as xr_room_diffuse at up).
+  const auto& ref = f.sh[f.grid.ref];
   for (int c = 0; c < 3; ++c) {
-    float e = f.sh[0][0][c] + f.sh[0][1][c] - f.sh[0][6][c] - f.sh[0][8][c];
+    float e = ref[0][c] + ref[1][c] - ref[6][c] - ref[8][c];
     for (int l = 0; l < 2; ++l)
       e += std::max(f.dir[l][1], 0.f) * f.col[l][c];
     f.up[c] = std::clamp(e, 0.f, 1.f);
@@ -7531,13 +7652,15 @@ enum {
   kRlYaw,
   kRlShading,
   kRlView,
+  kRlProbes,
   kRlRows
 };
-constexpr int kLightRowY0 = 70, kLightRowStep = 37;
-constexpr std::array<const char*, kRlRows> kLightNames{"SOURCE",   "FIGHTERS", "STAGE", "UNLIT",   "DELIGHT", "GLOSS",
-                                                       "STRENGTH", "KEY",      "YAW",   "SHADING", "VIEW"};
+constexpr int kLightRowY0 = 70, kLightRowStep = 34;
+constexpr std::array<const char*, kRlRows> kLightNames{"SOURCE", "FIGHTERS", "STAGE",   "UNLIT", "DELIGHT", "GLOSS",
+                                                       "STRENGTH", "KEY",    "YAW",     "SHADING", "VIEW", "PROBES"};
 constexpr std::array<const char*, 4> kShadingNames{"VERTEX", "PIXEL", "FACET", "SMOOTH"};
 constexpr std::array<const char*, 4> kViewNames{"OFF", "LIT", "CLASS", "NORMALS"};
+constexpr std::array<const char*, 2> kProbeNames{"GRID", "LINE"};
 
 // What's under a laser: a tint slider (kHue..kSat), an Audio row (kAudio +
 // row), a tab (kTab + page), Reset, a Stage channel (kMixChan + channel),
@@ -7926,6 +8049,8 @@ std::vector<const char*> light_choices(int row) {
     return {kShadingNames.begin(), kShadingNames.end()};
   if (row == kRlView)
     return {kViewNames.begin(), kViewNames.end()};
+  if (row == kRlProbes)
+    return {kProbeNames.begin(), kProbeNames.end()};
   return {};
 }
 float light_max(int row) { return row == kRlStrength || row == kRlKeys ? 2.f : row == kRlYaw ? 360.f : 1.f; }
@@ -7977,12 +8102,12 @@ void draw_light(Canvas& c) {
       continue;
     }
     const int n = static_cast<int>(names.size());
-    const int chosen = row == kRlSource ? r.source : row == kRlShading ? r.shading : r.view;
+    const int chosen = row == kRlSource ? r.source : row == kRlShading ? r.shading : row == kRlProbes ? r.probes : r.view;
     const int w = (kChoiceX1 - kTrackX0) / n;
     for (int i = 0; i < n; ++i) {
       const int x0 = kTrackX0 + i * w;
       const bool on = i == chosen;
-      c.fill(x0 + 2, y - 4, x0 + w - 2, y + kTrackH + 4,
+      c.fill(x0 + 2, y - 2, x0 + w - 2, y + kTrackH + 2,
              on ? (usable ? Rgba{70, 110, 150, 255} : Rgba{60, 64, 74, 255}) : Rgba{36, 40, 50, 255});
       // ROOM while it captures: the seconds left.
       std::string label = names[i];
@@ -8084,8 +8209,10 @@ int panel_target(float px, float py) {
       on = g_room.value.source != 0;
     }
     for (int row = 0; row < kRlRows; ++row) {
+      // Each row's band, the rows' step tall (they're close since PROBES).
       const float y = static_cast<float>(kLightRowY0 + row * kLightRowStep);
-      if ((row == kRlSource || on) && px >= kTrackX0 - 24 && px < kChoiceX1 && py >= y - 10 && py < y + kTrackH + 10)
+      constexpr float pad = static_cast<float>(kLightRowStep - kTrackH) / 2.f;
+      if ((row == kRlSource || on) && px >= kTrackX0 - 24 && px < kChoiceX1 && py >= y - pad && py < y + kTrackH + pad)
         return kLightRow + row;
     }
     if (px >= kTrackX0 && px < kChoiceX1 && py >= kRecaptureY - 10 && py < kRecaptureY + kTrackH + 10)
@@ -8116,6 +8243,8 @@ void light_choose(int row, float px) {
       v.source = i;
     else if (row == kRlShading)
       v.shading = i;
+    else if (row == kRlProbes)
+      v.probes = i;
     else
       v.view = i;
     r = v;
@@ -9336,6 +9465,11 @@ void thread_main() {
   g_displayPerGameFrame = 0;
   g_paceCv.notify_all();
   Log.info("XR thread exiting");
+#ifndef __ANDROID__
+  g_replayPollStop = true;
+  if (g_replayPoll.joinable())
+    g_replayPoll.join();
+#endif
   // Stop the render worker taking images, and let a frame it is drawing into
   // one finish, before the swapchains go.
   g_phase = Phase::Failed;
@@ -9718,8 +9852,7 @@ static_assert(gfx::XrMaxClipPlanes == AURORA_XR_MAX_CLIPS && gfx::XrMaxClipPlane
 // game camera space), then last frame's own (from last frame's).
 // Then the room light's fields (shader.cpp's XrEye: room_m to room_probe).
 constexpr uint64_t kMultiviewEyeSize = 2 * 64 + 16 + gfx::XrMaxClipPlanes * 16 + gfx::XrMaxClipPlanes * 4 + 4 * 64 +
-                                       64 + 4 * 16 + kCapPoints * 9 * 16 + 4 * 16 + 2 * 16 + 2 * 16 +
-                                       kCapPoints * 16;
+                                       64 + 4 * 16 + kCapPoints * 9 * 16 + 4 * 16 + 2 * 16 + 2 * 16 + 4 * 16;
 
 struct Renderer3D {
   uint64_t layoutKey = 0;
@@ -10911,7 +11044,7 @@ void release_motion(uint64_t tickFrame) {
 }
 
 bool render_eyes(const wgpu::CommandEncoder& cmd, gfx::detail::FramePacket& frame,
-                 const std::vector<std::array<float, 12 + gfx::XrClipFloats>>& worldTransforms,
+                 const std::vector<std::array<float, gfx::XrTransformFloats>>& worldTransforms,
                  const std::vector<const gfx::detail::RenderPass*>* passes) {
   std::array<XrView, 2> views;
   {
@@ -10947,10 +11080,12 @@ bool render_eyes(const wgpu::CommandEncoder& cmd, gfx::detail::FramePacket& fram
     // fighters' gloss, then the stage's.
     float roomEye[2][4];
     // The point lights in game camera space, w the squared distance (game
-    // units) their colour applies at (0: directional); the points the SH is
-    // made at, in game camera space (the middle, its left, its right).
+    // units) their colour applies at (0: directional); the probe grid in
+    // game camera space: its first point, then its three axes (each its
+    // whole span), w the grid's size along each (a fighter's own probe: one
+    // point, its blend).
     float roomLp[2][4];
-    float roomProbe[kCapPoints][4];
+    float roomProbe[4][4];
   } mv[gfx::XrMaxTransforms]{};
   static_assert(sizeof(mv[0]) == kMultiviewEyeSize);
   std::array<Mat4, gfx::XrMaxTransforms> worldToRoom{}, cameraToRoom{};
@@ -11074,11 +11209,37 @@ bool render_eyes(const wgpu::CommandEncoder& cmd, gfx::detail::FramePacket& fram
             o[c] = toCamera[c * 4] * p.x + toCamera[c * 4 + 1] * p.y + toCamera[c * 4 + 2] * p.z + toCamera[c * 4 + 3];
           return o;
         };
-        for (int i = 0; i < kCapPoints; ++i) {
-          const auto q = to_camera(room.at[i]);
-          std::copy(q.begin(), q.end(), u.roomProbe[i]);
-          u.roomProbe[i][3] = 0.f;
+        // The grid, or a fighter's probe (its entry's last floats): the SH
+        // blended at its middle, as one point.
+        constexpr int kProbe = 12 + gfx::XrClipFloats;
+        const XrVector3f* probe = nullptr;
+        XrVector3f probeRoom;
+        if (t > 0 && worldTransforms[t - 1][kProbe + 3] > 0.f) {
+          const auto& e = worldTransforms[t - 1];
+          const Mat4& w = worldToRoom[t];
+          probeRoom = {w[0] * e[kProbe] + w[1] * e[kProbe + 1] + w[2] * e[kProbe + 2] + w[3],
+                       w[4] * e[kProbe] + w[5] * e[kProbe + 1] + w[6] * e[kProbe + 2] + w[7],
+                       w[8] * e[kProbe] + w[9] * e[kProbe + 1] + w[10] * e[kProbe + 2] + w[11]};
+          probe = &probeRoom;
+          probe_blend(room.grid, room.sh, probeRoom, u.roomSh[0]);
+          if (static bool logged = false; !std::exchange(logged, true))
+            Log.info("Room light: a draw's own probe at {:.2f},{:.2f},{:.2f} (a fighter's middle)", probeRoom.x,
+                     probeRoom.y, probeRoom.z);
         }
+        const ProbeGrid& g = room.grid;
+        {
+          const auto o = to_camera(probe ? *probe : g.origin);
+          std::copy(o.begin(), o.end(), u.roomProbe[0]);
+          for (int a = 0; a < 3; ++a) {
+            const auto e = to_camera(g.origin + g.axis[a]), b = to_camera(g.origin);
+            for (int c = 0; c < 3; ++c)
+              u.roomProbe[a + 1][c] = probe ? 0.f : e[c] - b[c];
+          }
+          for (int a = 0; a < 3; ++a)
+            u.roomProbe[a][3] = probe ? 1.f : static_cast<float>(g.n[a]);
+          u.roomProbe[3][3] = 0.f;
+        }
+        const auto refCam = to_camera(g.at(g.ref));
         // A point light's place, w the squared distance its colour applies
         // at; a directional one's direction (unit), w 0.
         for (int l = 0; l < 2; ++l) {
@@ -11087,7 +11248,7 @@ bool render_eyes(const wgpu::CommandEncoder& cmd, gfx::detail::FramePacket& fram
             std::copy(q.begin(), q.end(), u.roomLp[l]);
             float d2 = 0.f;
             for (int c = 0; c < 3; ++c)
-              d2 += (q[c] - u.roomProbe[0][c]) * (q[c] - u.roomProbe[0][c]);
+              d2 += (q[c] - refCam[c]) * (q[c] - refCam[c]);
             u.roomLp[l][3] = d2;
           } else {
             const auto& d = room.dir[l];
@@ -11937,8 +12098,24 @@ extern "C" int aurora_xr_room_capture_wanted(void) {
     // the old spot's light, nearer a window, until the next pause
     // (2026-10-23). A make costs ~15 ms here, at most every poll.
     std::lock_guard lock{c.estMutex};
-    if ((make && log) || c.est.stale())
+    if ((make && log) || c.est.stale()) {
+      const int64_t t0 = steady_ns();
       c.est.make();
+      // Logged at most every 10 s: how many makes, for how many points, and
+      // what they cost (PROBES' GRID makes many more points than LINE).
+      static uint32_t makes = 0;
+      static double total = 0.0, most = 0.0;
+      static int64_t since = t0;
+      static int points = 0;
+      const double ms = static_cast<double>(steady_ns() - t0) * 1e-6;
+      ++makes, total += ms, most = std::max(most, ms);
+      if (steady_ns() - since >= 10'000'000'000 || c.last.grid.count() != points) {
+        points = c.last.grid.count();
+        Log.info("Room light made {} times in {:.0f} s ({} points): {:.1f} ms each, {:.1f} at most", makes,
+                 static_cast<double>(steady_ns() - since) * 1e-9, c.last.grid.count(), total / makes, most);
+        makes = 0, total = most = 0.0, since = steady_ns();
+      }
+    }
     if (log)
       capture_log(what, frames != 0 ? frames : c.est.frames(), casts);
   }

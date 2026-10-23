@@ -38,6 +38,14 @@ constexpr uint32_t XrMaxTransforms = 32;
 constexpr int XrMaxClipPlanes = 8;
 // A clip's floats: the planes, their fade bands, then the draw's opacity.
 constexpr int XrClipFloats = XrMaxClipPlanes * 5 + 1;
+// A draw's light probe (aurora_xr_light_probe): game world xyz, then 1 when
+// set (0: the room light's grid at each vertex).
+constexpr int XrProbeFloats = 4;
+// A world transform entry: move 3x4, the clip, the light probe.
+constexpr int XrTransformFloats = 12 + XrClipFloats + XrProbeFloats;
+// The room light's probes (lib/xr's grid, the shader's room_sh): at most
+// this many points, nine SH coefficients each.
+constexpr int XrRoomProbes = 36;
 
 using BindGroupRef = HashType;
 using PipelineRef = HashType;
