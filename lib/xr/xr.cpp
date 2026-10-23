@@ -6717,16 +6717,16 @@ constexpr float kFighterGloss = 0.1f;
 std::atomic<int> g_roomStage{-1};
 
 // How glossy a stage's own surfaces are (times GLOSS): the metal ones, and
-// the cars of the F-Zero stages; 0 elsewhere (no highlight pipelines).
+// the cars of the F-Zero stages; 0 elsewhere (no highlight pipelines). At
+// most 0.1, like the fighters (1 and 0.6 were far too heavy, 2026-10-23).
 float stage_gloss(int grkind) {
   switch (grkind) {
   case 0x0E: // Corneria: the Great Fox
   case 0x0F: // Venom
-    return 1.f;
   case 0x12: // Mute City
   case 0x13: // Big Blue
   case 0x22: // Big Blue's route
-    return 0.6f;
+    return 0.1f;
   default:
     return 0.f;
   }
