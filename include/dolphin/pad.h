@@ -249,6 +249,76 @@ void PADClearAllVirtualStatus();
  * player watching the game from behind. Takes effect on the next PADRead. */
 void PADSetMirrorX(bool mirror);
 
+/* Fight mapping: while a fight runs (PADSetFightMappingActive), an SDL
+ * gamepad (not a GameCube one) and the XR controllers are read through a
+ * per-input table instead of their usual GameCube mapping. Start is never
+ * mapped. An input held when the mapping turns on or off, whose meaning
+ * changes with it, gives nothing until it's released. */
+typedef enum {
+  PAD_FIGHT_DEVICE_GAMEPAD,
+  PAD_FIGHT_DEVICE_TOUCH,
+  PAD_FIGHT_DEVICE_COUNT,
+} PADFightDevice;
+
+/* The inputs of each device; the two sticks first. */
+enum {
+  PAD_FIGHT_LEFT_STICK,
+  PAD_FIGHT_RIGHT_STICK,
+  PAD_FIGHT_LEFT_STICK_CLICK,
+  PAD_FIGHT_RIGHT_STICK_CLICK,
+  PAD_FIGHT_LEFT_TRIGGER,
+  PAD_FIGHT_RIGHT_TRIGGER,
+  /* Gamepad */
+  PAD_FIGHT_PAD_SOUTH = 6,
+  PAD_FIGHT_PAD_EAST,
+  PAD_FIGHT_PAD_WEST,
+  PAD_FIGHT_PAD_NORTH,
+  PAD_FIGHT_PAD_LEFT_SHOULDER,
+  PAD_FIGHT_PAD_RIGHT_SHOULDER,
+  PAD_FIGHT_PAD_DPAD_UP,
+  PAD_FIGHT_PAD_DPAD_DOWN,
+  PAD_FIGHT_PAD_DPAD_LEFT,
+  PAD_FIGHT_PAD_DPAD_RIGHT,
+  PAD_FIGHT_PAD_COUNT,
+  /* Touch */
+  PAD_FIGHT_TOUCH_A = 6,
+  PAD_FIGHT_TOUCH_B,
+  PAD_FIGHT_TOUCH_X,
+  PAD_FIGHT_TOUCH_Y,
+  PAD_FIGHT_TOUCH_LEFT_GRIP,
+  PAD_FIGHT_TOUCH_RIGHT_GRIP,
+  PAD_FIGHT_TOUCH_COUNT,
+  PAD_FIGHT_INPUT_MAX = PAD_FIGHT_PAD_COUNT,
+};
+
+typedef enum {
+  PAD_FIGHT_STICK_NONE,
+  PAD_FIGHT_STICK_MAIN,
+  PAD_FIGHT_STICK_C,
+} PADFightStick;
+
+/* What an input gives: GameCube buttons, or a stick for a stick. A trigger
+ * giving PAD_TRIGGER_L or _R carries its analog value too. */
+typedef struct {
+  u16 button;
+  u8 stick; /* PADFightStick */
+} PADFightOutput;
+
+/* An input read off a device, before any mapping. */
+typedef struct {
+  float stick[2][2]; /* left, right: x, y; -1..1, past the dead zone */
+  u32 pressed;       /* a bit per input */
+  u8 analog[2];      /* the left and right trigger, 0..255 */
+  bool start;
+} PADFightRaw;
+
+/* `outputs` has one entry per input of the device (PAD_FIGHT_*_COUNT). */
+void PADSetFightMapping(PADFightDevice device, const PADFightOutput* outputs, u32 count);
+void PADSetFightMappingActive(bool active);
+bool PADFightMappingActive(void);
+/* The device's usual GameCube mapping, as a fight table (PAD_FIGHT_*_COUNT entries). */
+const PADFightOutput* PADFightStandardMapping(PADFightDevice device);
+
 /**
  * Set the default controller mapping used.
  *

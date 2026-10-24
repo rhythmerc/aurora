@@ -2,6 +2,7 @@
 #include "../../device.hpp"
 #include "../../internal.hpp"
 #include "../../io.hpp"
+#include "fight.hpp"
 #include <dolphin/pad.h>
 #include <dolphin/si.h>
 #include <SDL3/SDL_mouse.h>
@@ -35,6 +36,8 @@ std::array<PADButtonMapping, PAD_BUTTON_COUNT> g_defaultButtonsStandard{{
 }};
 
 std::array<PADStatus, PAD_CHANMAX> g_virtualPadStatus{};
+// Each port's gamepad, as a reader of the fight mapping (fight.hpp).
+std::array<aurora::pad::FightReader, PAD_CHANMAX> g_fightReaders{};
 std::array<bool, PAD_CHANMAX> g_virtualPadActive{};
 // PADSetMirrorX: every port's left and right swapped (set from another thread).
 std::atomic<bool> g_mirrorX{false};
@@ -922,6 +925,7 @@ u32 PADRead(PADStatus* status) {
           status[i].button |= PAD_TRIGGER_R;
         }
       }
+      const Sint16 tlRaw = tl, trRaw = tr;
       tl /= 128;
       tr /= 128;
 
@@ -934,6 +938,49 @@ u32 PADRead(PADStatus* status) {
       }
       if (status[i].button & PAD_TRIGGER_R) {
         status[i].triggerRight = 180;
+      }
+
+      // A fight (PADSetFightMapping): the native inputs through the fight
+      // table; or, while something held from before it turned on or off is
+      // suppressed, through the usual table without it.
+      if (!controller->m_isGameCube) {
+        PADFightRaw raw{};
+        raw.stick[0][0] = xl / 80.f, raw.stick[0][1] = yl / 80.f;
+        raw.stick[1][0] = xr / 72.f, raw.stick[1][1] = yr / 72.f;
+        raw.analog[0] = static_cast<u8>(std::min<int>(tl, 255));
+        raw.analog[1] = static_cast<u8>(std::min<int>(tr, 255));
+        raw.start = SDL_GetGamepadButton(controller->m_controller, SDL_GAMEPAD_BUTTON_START);
+        static constexpr std::array<std::pair<SDL_GamepadButton, int>, 12> kFightButtons{{
+            {SDL_GAMEPAD_BUTTON_LEFT_STICK, PAD_FIGHT_LEFT_STICK_CLICK},
+            {SDL_GAMEPAD_BUTTON_RIGHT_STICK, PAD_FIGHT_RIGHT_STICK_CLICK},
+            {SDL_GAMEPAD_BUTTON_SOUTH, PAD_FIGHT_PAD_SOUTH},
+            {SDL_GAMEPAD_BUTTON_EAST, PAD_FIGHT_PAD_EAST},
+            {SDL_GAMEPAD_BUTTON_WEST, PAD_FIGHT_PAD_WEST},
+            {SDL_GAMEPAD_BUTTON_NORTH, PAD_FIGHT_PAD_NORTH},
+            {SDL_GAMEPAD_BUTTON_LEFT_SHOULDER, PAD_FIGHT_PAD_LEFT_SHOULDER},
+            {SDL_GAMEPAD_BUTTON_RIGHT_SHOULDER, PAD_FIGHT_PAD_RIGHT_SHOULDER},
+            {SDL_GAMEPAD_BUTTON_DPAD_UP, PAD_FIGHT_PAD_DPAD_UP},
+            {SDL_GAMEPAD_BUTTON_DPAD_DOWN, PAD_FIGHT_PAD_DPAD_DOWN},
+            {SDL_GAMEPAD_BUTTON_DPAD_LEFT, PAD_FIGHT_PAD_DPAD_LEFT},
+            {SDL_GAMEPAD_BUTTON_DPAD_RIGHT, PAD_FIGHT_PAD_DPAD_RIGHT},
+        }};
+        for (const auto& [native, input] : kFightButtons)
+          if (SDL_GetGamepadButton(controller->m_controller, native))
+            raw.pressed |= 1u << input;
+        if (tlRaw > controller->m_deadZones.leftTriggerActivationZone)
+          raw.pressed |= 1u << PAD_FIGHT_LEFT_TRIGGER;
+        if (trRaw > controller->m_deadZones.rightTriggerActivationZone)
+          raw.pressed |= 1u << PAD_FIGHT_RIGHT_TRIGGER;
+        aurora::pad::FightReader& reader = g_fightReaders[i];
+        aurora::pad::fight_filter(PAD_FIGHT_DEVICE_GAMEPAD, reader, raw);
+        const bool fight = PADFightMappingActive();
+        if (fight || reader.suppressed != 0) {
+          const u32 ext = status[i].extButton;
+          aurora::pad::fight_compose(PAD_FIGHT_DEVICE_GAMEPAD, raw,
+                                     fight ? nullptr : aurora::pad::fight_standard(PAD_FIGHT_DEVICE_GAMEPAD), 80.f,
+                                     72.f, 180, status[i]);
+          status[i].extButton = ext;
+        }
       }
 
       if (controller->m_hasRumble) {

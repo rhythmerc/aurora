@@ -8,6 +8,7 @@
 #include "../gfx/recording.hpp"
 #include "../gfx/xr_replay.hpp"
 #include "../gx/gx.hpp"
+#include "../dolphin/pad/fight.hpp"
 
 #include <aurora/gfx.hpp>
 #include <dolphin/pad.h>
@@ -451,9 +452,11 @@ std::atomic<bool> g_passthroughWanted{true};
 // controllers' haptics to match.
 std::atomic<bool> g_rumbleWanted{false};
 
-// Controller input, written by the XR thread, read by the game thread.
+// Controller input, written by the XR thread, read by the game thread: the
+// controllers' own inputs, made a GameCube pad as the game reads it
+// (aurora_xr_get_pad), through the fight mapping in a fight.
 std::mutex g_padMutex;
-PADStatus g_pad{};
+PADFightRaw g_touchRaw{};
 bool g_padValid = false;
 // Where a laser points on the virtual screen's picture, for the game
 // (aurora_xr_screen_pointer). Under g_padMutex.
@@ -577,7 +580,8 @@ struct Bridge {
   XrActionSet actionSet = XR_NULL_HANDLE;
   XrAction stickMain = XR_NULL_HANDLE, stickC = XR_NULL_HANDLE;
   XrAction btnA = XR_NULL_HANDLE, btnB = XR_NULL_HANDLE, btnX = XR_NULL_HANDLE, btnY = XR_NULL_HANDLE;
-  XrAction btnZ = XR_NULL_HANDLE, btnStart = XR_NULL_HANDLE;
+  XrAction btnStart = XR_NULL_HANDLE;
+  std::array<XrAction, 2> gripBtn{}, stickClick{}; // left, right
   XrAction trigL = XR_NULL_HANDLE, trigR = XR_NULL_HANDLE;
   // Pointing and grabbing the arena while a fight is paused.
   std::array<XrAction, 2> aim{}, grab{};
@@ -1860,6 +1864,8 @@ void write_dump(const Stream& st) {
 //   A / B (right) -> A / B          X / Y (left) -> X / Y
 //   left / right trigger -> analog L / R (digital past 90%)
 //   either grip -> Z                left menu button -> Start
+// In a fight the game's own mapping (PADSetFightMapping) takes each input,
+// the grips and stick clicks apart, instead (aurora_xr_get_pad).
 // While a fight is paused the grips grab the arena instead (Z would retry the
 // match in some modes), and each controller shows a laser.
 
@@ -1903,7 +1909,10 @@ bool create_input() {
       !create_action(B.btnB, "b", "B", XR_ACTION_TYPE_BOOLEAN_INPUT) ||
       !create_action(B.btnX, "x", "X", XR_ACTION_TYPE_BOOLEAN_INPUT) ||
       !create_action(B.btnY, "y", "Y", XR_ACTION_TYPE_BOOLEAN_INPUT) ||
-      !create_action(B.btnZ, "z", "Z", XR_ACTION_TYPE_BOOLEAN_INPUT) ||
+      !create_action(B.gripBtn[0], "z_left", "Left grip", XR_ACTION_TYPE_BOOLEAN_INPUT) ||
+      !create_action(B.gripBtn[1], "z_right", "Right grip", XR_ACTION_TYPE_BOOLEAN_INPUT) ||
+      !create_action(B.stickClick[0], "stick_click_left", "Left stick click", XR_ACTION_TYPE_BOOLEAN_INPUT) ||
+      !create_action(B.stickClick[1], "stick_click_right", "Right stick click", XR_ACTION_TYPE_BOOLEAN_INPUT) ||
       !create_action(B.btnStart, "start", "Start", XR_ACTION_TYPE_BOOLEAN_INPUT) ||
       !create_action(B.trigL, "l", "L", XR_ACTION_TYPE_FLOAT_INPUT) ||
       !create_action(B.trigR, "r", "R", XR_ACTION_TYPE_FLOAT_INPUT) ||
@@ -1920,8 +1929,10 @@ bool create_input() {
       {B.btnB, "/user/hand/right/input/b/click"},
       {B.btnX, "/user/hand/left/input/x/click"},
       {B.btnY, "/user/hand/left/input/y/click"},
-      {B.btnZ, "/user/hand/left/input/squeeze/value"},
-      {B.btnZ, "/user/hand/right/input/squeeze/value"},
+      {B.gripBtn[0], "/user/hand/left/input/squeeze/value"},
+      {B.gripBtn[1], "/user/hand/right/input/squeeze/value"},
+      {B.stickClick[0], "/user/hand/left/input/thumbstick/click"},
+      {B.stickClick[1], "/user/hand/right/input/thumbstick/click"},
       {B.btnStart, "/user/hand/left/input/menu/click"},
       {B.trigL, "/user/hand/left/input/trigger/value"},
       {B.trigR, "/user/hand/right/input/trigger/value"},
@@ -2063,36 +2074,34 @@ void update_input() {
   if (XR_FAILED(xrSyncActions(B.session, &sync)))
     return;
   update_rumble(true);
-  PADStatus pad{};
+  PADFightRaw raw{};
   const XrVector2f main = action_vec2(B.stickMain);
   const XrVector2f c = action_vec2(B.stickC);
   B.stickY = {main.y, c.y};
   // A controller dragging the screen reels it in and out with its stick
   // instead of steering the menu.
-  if (B.reelHand != 0) {
-    pad.stickX = to_axis(main.x);
-    pad.stickY = to_axis(main.y);
-  }
-  if (B.reelHand != 1) {
-    pad.substickX = to_axis(c.x);
-    pad.substickY = to_axis(c.y);
-  }
+  if (B.reelHand != 0)
+    raw.stick[0][0] = main.x, raw.stick[0][1] = main.y;
+  if (B.reelHand != 1)
+    raw.stick[1][0] = c.x, raw.stick[1][1] = c.y;
   const float l = B.triggersClick ? 0.f : action_float(B.trigL);
   const float r = B.triggersClick ? 0.f : action_float(B.trigR);
-  pad.triggerLeft = static_cast<u8>(std::lround(std::clamp(l, 0.f, 1.f) * 255.f));
-  pad.triggerRight = static_cast<u8>(std::lround(std::clamp(r, 0.f, 1.f) * 255.f));
-  u16 buttons = 0;
-  buttons |= action_bool(B.btnA) ? PAD_BUTTON_A : 0;
-  buttons |= action_bool(B.btnB) ? PAD_BUTTON_B : 0;
-  buttons |= action_bool(B.btnX) ? PAD_BUTTON_X : 0;
-  buttons |= action_bool(B.btnY) ? PAD_BUTTON_Y : 0;
-  buttons |= !B.pointerMode && action_bool(B.btnZ) ? PAD_TRIGGER_Z : 0;
-  buttons |= action_bool(B.btnStart) ? PAD_BUTTON_START : 0;
-  buttons |= l > 0.9f ? PAD_TRIGGER_L : 0;
-  buttons |= r > 0.9f ? PAD_TRIGGER_R : 0;
-  pad.button = buttons;
+  raw.analog[0] = static_cast<u8>(std::lround(std::clamp(l, 0.f, 1.f) * 255.f));
+  raw.analog[1] = static_cast<u8>(std::lround(std::clamp(r, 0.f, 1.f) * 255.f));
+  const auto press = [&raw](bool on, int input) { raw.pressed |= on ? 1u << input : 0u; };
+  press(action_bool(B.btnA), PAD_FIGHT_TOUCH_A);
+  press(action_bool(B.btnB), PAD_FIGHT_TOUCH_B);
+  press(action_bool(B.btnX), PAD_FIGHT_TOUCH_X);
+  press(action_bool(B.btnY), PAD_FIGHT_TOUCH_Y);
+  press(!B.pointerMode && action_bool(B.gripBtn[0]), PAD_FIGHT_TOUCH_LEFT_GRIP);
+  press(!B.pointerMode && action_bool(B.gripBtn[1]), PAD_FIGHT_TOUCH_RIGHT_GRIP);
+  press(action_bool(B.stickClick[0]), PAD_FIGHT_LEFT_STICK_CLICK);
+  press(action_bool(B.stickClick[1]), PAD_FIGHT_RIGHT_STICK_CLICK);
+  press(l > 0.9f, PAD_FIGHT_LEFT_TRIGGER);
+  press(r > 0.9f, PAD_FIGHT_RIGHT_TRIGGER);
+  raw.start = action_bool(B.btnStart);
   std::lock_guard lock{g_padMutex};
-  g_pad = pad;
+  g_touchRaw = raw;
   g_padValid = true;
 }
 
@@ -12010,10 +12019,22 @@ extern "C" void aurora_xr_set_rumble(bool on) {
 }
 
 extern "C" bool aurora_xr_get_pad(PADStatus* out) {
-  std::lock_guard lock{aurora::xr::g_padMutex};
-  if (!aurora::xr::g_padValid)
-    return false;
-  *out = aurora::xr::g_pad;
+  PADFightRaw raw;
+  {
+    std::lock_guard lock{aurora::xr::g_padMutex};
+    if (!aurora::xr::g_padValid)
+      return false;
+    raw = aurora::xr::g_touchRaw;
+  }
+  // Through the fight mapping in a fight (PADSetFightMappingActive), the
+  // usual one otherwise: the sticks at full scale, the triggers' analog
+  // values as they are.
+  static aurora::pad::FightReader reader; // the game thread's
+  aurora::pad::fight_filter(PAD_FIGHT_DEVICE_TOUCH, reader, raw);
+  *out = {};
+  aurora::pad::fight_compose(PAD_FIGHT_DEVICE_TOUCH, raw,
+                             PADFightMappingActive() ? nullptr : aurora::pad::fight_standard(PAD_FIGHT_DEVICE_TOUCH),
+                             127.f, 127.f, 0, *out);
   return true;
 }
 

@@ -1,4 +1,4 @@
-add_library(aurora_pad STATIC lib/dolphin/pad/pad.cpp)
+add_library(aurora_pad STATIC lib/dolphin/pad/pad.cpp lib/dolphin/pad/fight.cpp)
 add_library(aurora::pad ALIAS aurora_pad)
 set_target_properties(aurora_pad PROPERTIES FOLDER "aurora")
 
