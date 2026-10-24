@@ -6767,6 +6767,17 @@ constexpr int64_t kCaptureNs = 20'000'000'000;
 constexpr float kCapFighters = 0.7f;
 constexpr int kRoomSourceCaptured = static_cast<int>(kRoomPresets.size()) + 1;
 
+// The launcher's Lighting > Roomtone (Beta): the room capture, lit as the
+// user tuned it on the headset (AURORA_XR_ROOM_LIGHT=4,1,1,1,1,0,3,0,1,1,1,0,
+// 2026-10-24: the rest are RoomLight's defaults).
+const RoomLight kRoomtone = [] {
+  RoomLight r;
+  r.source = kRoomSourceCaptured;
+  r.unlit = 1.f;
+  r.shading = 3; // smooth normals where meshes have none
+  return r;
+}();
+
 // The points the light is made for (room_frame's ProbeGrid), each lifted
 // to about a fighter's middle (kCapLift, game units, so it scales with the
 // stage: 4 cm at the default 0.0035; the stage's origin is on the table,
@@ -7317,6 +7328,10 @@ void init_room_light() {
   for (size_t i = 0; i < kRoomPresets.size(); ++i)
     g_room.sh[i] = room_sh(kRoomPresets[i]);
   RoomLight r;
+  // The launcher's Lighting: Roomtone is the room capture with these
+  // settings (tuned on the headset).
+  if (g_config.xrRoomLight == 1)
+    r = kRoomtone;
   if (const char* v = std::getenv("AURORA_XR_ROOM_LIGHT")) {
     float f[12] = {0.f, r.fighters, r.stage, r.unlit, r.strength, r.yaw, 0.f, 0.f, r.delight, r.gloss, r.keys, 0.f};
     std::sscanf(v, "%f,%f,%f,%f,%f,%f,%f,%f,%f,%f,%f,%f", &f[0], &f[1], &f[2], &f[3], &f[4], &f[5], &f[6], &f[7],

@@ -142,6 +142,13 @@ typedef struct {
    * eyes' pass as it was. AURORA_XR_FOVEATION overrides it.
    */
   int32_t xrFoveation;
+  /*
+   * OpenXR builds: how fights are lit. 0 the game's own lighting; 1
+   * Roomtone, the room's light from the headset's passthrough cameras
+   * (which needs their permission: without it the game's own lighting).
+   * AURORA_XR_ROOM_LIGHT overrides it.
+   */
+  int32_t xrRoomLight;
 } AuroraConfig;
 
 typedef struct {
