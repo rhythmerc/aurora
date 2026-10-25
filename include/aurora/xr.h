@@ -116,10 +116,12 @@ void aurora_xr_set_placing_clip(int which, int width, int height, const unsigned
  * no-light and dark-room cards), with the found lights' markers; 2:
  * looking: the card as a strip at the top, the legend under it, the
  * camera's view as a circle, the markers, and a ring from each light as it
- * rings. While on, the room capture runs with no time limit, keeping what
- * it saw before (the menus' ambient capture), and a fight's 3D view, its
- * shadow and its HUD are hidden (the placement scene's stage, until the
- * step ends). AURORA_XR_CALIBRATE_FAKE=n: n made-up lights found one every
+ * rings; 3: over, with the scene ending: nothing shown, the fight kept
+ * hidden until the game shows a flat frame (the menu it goes back to),
+ * then off. While on (1, 2), the room capture runs with no time limit,
+ * keeping what it saw before (the menus' ambient capture), and a fight's
+ * 3D view, its shadow and its HUD are hidden (the placement scene's stage,
+ * until the step ends). AURORA_XR_CALIBRATE_FAKE=n: n made-up lights found one every
  * 2.5 s, for a desktop without a camera. Any thread. */
 void aurora_xr_set_calibrating(int mode);
 
@@ -129,6 +131,14 @@ void aurora_xr_set_calibrating(int mode);
  * Straight-alpha RGBA8, copied; given again whenever one changes (the
  * card's count). Any thread. */
 void aurora_xr_set_calibration_image(int which, int width, int height, const unsigned char* rgba);
+
+/* A looping clip over the card while it's a centred one (the intro's):
+ * `rgba` is a width x height atlas of `frames` frameW x frameH frames, `cols`
+ * to a row, played forward and looped at `fps`; x, y, w, h: where it goes
+ * on the card, in its pixels. Opaque. Copied. NULL takes it away, and its
+ * texture is freed. Any thread. */
+void aurora_xr_set_calibration_clip(int width, int height, const unsigned char* rgba, int frames, int cols,
+                                    int frameW, int frameH, float fps, int x, int y, int w, int h);
 
 /* What the step has found: every bright spot the capture has seen (as
  * lights), how many of them have rung since it started (come into the
