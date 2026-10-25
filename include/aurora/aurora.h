@@ -122,7 +122,8 @@ typedef struct {
   /*
    * OpenXR builds: the eyes' resolution, a fixed share of the runtime's
    * recommended size (0.8-1.3), or 0 for dynamic resolution where it is
-   * available. AURORA_XR_EYE_SCALE and AURORA_XR_DYNRES override it.
+   * available; aurora_xr_set_eye_scale changes it as the game runs.
+   * AURORA_XR_EYE_SCALE and AURORA_XR_DYNRES override it.
    */
   float xrEyeScale;
   /*
@@ -132,8 +133,9 @@ typedef struct {
   bool xrNoSpaceWarp;
   /*
    * OpenXR builds, mixed reality, for the room around the stage. No
-   * contact shadow on the surface under the stage (and no raycasting for
-   * it); AURORA_XR_RAYCAST and AURORA_XR_SURFACE_SHADOW override it.
+   * contact shadow on the surface under the stage
+   * (aurora_xr_set_stage_shadow changes it as the game runs);
+   * AURORA_XR_RAYCAST and AURORA_XR_SURFACE_SHADOW override it.
    */
   bool xrNoStageShadow;
   /*
@@ -146,6 +148,7 @@ typedef struct {
    * OpenXR builds: how fights are lit. 0 the game's own lighting; 1
    * Roomtone, the room's light from the headset's passthrough cameras
    * (which needs their permission: without it the game's own lighting).
+   * aurora_xr_set_room_light changes it as the game runs;
    * AURORA_XR_ROOM_LIGHT overrides it.
    */
   int32_t xrRoomLight;

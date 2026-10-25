@@ -292,6 +292,10 @@ struct DynamicResolution {
   std::chrono::steady_clock::time_point lastLog{};
 } g_dynres;
 
+// A fixed share of the recommended eye size the host picked (AuroraConfig::
+// xrEyeScale, aurora_xr_set_eye_scale), or 0: dynamic resolution's.
+std::atomic<float> g_eyeScaleFixed{0.f};
+
 // One step of the cost table: the frame GPU time measured at that scale and
 // how much of it there is, which fades with time since the last visit.
 constexpr float kDynresStep = 0.025f;
@@ -809,10 +813,12 @@ bool create_instance() {
   if (B.hasBoundaryVisibilityExt)
     exts.push_back(XR_META_BOUNDARY_VISIBILITY_EXTENSION_NAME);
 #endif
-  // The surface under the stage, for its shadow. Raycast is offered only to
-  // apps declaring USE_SCENE, on Quest 3 and 3S; AURORA_XR_RAYCAST=0 leaves
-  // it off, AURORA_XR_LOCAL_FLOOR=0 the floor that stands in for it.
-  B.hasEnvRaycastExt &= B.hasFutureExt && env_flag("AURORA_XR_RAYCAST", !g_config.xrNoStageShadow);
+  // The surface under the stage, for its shadow (and the room's light).
+  // Raycast is offered only to apps declaring USE_SCENE, on Quest 3 and 3S;
+  // on whether the shadow is or not, so it can be turned on as the game runs
+  // (aurora_xr_set_stage_shadow). AURORA_XR_RAYCAST=0 leaves it off,
+  // AURORA_XR_LOCAL_FLOOR=0 the floor that stands in for it.
+  B.hasEnvRaycastExt &= B.hasFutureExt && env_flag("AURORA_XR_RAYCAST", true);
   if (B.hasEnvRaycastExt) {
     exts.push_back(XR_EXT_FUTURE_EXTENSION_NAME);
     exts.push_back(XR_META_ENVIRONMENT_RAYCAST_EXTENSION_NAME);
@@ -1326,18 +1332,21 @@ bool size_stereo_stream() {
     Log.error("Expected 2 stereo views, got {}", n);
     return false;
   }
-  // A fixed eye resolution from the host (AuroraConfig::xrEyeScale) turns
-  // dynamic resolution off; AURORA_XR_EYE_SCALE and AURORA_XR_DYNRES override.
-  const bool hostFixed = g_config.xrEyeScale > 0.f;
-  const float scale =
-      std::clamp(env_float("AURORA_XR_EYE_SCALE", hostFixed ? g_config.xrEyeScale : 1.f), 0.25f, 2.f);
+  // The eyes are sized for dynamic resolution's largest step; a fixed share
+  // of the recommended size from the host (AuroraConfig::xrEyeScale, or
+  // aurora_xr_set_eye_scale as the game runs) pins its scale there, so the
+  // host can change it any time. AURORA_XR_EYE_SCALE scales the recommended
+  // size itself; AURORA_XR_DYNRES=0 leaves the eyes at it.
+  const float scale = std::clamp(env_float("AURORA_XR_EYE_SCALE", 1.f), 0.25f, 2.f);
+  if (g_config.xrEyeScale > 0.f && g_eyeScaleFixed.load() == 0.f)
+    g_eyeScaleFixed = g_config.xrEyeScale;
   const auto even = [](float v) { return (static_cast<uint32_t>(v + 0.5f) + 1u) & ~1u; };
   auto& dr = g_dynres;
   dr.recWidth = even(static_cast<float>(views[0].recommendedImageRectWidth) * scale);
   dr.recHeight = even(static_cast<float>(views[0].recommendedImageRectHeight) * scale);
   // Multiview only: the side-by-side path packs both eyes in one image.
 #ifdef __ANDROID__
-  dr.on = g_multiview && env_flag("AURORA_XR_DYNRES", !hostFixed); // measured there
+  dr.on = g_multiview && env_flag("AURORA_XR_DYNRES", true); // measured there
 #else
   dr.on = g_multiview && env_flag("AURORA_XR_DYNRES", false);
 #endif
@@ -4354,6 +4363,15 @@ const SurfaceSettings& surface_settings() {
   return s;
 }
 
+// The stage's shadow as the host last set it (aurora_xr_set_stage_shadow),
+// else as it started (-1).
+std::atomic<int> g_stageShadow{-1};
+
+bool stage_shadow_on() {
+  const int v = g_stageShadow.load(std::memory_order_relaxed);
+  return v >= 0 ? v != 0 : surface_settings().shadow;
+}
+
 // What the worker found, for the XR thread.
 struct SurfaceEstimate {
   enum class State { Unknown, Known, Frozen };
@@ -6058,7 +6076,7 @@ bool build_shadow_layer(XrCompositionLayerQuad& q, XrCompositionLayerColorScaleB
   const auto now = std::chrono::steady_clock::now();
   const float dt = std::min(std::chrono::duration<float>(now - lastTime).count(), 0.1f);
   lastTime = now;
-  if (!shown || !surface_settings().shadow || !B.shadowSwapchain || !B.hasColorScaleBias) {
+  if (!shown || !stage_shadow_on() || !B.shadowSwapchain || !B.hasColorScaleBias) {
     alpha = 0.f;
     return false;
   }
@@ -7380,6 +7398,23 @@ void init_room_light() {
   }
   g_room.value = g_room.defaults = r;
   room_light_apply(r);
+}
+
+// The host's Lighting as the game runs (aurora_xr_set_room_light): 0 the
+// game's own, 1 Roomtone (the room capture, kept from before if there was
+// one), as init_room_light makes them.
+void set_room_light_mode(int mode) {
+  const RoomLight r = mode == 1 ? kRoomtone : RoomLight{};
+  {
+    std::lock_guard lock{g_room.mutex};
+    g_room.value = g_room.defaults = r;
+  }
+  if (r.source == kRoomSourceCaptured)
+    capture_resume();
+  else
+    capture_stop();
+  room_light_apply(r);
+  Log.info("Room light: {} (the host's Lighting)", mode == 1 ? "Roomtone" : "off");
 }
 
 // What render_eyes puts in the eye uniform's room fields, for a frame.
@@ -10566,6 +10601,8 @@ void update_dynamic_resolution(bool missed) {
   if (dr.random) {
     // Exercise every size: resolution-dependent bugs show up as flicker.
     dr.scale = dr.minScale + (dr.maxScale - dr.minScale) * static_cast<float>(std::rand() % 1000) / 999.f;
+  } else if (const float fixed = g_eyeScaleFixed.load(std::memory_order_relaxed); fixed > 0.f) {
+    dr.scale = std::clamp(fixed, 0.5f, dr.maxScale); // the host's, until it asks for dynamic again
   } else {
     int stage;
     {
@@ -12141,6 +12178,14 @@ extern "C" void aurora_xr_set_placing_image(int which, int width, int height, co
 }
 
 extern "C" void aurora_xr_set_passthrough(bool on) { aurora::xr::g_passthroughWanted = on; }
+
+extern "C" void aurora_xr_set_stage_shadow(bool on) { aurora::xr::g_stageShadow = on ? 1 : 0; }
+
+extern "C" void aurora_xr_set_room_light(int mode) { aurora::xr::set_room_light_mode(mode); }
+
+extern "C" void aurora_xr_set_eye_scale(float scale) {
+  aurora::xr::g_eyeScaleFixed = scale > 0.f ? std::clamp(scale, 0.5f, 2.f) : 0.f;
+}
 
 extern "C" bool aurora_xr_active(void) { return aurora::xr::active(); }
 

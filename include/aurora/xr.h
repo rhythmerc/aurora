@@ -115,6 +115,16 @@ void aurora_xr_set_placing_clip(int which, int width, int height, const unsigned
  * On by default. Any thread. */
 void aurora_xr_set_passthrough(bool on);
 
+/* The host's graphics settings as the game runs, in place of their
+ * AuroraConfig values (xrNoStageShadow, xrRoomLight, xrEyeScale), each from
+ * its next frame. The stage's shadow; the room's light (0 the game's own, 1
+ * Roomtone, the room capture, which needs the headset cameras); the eyes'
+ * resolution as a share of the recommended size (0.8-1.3), or 0 for dynamic
+ * resolution. Any thread. */
+void aurora_xr_set_stage_shadow(bool on);
+void aurora_xr_set_room_light(int mode);
+void aurora_xr_set_eye_scale(float scale);
+
 /* The stage now playing (any id the game keys its stages by), the game
  * point (world units) that sits at the arena position, for stages whose
  * action happens far from the world origin, and its size against the
