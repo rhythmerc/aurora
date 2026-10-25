@@ -11293,7 +11293,11 @@ void update_dynamic_resolution(bool missed) {
     // Shaders compiling (a stage's first fight of the session) stall the
     // frame on the CPU and inflate its span; less resolution can't help, and
     // those frames would make every step look dear for a long while. They're
-    // left out of the costs and don't cut the scale (a panic still does).
+    // left out of the costs and don't cut the scale, nor do the misses and
+    // late frames they cause (panics and brakes took a stage's first fight
+    // to the floor in its first 10 s, and the steps' marks held it there
+    // for 20 s after; Yoshi's Story, 2026-10-25). Once compiles stop, a
+    // GPU really over the target is down at once from its readings.
     if (const uint32_t created = gfx::pipelines_created(); created != dr.pipelinesSeen) {
       dr.pipelinesSeen = created;
       dr.compileQuiet = 0;
@@ -11422,7 +11426,7 @@ void update_dynamic_resolution(bool missed) {
         recent += f != 0 && dr.frameCount - f < 60 ? 1 : 0;
       // With the GPU well under the target the misses are the CPU's, and
       // less resolution can't help (Mushroom Kingdom II at 8.3 ms).
-      panic = recent >= 2 && (dr.emaNs == 0 || dr.emaNs > dr.targetNs - 2.5e6) && !heavyMoment;
+      panic = recent >= 2 && (dr.emaNs == 0 || dr.emaNs > dr.targetNs - 2.5e6) && !heavyMoment && !compiling;
       if (!panic)
         ++dr.loneMisses;
     }
@@ -11431,10 +11435,12 @@ void update_dynamic_resolution(bool missed) {
     // Stadium rock it went to 1.20 and stale frames rose from 1.3 a second
     // to 2.2. More than 2 frames over a millisecond late within 2 s, above
     // the lowest step, and the scale goes down a step and holds there for
-    // 15 s (30, 60 if it brakes again within that).
+    // 15 s (30, 60 if it brakes again within that). Not while shaders
+    // compile (above): a stage's first fight braked 8 times in its first
+    // 10 s, the holds keeping the scale at its floor for a minute.
     bool brake = false;
     if (const uint32_t lateNow = g_lateFrames.load(std::memory_order_relaxed); lateNow != dr.lateFramesSeen) {
-      for (uint32_t i = dr.lateFramesSeen; i != lateNow && !heavyMoment; ++i)
+      for (uint32_t i = dr.lateFramesSeen; i != lateNow && !heavyMoment && !compiling; ++i)
         dr.recentLate[dr.recentLateIndex++ % dr.recentLate.size()] = dr.frameCount;
       dr.lateFramesSeen = lateNow;
       int recent = 0;
