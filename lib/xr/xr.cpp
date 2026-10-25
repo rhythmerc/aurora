@@ -7061,6 +7061,7 @@ constexpr float kCalRingDeg = 16.f, kCalMarkerDeg = 3.2f;
 constexpr size_t kCalMarkersMax = 8, kCalRingsMax = 3;
 
 std::atomic<int> g_calibrating{0};
+std::atomic<int64_t> g_calOverNs{0}; // when it went to 3 (over)
 struct CalLight {
   XrVector3f dir; // from the origin (unit)
   XrVector3f pos;
@@ -7088,6 +7089,16 @@ struct CalImage {
   uint64_t gen = 0, shownGen = 0;
 };
 std::array<CalImage, 4> g_calImages;
+// The intro card's clip (aurora_xr_set_calibration_clip): a grid of frames
+// played forward and looped, over the card while it's a centred one (mode
+// 1); given at the intro, taken away (and its texture freed) after it.
+struct CalClip {
+  CalImage atlas;
+  int frames = 0, cols = 0, frameW = 0, frameH = 0;
+  float fps = 15.f;
+  int x = 0, y = 0, w = 0, h = 0; // on the card, in its pixels
+  int64_t startNs = 0;
+} g_calClip;
 XrSwapchain g_calRing = XR_NULL_HANDLE, g_calView = XR_NULL_HANDLE;
 constexpr uint32_t kCalRingSize = 128, kCalViewSize = 512;
 
@@ -7145,7 +7156,7 @@ void calibration_moved(XrVector3f p0, float y0, XrVector3f p1, float y1) {
 // lights, and which of them ring.
 void calibration_frame() {
   const int mode = g_calibrating.load();
-  if (mode == 0)
+  if (mode == 0 || mode == 3)
     return;
   auto& c = g_capture;
   std::vector<roomtone::Spot> spots;
@@ -7295,6 +7306,10 @@ void destroy_calibration() {
     ci.img.swapchain = XR_NULL_HANDLE;
     ci.shownGen = 0;
   }
+  if (g_calClip.atlas.img.swapchain)
+    xrDestroySwapchain(g_calClip.atlas.img.swapchain);
+  g_calClip.atlas.img.swapchain = XR_NULL_HANDLE;
+  g_calClip.frames = 0;
 }
 
 // AURORA_XR_ROOM_REPLAY_PACE=n with AURORA_XR_ROOM_REPLAY: the recording's
@@ -7341,7 +7356,7 @@ void replay_paced(std::string path, uint32_t first) {
 // after the head past a 20 degree dead zone, at the head's place), the
 // camera's view locked to the head, and the markers and rings on the
 // lights.
-constexpr size_t kMaxCalLayers = 3 + kCalMarkersMax + kCalRingsMax;
+constexpr size_t kMaxCalLayers = 4 + kCalMarkersMax + kCalRingsMax;
 struct CalLayers {
   std::array<XrCompositionLayerQuad, kMaxCalLayers> quads;
   std::array<XrCompositionLayerColorScaleBiasKHR, kMaxCalLayers> tints;
@@ -7395,9 +7410,24 @@ void build_calibration_layers(CalLayers& out, int mode) {
     ++out.count;
   };
   const auto across = [](float deg, float dist) { return 2.f * dist * std::tan(deg * 0.5f * kPi / 180.f); };
-  const bool hands = G.hands[0].tracked || G.hands[1].tracked;
+  // The hands' legend ("Pick up your controller") only while no controller
+  // is in hand: with one controller held and the other hand free, that hand
+  // is tracked, but the step's A and B are on the controller.
+  const bool controller = std::any_of(G.hands.begin(), G.hands.end(), [](const Hand& h) { return h.valid && !h.tracked; });
+  const bool hands = !controller && (G.hands[0].tracked || G.hands[1].tracked);
   {
     std::lock_guard lock{g_placingMutex};
+    // The clip: made into a swapchain when given, freed when taken away.
+    if (g_calClip.atlas.gen != g_calClip.atlas.shownGen) {
+      if (g_calClip.atlas.img.swapchain)
+        xrDestroySwapchain(g_calClip.atlas.img.swapchain);
+      g_calClip.atlas.img.swapchain = XR_NULL_HANDLE;
+      if (g_calClip.frames > 0 && !upload_placing_image(g_calClip.atlas.img))
+        Log.warn("Calibration clip unavailable");
+      g_calClip.atlas.img.rgba.clear();
+      g_calClip.atlas.img.rgba.shrink_to_fit();
+      g_calClip.atlas.shownGen = g_calClip.atlas.gen;
+    }
     for (CalImage& ci : g_calImages) {
       if (ci.gen == ci.shownGen || ci.img.width == 0)
         continue;
@@ -7412,17 +7442,34 @@ void build_calibration_layers(CalLayers& out, int mode) {
       if (!img.swapchain)
         return;
       const XrVector3f pos = B.head + rot_y(offset, yaw);
-      add(img.swapchain, {{0, 0}, {static_cast<int32_t>(img.width), static_cast<int32_t>(img.height)}},
-          {facing(pos, B.head), pos}, {width, width * static_cast<float>(img.height) / static_cast<float>(img.width)},
+      const XrQuaternionf turn = facing(pos, B.head);
+      const XrExtent2Df size{width, width * static_cast<float>(img.height) / static_cast<float>(img.width)};
+      add(img.swapchain, {{0, 0}, {static_cast<int32_t>(img.width), static_cast<int32_t>(img.height)}}, {turn, pos},
+          size, {1.f, 1.f, 1.f, 1.f});
+      // The clip over the centred card, a hair in front (opaque).
+      const CalClip& c = g_calClip;
+      if (&img != &g_calImages[0].img || mode != 1 || c.frames <= 0 || !c.atlas.img.swapchain)
+        return;
+      const double t = static_cast<double>(steady_ns() - c.startNs) * 1e-9;
+      const int frame = static_cast<int>(std::fmod(t * c.fps, static_cast<double>(c.frames)));
+      const float u = (c.x + c.w * 0.5f) / static_cast<float>(img.width) - 0.5f;
+      const float v = 0.5f - (c.y + c.h * 0.5f) / static_cast<float>(img.height);
+      add(c.atlas.img.swapchain, {{(frame % c.cols) * c.frameW, (frame / c.cols) * c.frameH}, {c.frameW, c.frameH}},
+          {turn, pos + qrot(turn, {u * size.width, v * size.height, 0.002f})},
+          {size.width * c.w / static_cast<float>(img.width), size.height * c.h / static_cast<float>(img.height)},
           {1.f, 1.f, 1.f, 1.f});
+      out.quads[out.count - 1].layerFlags = 0;
     };
     // The card: in the middle, or as a strip at the top while looking,
     // over the legend.
-    picture(g_calImages[0].img, mode == 2 ? XrVector3f{0.f, 0.36f, -1.2f} : XrVector3f{0.f, 0.05f, -1.2f}, 0.62f);
+    if (mode != 3)
+      picture(g_calImages[0].img, mode == 2 ? XrVector3f{0.f, 0.36f, -1.2f} : XrVector3f{0.f, 0.05f, -1.2f}, 0.62f);
     if (mode == 2)
       picture(hands && g_calImages[2].img.width > 0 ? g_calImages[2].img : g_calImages[1].img, {0.f, -0.42f, -1.1f},
               0.32f);
   }
+  if (mode == 3)
+    return; // over: nothing more, the fight still hidden
   // The camera's view, where the head looks.
   if (mode == 2 && calibration_textures()) {
     const XrQuaternionf pitch{std::sin(kCalPitch * 0.5f), 0.f, 0.f, std::cos(kCalPitch * 0.5f)};
@@ -9514,7 +9561,16 @@ bool render_xr_frame() {
   // A room light calibration: its lights, and the fight (the placement
   // scene's) hidden under it.
   calibration_frame();
-  const int calibrating = g_calibrating.load();
+  // Over (3): the scene's last 3D image stays hidden until the screen shows
+  // again (the menu it goes back to; at most 3 s), then nothing. A flat
+  // frame comes as the scene ends, but its last 3D image holds for 250 ms.
+  int calibrating = g_calibrating.load();
+  if (calibrating == 3 && (!fight || steady_ns() - g_calOverNs.load() > 3'000'000'000)) {
+    int over = 3;
+    if (g_calibrating.compare_exchange_strong(over, 0))
+      Log.info("Room light calibration: off, the screen back");
+    calibrating = g_calibrating.load();
+  }
   room_survey_apply();
   spot_frame(fs.predictedDisplayTime);
   room_depth_frame(fs.predictedDisplayTime);
@@ -12645,12 +12701,36 @@ extern "C" void aurora_xr_set_placing_image(int which, int width, int height, co
 
 extern "C" void aurora_xr_set_calibrating(int mode) {
   using namespace aurora::xr;
-  mode = std::clamp(mode, 0, 2);
+  mode = std::clamp(mode, 0, 3);
   const int was = g_calibrating.exchange(mode);
-  if (was == 0 && mode != 0)
+  if (mode == 3)
+    g_calOverNs = steady_ns();
+  const auto running = [](int m) { return m == 1 || m == 2; };
+  if (!running(was) && running(mode))
     calibration_start();
-  else if (was != 0 && mode == 0)
+  else if (running(was) && !running(mode))
     calibration_stop();
+}
+
+extern "C" void aurora_xr_set_calibration_clip(int width, int height, const unsigned char* rgba, int frames, int cols,
+                                               int frameW, int frameH, float fps, int x, int y, int w, int h) {
+  using namespace aurora::xr;
+  std::lock_guard lock{g_placingMutex};
+  CalClip& c = g_calClip;
+  const bool ok = rgba != nullptr && width > 0 && height > 0 && frames > 0 && cols > 0 && frameW > 0 &&
+                  frameH > 0 && cols * frameW <= width && (frames + cols - 1) / cols * frameH <= height;
+  if (!ok && c.frames == 0)
+    return;
+  c.frames = ok ? frames : 0;
+  c.atlas.img.width = ok ? static_cast<uint32_t>(width) : 0;
+  c.atlas.img.height = ok ? static_cast<uint32_t>(height) : 0;
+  if (ok)
+    c.atlas.img.rgba.assign(rgba, rgba + static_cast<size_t>(width) * height * 4);
+  c.cols = cols, c.frameW = frameW, c.frameH = frameH;
+  c.fps = fps > 0.f ? fps : 15.f;
+  c.x = x, c.y = y, c.w = w, c.h = h;
+  c.startNs = steady_ns();
+  ++c.atlas.gen; // made (or freed) on the XR thread
 }
 
 extern "C" void aurora_xr_set_calibration_image(int which, int width, int height, const unsigned char* rgba) {
