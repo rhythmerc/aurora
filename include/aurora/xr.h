@@ -110,6 +110,50 @@ void aurora_xr_set_placing_image(int which, int width, int height, const unsigne
 void aurora_xr_set_placing_clip(int which, int width, int height, const unsigned char* rgba, int frames, int cols,
                                 int frameW, int frameH, float fps, int x, int y, int w, int h);
 
+/* Room light calibration: the step before the first fight of a launch with
+ * Roomtone on, where the player looks at the room's bright lights. 0: off;
+ * 1: a card in the middle of the view (the intro, the done card, the
+ * no-light and dark-room cards), with the found lights' markers; 2:
+ * looking: the card as a strip at the top, the legend under it, the
+ * camera's view as a circle, the markers, and a ring from each light as it
+ * rings. While on, the room capture runs with no time limit, keeping what
+ * it saw before (the menus' ambient capture), and a fight's 3D view, its
+ * shadow and its HUD are hidden (the placement scene's stage, until the
+ * step ends). AURORA_XR_CALIBRATE_FAKE=n: n made-up lights found one every
+ * 2.5 s, for a desktop without a camera. Any thread. */
+void aurora_xr_set_calibrating(int mode);
+
+/* Its pictures: 0 the card, 1 the legend for Touch controllers, 2 for
+ * tracked hands (shown instead while a hand is tracked), 3 the markers: a
+ * row of square markers, the nth light's the nth (the last for the rest).
+ * Straight-alpha RGBA8, copied; given again whenever one changes (the
+ * card's count). Any thread. */
+void aurora_xr_set_calibration_image(int which, int width, int height, const unsigned char* rgba);
+
+/* What the step has found: every bright spot the capture has seen (as
+ * lights), how many of them have rung since it started (come into the
+ * camera's view, or been found), whether the room reads dark (none found,
+ * a dim room), and how many times the room changed so the capture started
+ * over (the lights cleared). False while it's off. Any thread. */
+typedef struct AuroraXrCalibration {
+    int found;
+    int rung;
+    bool dark;
+    int changed;
+} AuroraXrCalibration;
+bool aurora_xr_calibration(AuroraXrCalibration* out);
+
+/* The next light that rang, oldest first, for its chime: its number (1 on,
+ * in the order they rang) and its place in the room (tracking space,
+ * metres). False when none is waiting. Any thread. */
+bool aurora_xr_calibration_ring(int* number, float pos[3]);
+
+/* Lighting the room's way or the game's for a while, Roomtone staying the
+ * setting and its capture going on: true lights fights as Vanilla (the
+ * placement scene before the room light is calibrated), false goes back.
+ * Any thread. */
+void aurora_xr_set_room_light_held(bool vanilla);
+
 /* Whether the room shows behind the game (passthrough): on for mixed
  * reality, off for full VR, where passthrough is stopped, not just hidden.
  * On by default. Any thread. */
@@ -251,6 +295,11 @@ bool aurora_xr_audio_listener(float m[3][4]);
  * aurora_xr_audio_listener) and its width in meters. False otherwise, or
  * while the head pose is not tracked. Any thread; cheap. */
 bool aurora_xr_audio_screen(float center[3], float right[3], float* width);
+/* For a sound placed in the room (the room light calibration's chimes):
+ * the transform from the room (tracking space, metres) to the head's own
+ * space, from the newest head pose. False, leaving `m` untouched, while no
+ * session presents or the head pose is not tracked. Any thread; cheap. */
+bool aurora_xr_audio_room(float m[3][4]);
 void aurora_xr_camera(int category, const float view[3][4]);
 
 /* Extra placement for the following AURORA_XR_WORLD draws in the 3D view

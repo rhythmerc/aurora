@@ -6897,6 +6897,11 @@ struct Capture {
   uint32_t ambientFrames = 0; // since the last log
   uint32_t casts = 0;
   bool any = false; // the estimate has a frame (capture_resume)
+  // A room light calibration runs (aurora_xr_set_calibrating): frames as a
+  // capture's, with no time limit; ended, for the capture thread's make and
+  // log. The times the room changed and the capture started over.
+  bool calibrating = false, calibrationEnded = false;
+  uint32_t restarts = 0;
   // The latest depth image (room_depth_feed, the XR thread), for the capture
   // thread's next frame.
   bool depthPending = false;
@@ -6970,10 +6975,14 @@ void capture_stop() {
   g_capture.requested = g_capture.room = false;
 }
 
+void calibration_moved(XrVector3f p0, float y0, XrVector3f p1, float y1);
+
 // Under g_arenaMutex (move_arenas): the room moved in LOCAL, (p0, y0) to
-// (p1, y1); the capture and its light move with it.
+// (p1, y1); the capture and its light move with it (and a calibration's
+// lights).
 void capture_moved(XrVector3f p0, float y0, XrVector3f p1, float y1) {
   auto& c = g_capture;
+  calibration_moved(p0, y0, p1, y1);
   std::lock_guard lock{c.estMutex};
   c.rec.moved(rt(p0), y0, rt(p1), y1);
   if (c.est.moved(rt(p0), y0, rt(p1), y1))
@@ -6981,18 +6990,18 @@ void capture_moved(XrVector3f p0, float y0, XrVector3f p1, float y1) {
              (y1 - y0) * 57.2958f);
 }
 
-// A capture's frames wanted now: 1 (the 20 s after choosing ROOM), 2
-// (ambient), 0 (none). Under g_capture.mutex.
+// A capture's frames wanted now: 1 (the 20 s after choosing ROOM, or a
+// calibration), 2 (ambient), 0 (none). Under g_capture.mutex.
 int capture_mode_locked() {
   const auto& c = g_capture;
-  return c.requested ? 1 : c.room && c.ambientOk ? 2 : 0;
+  return c.requested || c.calibrating ? 1 : c.room && c.ambientOk ? 2 : 0;
 }
 
 // light_cast's: 1 while a capture's first frames are in, 2 ambient, 0 not.
 int capture_casting() {
   std::lock_guard lock{g_capture.mutex};
   const int mode = capture_mode_locked();
-  return mode == 1 ? (g_capture.untilNs != 0 ? 1 : 0) : mode == 2 && g_capture.any ? 2 : 0;
+  return mode == 1 ? (g_capture.untilNs != 0 || g_capture.calibrating ? 1 : 0) : mode == 2 && g_capture.any ? 2 : 0;
 }
 
 void capture_note_cast() {
@@ -7059,6 +7068,446 @@ bool capture_light(const ProbeGrid& grid, CapLight& out) {
     return false;
   out = c.last;
   return true;
+}
+
+// ---------------------------------------------------------------- Room light calibration
+//
+// The game's step before the first fight of a launch with Roomtone on
+// (aurora_xr_set_calibrating): the player looks at the room's bright lights
+// while the capture runs with no time limit, keeping what it had (the
+// menus' ambient capture). Every bright spot Roomtone has seen
+// (Room::spots, not only the two it lights with) is a light here. A light
+// rings the first time the camera sees it during the step: found then, or
+// found before (in the menus) and now looked at. A ring expands from it, a
+// numbered marker stays on it, and the game plays its chime there
+// (aurora_xr_calibration_ring). Seen again later, its marker pulses. A
+// light sits where Roomtone placed it (a key light's voxels or depth hits),
+// else kCalLightM along its direction from where the head was as the step
+// began. The room changing (the capture starting over) clears them.
+constexpr float kCalLightM = 2.5f;
+// The capture camera's view: its middle 11 degrees under the head's, about
+// 36 degrees round; a light rings within kCalViewCos (30 degrees) of it.
+constexpr float kCalPitch = -0.192f; // radians
+constexpr float kCalViewDeg = 36.f, kCalViewCos = 0.866f;
+// The same light from one make to the next: within 20 degrees.
+constexpr float kCalSameCos = 0.94f;
+// No light, and the seen room's median under this (as passthrough shows it,
+// 0-1): the dark-room card. A guess: the user's dark room with only a
+// monitor lit read 0.0064 (2026-10-25's recording).
+constexpr float kCalDark = 0.01f;
+// AURORA_XR_CALIBRATE_FAKE's lights: one found every kCalFakeNs.
+constexpr int64_t kCalFakeNs = 2'500'000'000;
+// A ring grows to kCalRingDeg across in kCalRingNs, white turning gold and
+// fading; a marker is kCalMarkerDeg across, and a pulse grows it for
+// kCalPulseNs. Sizes in degrees of view, so a far window and a near lamp
+// ring alike.
+constexpr int64_t kCalRingNs = 550'000'000, kCalPulseNs = 350'000'000;
+constexpr float kCalRingDeg = 16.f, kCalMarkerDeg = 3.2f;
+constexpr size_t kCalMarkersMax = 8, kCalRingsMax = 3;
+
+std::atomic<int> g_calibrating{0};
+struct CalLight {
+  XrVector3f dir; // from the origin (unit)
+  XrVector3f pos;
+  bool fresh = false; // found during the step: rings at once
+  int number = 0;     // in the order they rang, from 1; 0: not yet
+  int64_t rungNs = 0, pulseNs = 0;
+  bool inView = false;
+};
+struct {
+  std::mutex mutex;
+  int64_t startNs = 0, lookNs = 0; // the step's start, the looking's (0: not yet)
+  bool primed = false;  // the lights the capture already had are in
+  XrVector3f origin{};  // the head as the step began
+  std::vector<CalLight> lights;
+  int rung = 0, changed = 0;
+  uint32_t restarts = 0; // g_capture.restarts, as last seen
+  bool dark = false;
+  std::deque<std::pair<int, XrVector3f>> rings; // for the game's chimes
+} g_cal;
+
+// Its pictures (aurora_xr_set_calibration_image): given on the game thread,
+// made into swapchains on the XR thread, again when one changes.
+struct CalImage {
+  PlacingImage img;
+  uint64_t gen = 0, shownGen = 0;
+};
+std::array<CalImage, 4> g_calImages;
+XrSwapchain g_calRing = XR_NULL_HANDLE, g_calView = XR_NULL_HANDLE;
+constexpr uint32_t kCalRingSize = 128, kCalViewSize = 512;
+
+// The game turns it on (from off) or off.
+void calibration_start() {
+  XrVector3f head{};
+  {
+    std::lock_guard lock{g_viewMutex};
+    head = B.head;
+  }
+  uint32_t restarts;
+  {
+    std::lock_guard lock{g_capture.mutex};
+    g_capture.calibrating = true;
+    restarts = g_capture.restarts;
+  }
+  std::lock_guard lock{g_cal.mutex};
+  g_cal.startNs = steady_ns();
+  g_cal.lookNs = 0;
+  g_cal.primed = false;
+  g_cal.origin = head;
+  g_cal.lights.clear();
+  g_cal.rings.clear();
+  g_cal.rung = g_cal.changed = 0;
+  g_cal.restarts = restarts;
+  g_cal.dark = false;
+  Log.info("Room light calibration: started");
+}
+
+void calibration_stop() {
+  {
+    std::lock_guard lock{g_capture.mutex};
+    g_capture.calibrating = false;
+    g_capture.calibrationEnded = true; // made and logged by the capture thread's next poll
+  }
+  std::lock_guard lock{g_cal.mutex};
+  Log.info("Room light calibration: ended, {} lights ({} rang), the room changed {} times", g_cal.lights.size(),
+           g_cal.rung, g_cal.changed);
+}
+
+// capture_moved's: the lights keep their place in the room.
+void calibration_moved(XrVector3f p0, float y0, XrVector3f p1, float y1) {
+  const float dy = y1 - y0;
+  std::lock_guard lock{g_cal.mutex};
+  g_cal.origin = p1 + rot_y(g_cal.origin - p0, dy);
+  for (CalLight& l : g_cal.lights) {
+    l.pos = p1 + rot_y(l.pos - p0, dy);
+    l.dir = rot_y(l.dir, dy);
+  }
+  for (auto& r : g_cal.rings)
+    r.second = p1 + rot_y(r.second - p0, dy);
+}
+
+// XR thread, every frame while it's on: the capture's bright spots as
+// lights, and which of them ring.
+void calibration_frame() {
+  const int mode = g_calibrating.load();
+  if (mode == 0)
+    return;
+  auto& c = g_capture;
+  std::vector<roomtone::Spot> spots;
+  bool made;
+  float median;
+  std::array<bool, 2> placed{};
+  std::array<XrVector3f, 2> placedAt{};
+  {
+    std::unique_lock lock{c.estMutex, std::try_to_lock};
+    if (!lock.owns_lock())
+      return; // a make running: the next frame
+    spots = c.est.spots();
+    made = c.est.made();
+    median = c.est.seenMedian();
+    if (c.haveLast)
+      for (int k = 0; k < 2; ++k)
+        placed[k] = c.last.placed[k], placedAt[k] = c.last.pos[k];
+  }
+  uint32_t restarts;
+  {
+    std::lock_guard lock{c.mutex};
+    restarts = c.restarts;
+  }
+  const int64_t now = steady_ns();
+  std::lock_guard lock{g_cal.mutex};
+  if (mode == 2 && g_cal.lookNs == 0)
+    g_cal.lookNs = now;
+  static const int fake = [] {
+    const char* v = std::getenv("AURORA_XR_CALIBRATE_FAKE");
+    return v != nullptr ? std::clamp(std::atoi(v), 0, 12) : 0;
+  }();
+  if (fake > 0) {
+    // Made up, around the room: ahead and up, left, overhead, behind...
+    static const std::array<XrVector3f, 12> dirs{{{0.35f, 0.25f, -0.9f},
+                                                  {-0.6f, 0.45f, -0.65f},
+                                                  {0.1f, 0.95f, -0.3f},
+                                                  {0.85f, 0.15f, -0.5f},
+                                                  {-0.9f, 0.05f, -0.4f},
+                                                  {0.f, 0.3f, 1.f},
+                                                  {-0.3f, -0.15f, -0.95f},
+                                                  {0.6f, 0.7f, 0.4f},
+                                                  {-0.5f, 0.8f, 0.3f},
+                                                  {0.95f, -0.1f, 0.3f},
+                                                  {-0.95f, 0.3f, 0.2f},
+                                                  {0.2f, 0.1f, 0.98f}}};
+    spots.clear();
+    const int n = g_cal.lookNs == 0 ? 0 : std::min<int>(fake, static_cast<int>((now - g_cal.lookNs) / kCalFakeNs));
+    for (int k = 0; k < n; ++k) {
+      const XrVector3f d = vnorm(dirs[k]);
+      spots.push_back({{d.x, d.y, d.z}, 10.f, false});
+    }
+    made = true;
+    median = 0.1f;
+  }
+  if (restarts != g_cal.restarts) {
+    // The room changed: the capture started over, and the lights with it.
+    g_cal.restarts = restarts;
+    g_cal.lights.clear();
+    g_cal.rings.clear();
+    g_cal.rung = 0;
+    ++g_cal.changed;
+  }
+  for (const roomtone::Spot& s : spots) {
+    const XrVector3f d = vnorm({s.dir.x, s.dir.y, s.dir.z});
+    const auto same = std::find_if(g_cal.lights.begin(), g_cal.lights.end(),
+                                   [&](const CalLight& l) { return vdot(l.dir, d) > kCalSameCos; });
+    if (same != g_cal.lights.end()) {
+      same->dir = d;
+      continue;
+    }
+    CalLight l;
+    l.dir = d;
+    l.fresh = g_cal.primed;
+    g_cal.lights.push_back(l);
+  }
+  g_cal.primed = true;
+  // Where each is: a placed key light's place, else along its direction.
+  for (CalLight& l : g_cal.lights) {
+    l.pos = g_cal.origin + l.dir * kCalLightM;
+    for (int k = 0; k < 2; ++k)
+      if (placed[k] && vdot(vnorm(placedAt[k] - g_cal.origin), l.dir) > kCalSameCos)
+        l.pos = placedAt[k];
+  }
+  g_cal.dark = g_cal.lights.empty() && made && median < kCalDark;
+  // Ringing, while looking (one found at the intro rings as it starts):
+  // found now, or in the camera's view for the first time.
+  if (mode != 2)
+    return;
+  const XrVector3f camFwd = qrot(B.headOrientation, {0.f, std::sin(kCalPitch), -std::cos(kCalPitch)});
+  for (CalLight& l : g_cal.lights) {
+    const bool inView = vdot(vnorm(l.pos - B.head), camFwd) > kCalViewCos;
+    if (l.number == 0 && (l.fresh || inView)) {
+      l.number = ++g_cal.rung;
+      l.rungNs = now;
+      g_cal.rings.emplace_back(l.number, l.pos);
+      Log.info("Room light calibration: light {} rang at {:.2f},{:.2f},{:.2f} ({})", l.number, l.pos.x, l.pos.y,
+               l.pos.z, l.fresh ? "found now" : "seen before");
+    } else if (l.number > 0 && inView && !l.inView && now - l.rungNs > kCalRingNs) {
+      l.pulseNs = now; // seen again: a pulse, no chime
+    }
+    l.inView = inView;
+  }
+}
+
+// The ring (a soft white circle line) and the camera's view (a dashed one),
+// premultiplied white; tinted per frame.
+bool calibration_textures() {
+  if (g_calRing && g_calView)
+    return true;
+  const bool srgb = B.swapFormat == VK_FORMAT_R8G8B8A8_SRGB;
+  const auto texel = [srgb](std::vector<uint8_t>& px, size_t i, float alpha) {
+    alpha = std::clamp(alpha, 0.f, 1.f);
+    const float c = srgb ? (alpha <= 0.0031308f ? alpha * 12.92f : 1.055f * std::pow(alpha, 1.f / 2.4f) - 0.055f)
+                         : alpha;
+    px[i * 4 + 0] = px[i * 4 + 1] = px[i * 4 + 2] = static_cast<uint8_t>(std::lround(c * 255.f));
+    px[i * 4 + 3] = static_cast<uint8_t>(std::lround(alpha * 255.f));
+  };
+  const auto circle = [&](uint32_t n, float width, int dashes) {
+    std::vector<uint8_t> px(n * n * 4);
+    for (uint32_t y = 0; y < n; ++y)
+      for (uint32_t x = 0; x < n; ++x) {
+        const float dx = (x + 0.5f) / n * 2.f - 1.f, dy = (y + 0.5f) / n * 2.f - 1.f;
+        const float d = std::abs(std::hypot(dx, dy) - (1.f - width)) / width; // 0 on the line, 1 at its edge
+        float a = std::clamp(1.5f * (1.f - d), 0.f, 1.f);
+        if (dashes > 0) {
+          const float t = (std::atan2(dy, dx) / 6.2831853f + 0.5f) * dashes;
+          a *= std::clamp((0.3f - std::abs(t - std::floor(t) - 0.5f)) * 12.f, 0.f, 1.f);
+        }
+        texel(px, y * n + x, a);
+      }
+    return px;
+  };
+  return (g_calRing || create_static_swapchain(g_calRing, kCalRingSize, kCalRingSize, circle(kCalRingSize, 0.09f, 0))) &&
+         (g_calView || create_static_swapchain(g_calView, kCalViewSize, kCalViewSize, circle(kCalViewSize, 0.006f, 48)));
+}
+
+void destroy_calibration() {
+  for (XrSwapchain* sc : {&g_calRing, &g_calView}) {
+    if (*sc)
+      xrDestroySwapchain(*sc);
+    *sc = XR_NULL_HANDLE;
+  }
+  std::lock_guard lock{g_placingMutex};
+  for (CalImage& ci : g_calImages) {
+    if (ci.img.swapchain)
+      xrDestroySwapchain(ci.img.swapchain);
+    ci.img.swapchain = XR_NULL_HANDLE;
+    ci.shownGen = 0;
+  }
+}
+
+// AURORA_XR_ROOM_REPLAY_PACE=n with AURORA_XR_ROOM_REPLAY: the recording's
+// first n frames go in at launch (as the menus' ambient capture), the rest
+// at its own pace (gaps cut to 200 ms) once a calibration starts, so a
+// desktop sees lights found as the head looked round the room.
+void replay_paced(std::string path, uint32_t first) {
+  std::thread([path, first] {
+    auto& c = g_capture;
+    uint32_t frames = 0;
+    int64_t lastNs = 0;
+    std::unique_lock lock{c.estMutex};
+    roomtone::replay(path, c.est, [&](const roomtone::ReplayEvent& e) {
+      if (e.kind != roomtone::ReplayEvent::Frame)
+        return;
+      if (e.frame != nullptr && e.frame->restarted) {
+        std::lock_guard l{c.mutex};
+        ++c.restarts;
+      }
+      if (++frames == first) {
+        c.est.make();
+        Log.info("Room capture: replayed {} frames of {}; the rest once a calibration starts: {}", frames, path,
+                 c.est.summary());
+        std::lock_guard l{c.mutex};
+        c.any = c.est.made();
+      }
+      if (frames < first)
+        return;
+      lock.unlock();
+      while (g_calibrating.load() == 0)
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+      const int64_t gap = lastNs != 0 ? std::clamp<int64_t>(e.timeNs - lastNs, 0, 200'000'000) : 0;
+      lastNs = e.timeNs;
+      std::this_thread::sleep_for(std::chrono::nanoseconds(gap));
+      lock.lock();
+    });
+    c.est.make();
+    Log.info("Room capture: replayed all {} frames of {}: {}", frames, path, c.est.summary());
+  }).detach();
+}
+
+// What it shows (XR thread), in place of the fight or the screen: the card
+// and the legend head-locked like the placing cards (1.2 m ahead, turning
+// after the head past a 20 degree dead zone, at the head's place), the
+// camera's view locked to the head, and the markers and rings on the
+// lights.
+constexpr size_t kMaxCalLayers = 3 + kCalMarkersMax + kCalRingsMax;
+struct CalLayers {
+  std::array<XrCompositionLayerQuad, kMaxCalLayers> quads;
+  std::array<XrCompositionLayerColorScaleBiasKHR, kMaxCalLayers> tints;
+  uint32_t count = 0;
+};
+
+void build_calibration_layers(CalLayers& out, int mode) {
+  out.count = 0;
+  constexpr float kPi = 3.14159265f;
+  static auto last = std::chrono::steady_clock::time_point{};
+  static float yaw = 0.f;
+  static bool following = false;
+  const auto tnow = std::chrono::steady_clock::now();
+  const float dt = std::chrono::duration<float>(tnow - last).count();
+  last = tnow;
+  const XrVector3f fwd = qrot(B.headOrientation, {0.f, 0.f, -1.f});
+  const float headYaw = std::atan2(-fwd.x, -fwd.z);
+  const auto wrap = [&](float a) { return a - 2.f * kPi * std::floor((a + kPi) / (2.f * kPi)); };
+  const bool recentered = monotonic_ns() - g_recenteredNs.load(std::memory_order_relaxed) < 500'000'000;
+  if (dt > 0.25f || recentered) {
+    yaw = headYaw;
+    following = false;
+  } else {
+    const float diff = wrap(headYaw - yaw);
+    if (std::fabs(diff) > 20.f * kPi / 180.f)
+      following = true;
+    if (following) {
+      yaw += diff * std::min(1.f, dt * 4.f);
+      if (std::fabs(diff) < 1.f * kPi / 180.f)
+        following = false;
+    }
+  }
+  const auto add = [&](XrSwapchain sc, XrRect2Di rect, XrPosef pose, XrExtent2Df size, XrColor4f color) {
+    if (out.count >= kMaxCalLayers || !sc)
+      return;
+    auto& q = out.quads[out.count];
+    q = {XR_TYPE_COMPOSITION_LAYER_QUAD};
+    q.layerFlags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT;
+    q.space = B.space;
+    q.eyeVisibility = XR_EYE_VISIBILITY_BOTH;
+    q.subImage.swapchain = sc;
+    q.subImage.imageRect = rect;
+    q.pose = pose;
+    q.size = size;
+    if (B.hasColorScaleBias && (color.r != 1.f || color.g != 1.f || color.b != 1.f || color.a != 1.f)) {
+      auto& t = out.tints[out.count];
+      t = {XR_TYPE_COMPOSITION_LAYER_COLOR_SCALE_BIAS_KHR};
+      t.colorScale = {color.r * color.a, color.g * color.a, color.b * color.a, color.a}; // premultiplied
+      q.next = &t;
+    }
+    ++out.count;
+  };
+  const auto across = [](float deg, float dist) { return 2.f * dist * std::tan(deg * 0.5f * kPi / 180.f); };
+  const bool hands = G.hands[0].tracked || G.hands[1].tracked;
+  {
+    std::lock_guard lock{g_placingMutex};
+    for (CalImage& ci : g_calImages) {
+      if (ci.gen == ci.shownGen || ci.img.width == 0)
+        continue;
+      if (ci.img.swapchain)
+        xrDestroySwapchain(ci.img.swapchain);
+      ci.img.swapchain = XR_NULL_HANDLE;
+      if (!upload_placing_image(ci.img))
+        Log.warn("Calibration picture unavailable");
+      ci.shownGen = ci.gen;
+    }
+    const auto picture = [&](PlacingImage& img, XrVector3f offset, float width) {
+      if (!img.swapchain)
+        return;
+      const XrVector3f pos = B.head + rot_y(offset, yaw);
+      add(img.swapchain, {{0, 0}, {static_cast<int32_t>(img.width), static_cast<int32_t>(img.height)}},
+          {facing(pos, B.head), pos}, {width, width * static_cast<float>(img.height) / static_cast<float>(img.width)},
+          {1.f, 1.f, 1.f, 1.f});
+    };
+    // The card: in the middle, or as a strip at the top while looking,
+    // over the legend.
+    picture(g_calImages[0].img, mode == 2 ? XrVector3f{0.f, 0.36f, -1.2f} : XrVector3f{0.f, 0.05f, -1.2f}, 0.62f);
+    if (mode == 2)
+      picture(hands && g_calImages[2].img.width > 0 ? g_calImages[2].img : g_calImages[1].img, {0.f, -0.42f, -1.1f},
+              0.32f);
+  }
+  // The camera's view, where the head looks.
+  if (mode == 2 && calibration_textures()) {
+    const XrQuaternionf pitch{std::sin(kCalPitch * 0.5f), 0.f, 0.f, std::cos(kCalPitch * 0.5f)};
+    const XrQuaternionf turn = qmul(B.headOrientation, pitch);
+    constexpr float kAt = 1.5f;
+    add(g_calView, {{0, 0}, {static_cast<int32_t>(kCalViewSize), static_cast<int32_t>(kCalViewSize)}},
+        {turn, B.head + qrot(turn, {0.f, 0.f, -kAt})}, {across(2.f * kCalViewDeg, kAt), across(2.f * kCalViewDeg, kAt)},
+        {1.f, 1.f, 1.f, 0.35f});
+  }
+  // The markers on the lights that rang, and their rings.
+  std::lock_guard lock{g_cal.mutex};
+  const int64_t now = steady_ns();
+  std::lock_guard pictures{g_placingMutex};
+  const PlacingImage& markers = g_calImages[3].img;
+  const int frames = markers.height > 0 ? static_cast<int>(markers.width / markers.height) : 0;
+  size_t rings = 0;
+  for (const CalLight& l : g_cal.lights) {
+    if (l.number == 0)
+      continue;
+    const float dist = std::max(vlen(l.pos - B.head), 0.3f);
+    const XrQuaternionf turn = facing(l.pos, B.head);
+    const float t = static_cast<float>(now - l.rungNs) / kCalRingNs;
+    if (t < 1.f && rings < kCalRingsMax && calibration_textures()) {
+      ++rings;
+      const float grow = 1.f - (1.f - t) * (1.f - t);
+      const float w = across(kCalRingDeg * (0.15f + 0.85f * grow), dist);
+      const float gold = std::clamp(t * 1.6f, 0.f, 1.f);
+      add(g_calRing, {{0, 0}, {static_cast<int32_t>(kCalRingSize), static_cast<int32_t>(kCalRingSize)}},
+          {turn, l.pos}, {w, w}, {1.f, 1.f - 0.24f * gold, 1.f - 0.85f * gold, 1.f - t * t});
+    }
+    if (frames <= 0 || !markers.swapchain || l.number > static_cast<int>(kCalMarkersMax))
+      continue;
+    const float p = static_cast<float>(now - l.pulseNs) / kCalPulseNs;
+    const float scale = l.pulseNs != 0 && p < 1.f ? 1.f + 0.5f * std::sin(p * kPi) : 1.f;
+    const float w = across(kCalMarkerDeg, dist) * scale;
+    const int f = std::min(l.number, frames) - 1;
+    const int32_t side = static_cast<int32_t>(markers.height);
+    add(markers.swapchain, {{f * side, 0}, {side, side}}, {turn, l.pos + vnorm(B.head - l.pos) * 0.01f}, {w, w},
+        {1.f, 1.f, 1.f, std::clamp((t - 0.3f) / 0.4f, 0.f, 1.f)});
+  }
 }
 
 #ifdef XR_META_environment_depth
@@ -7378,9 +7827,13 @@ std::string room_light_value(const RoomLight& r) {
                      r.stage, r.unlit, r.strength, r.yaw, r.shading, r.view, r.delight, r.gloss, r.keys, r.probes);
 }
 
+// aurora_xr_set_room_light_held: fights lit as Vanilla for now, the source
+// and its capture kept.
+std::atomic<bool> g_roomLightHeld{false};
+
 // The eye pipelines' variant bits (gfx::set_xr_room_light).
 void room_light_apply(const RoomLight& r) {
-  gfx::set_xr_room_light(r.source == 0 ? 0u
+  gfx::set_xr_room_light(r.source == 0 || g_roomLightHeld ? 0u
                                          : 1u | (r.shading == 1 ? 2u : 0u) | (static_cast<uint32_t>(r.view) & 3u) << 2 |
                                                (r.shading >= 2 ? 16u : 0u) | (r.shading == 3 ? 32u : 0u) |
                                                (r.gloss > 0.f && stage_gloss(g_roomStage) > 0.f ? 64u : 0u));
@@ -7420,7 +7873,9 @@ void init_room_light() {
   if (const char* path = std::getenv("AURORA_XR_ROOM_REPLAY"); path && *path && r.source == kRoomSourceCaptured) {
     auto& c = g_capture;
     uint32_t frames = 0;
-    {
+    if (const char* pace = std::getenv("AURORA_XR_ROOM_REPLAY_PACE"); pace && *pace) {
+      replay_paced(path, static_cast<uint32_t>(std::max(std::atoi(pace), 1)));
+    } else {
       std::lock_guard lock{c.estMutex};
       roomtone::replay(path, c.est, [&](const roomtone::ReplayEvent& e) { frames += e.kind == roomtone::ReplayEvent::Frame; });
       c.est.make();
@@ -9101,11 +9556,15 @@ bool render_xr_frame() {
   // Ambient capture in the menus, while the stage is placed and in a pause
   // (where the stage is placed again; not Slippi's, the match runs on).
   capture_ambient(!fight || placing > 0 || (g_fightPaused && g_matchStopped));
+  // A room light calibration: its lights, and the fight (the placement
+  // scene's) hidden under it.
+  calibration_frame();
+  const int calibrating = g_calibrating.load();
   room_survey_apply();
   spot_frame(fs.predictedDisplayTime);
   room_depth_frame(fs.predictedDisplayTime);
   density_frame();
-  behind_frame(fight && placing == 0);
+  behind_frame(fight && placing == 0 && calibrating == 0);
 
   // The passthrough, the shadow, the HUD and the 3D view, the HUD on top in
   // full VR, then the placing cards and the lasers.
@@ -9124,7 +9583,7 @@ bool render_xr_frame() {
   XrCompositionLayerColorScaleBiasKHR shadowTint{XR_TYPE_COMPOSITION_LAYER_COLOR_SCALE_BIAS_KHR};
   const bool shadow = build_shadow_layer(shadowQuad, shadowTint, fs.shouldRender && fight && roomShown);
   // The room's grade, while a fight that isn't held for placing shows over it.
-  grade_frame(fight && placing == 0 && roomShown);
+  grade_frame(fight && placing == 0 && calibrating == 0 && roomShown);
   int shadowIndex = -1;
   std::array<XrCompositionLayerProjectionView, 2> projViews{};
   std::array<XrCompositionLayerSpaceWarpInfoFB, 2> spaceWarp{};
@@ -9133,9 +9592,15 @@ bool render_xr_frame() {
   XrCompositionLayerQuad screenQuad{XR_TYPE_COMPOSITION_LAYER_QUAD};
   PointerLayers pointers;
   PlacingLayers placingLayers;
+  CalLayers calLayers;
+  static_assert(1 + kMaxCalLayers <= 5 + kMaxPlacingLayers + kMaxPointerLayers);
   XrCompositionLayerQuad panelQuad{XR_TYPE_COMPOSITION_LAYER_QUAD};
   const bool panel = build_dev_panel_layer(panelQuad);
-  if (fs.shouldRender && fight) {
+  if (fs.shouldRender && calibrating > 0) {
+    build_calibration_layers(calLayers, calibrating);
+    for (uint32_t i = 0; i < calLayers.count; ++i)
+      layers[layerCount++] = reinterpret_cast<const XrCompositionLayerBaseHeader*>(&calLayers.quads[i]);
+  } else if (fs.shouldRender && fight) {
     // Premultiplied alpha (no UNPREMULTIPLIED bit): the arena's coverage
     // hides the room, effects outside it add light over passthrough.
     // Multiview: one layer per eye. Otherwise the eyes sit side by side.
@@ -9551,6 +10016,7 @@ void teardown() {
     *sc = XR_NULL_HANDLE;
   }
   destroy_dev_panel();
+  destroy_calibration();
   {
     std::lock_guard lock{g_placingMutex};
     for (auto& clip : g_placingClips) {
@@ -12249,6 +12715,65 @@ extern "C" void aurora_xr_set_placing_image(int which, int width, int height, co
   img.rgba.assign(rgba, rgba + static_cast<size_t>(width) * height * 4);
 }
 
+extern "C" void aurora_xr_set_calibrating(int mode) {
+  using namespace aurora::xr;
+  mode = std::clamp(mode, 0, 2);
+  const int was = g_calibrating.exchange(mode);
+  if (was == 0 && mode != 0)
+    calibration_start();
+  else if (was != 0 && mode == 0)
+    calibration_stop();
+}
+
+extern "C" void aurora_xr_set_calibration_image(int which, int width, int height, const unsigned char* rgba) {
+  using namespace aurora::xr;
+  if (which < 0 || which >= static_cast<int>(g_calImages.size()) || width <= 0 || height <= 0 || !rgba)
+    return;
+  std::lock_guard lock{g_placingMutex};
+  CalImage& ci = g_calImages[which];
+  ci.img.width = static_cast<uint32_t>(width);
+  ci.img.height = static_cast<uint32_t>(height);
+  ci.img.rgba.assign(rgba, rgba + static_cast<size_t>(width) * height * 4);
+  ++ci.gen; // made again on the XR thread
+}
+
+extern "C" bool aurora_xr_calibration(AuroraXrCalibration* out) {
+  using namespace aurora::xr;
+  if (g_calibrating.load() == 0 || out == nullptr)
+    return false;
+  std::lock_guard lock{g_cal.mutex};
+  out->found = static_cast<int>(g_cal.lights.size());
+  out->rung = g_cal.rung;
+  out->dark = g_cal.dark;
+  out->changed = g_cal.changed;
+  return true;
+}
+
+extern "C" bool aurora_xr_calibration_ring(int* number, float pos[3]) {
+  using namespace aurora::xr;
+  std::lock_guard lock{g_cal.mutex};
+  if (g_cal.rings.empty())
+    return false;
+  const auto [n, p] = g_cal.rings.front();
+  g_cal.rings.pop_front();
+  *number = n;
+  pos[0] = p.x, pos[1] = p.y, pos[2] = p.z;
+  return true;
+}
+
+extern "C" void aurora_xr_set_room_light_held(bool vanilla) {
+  using namespace aurora::xr;
+  if (g_roomLightHeld.exchange(vanilla) == vanilla)
+    return;
+  RoomLight r;
+  {
+    std::lock_guard lock{g_room.mutex};
+    r = g_room.value;
+  }
+  room_light_apply(r);
+  Log.info("Room light: {}", vanilla ? "held at Vanilla for now" : "back to the setting");
+}
+
 extern "C" void aurora_xr_set_passthrough(bool on) { aurora::xr::g_passthroughWanted = on; }
 
 extern "C" void aurora_xr_set_stage_shadow(bool on) { aurora::xr::g_stageShadow = on ? 1 : 0; }
@@ -12322,6 +12847,11 @@ extern "C" int aurora_xr_room_capture_wanted(void) {
       what = "";
       frames = 0; // the estimate's own count
       c.ambientFrames = 0;
+    }
+    if (std::exchange(c.calibrationEnded, false)) {
+      make = log = true;
+      what = " (calibration)";
+      frames = 0;
     }
     casts = c.casts;
     mode = capture_mode_locked();
@@ -12430,6 +12960,7 @@ extern "C" void aurora_xr_room_capture_frame(const float* rgb, int cols, int row
     if (mode == 2)
       ++c.ambientFrames;
   }
+  c.restarts += r.restarted ? 1 : 0;
 }
 
 extern "C" void aurora_xr_set_stage_footprint(float xmin, float xmax, float zmin, float zmax, float ybottom) {
@@ -12578,6 +13109,25 @@ extern "C" bool aurora_xr_audio_listener(float m[3][4]) {
   for (int r = 0; r < 3; ++r)
     for (int c = 0; c < 4; ++c)
       m[r][c] = t[r * 4 + c];
+  return true;
+}
+
+extern "C" bool aurora_xr_audio_room(float m[3][4]) {
+  using namespace aurora::xr;
+  if (!active())
+    return false;
+  XrPosef head;
+  {
+    std::lock_guard lock{g_viewMutex};
+    if (!g_viewsValid)
+      return false;
+    head.orientation = B.headOrientation;
+    head.position = B.head;
+  }
+  const Mat4 v = view_from_pose(head);
+  for (int r = 0; r < 3; ++r)
+    for (int c = 0; c < 4; ++c)
+      m[r][c] = v[r * 4 + c];
   return true;
 }
 
