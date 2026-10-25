@@ -6772,8 +6772,9 @@ struct RoomLight {
 };
 
 // The fighters' share of GLOSS (tuned on the headset: at 1 they looked too
-// shiny, the stages' metal didn't; 0.5 still far too heavy, 2026-10-23).
-constexpr float kFighterGloss = 0.1f;
+// shiny, the stages' metal didn't; 0.5 still far too heavy, 2026-10-23; 0.1
+// still "shiny metal", 2026-10-25: it should be very subtle).
+constexpr float kFighterGloss = 0.03f;
 
 // The current stage (GrKind, aurora_xr_set_stage), for stage_gloss.
 std::atomic<int> g_roomStage{-1};

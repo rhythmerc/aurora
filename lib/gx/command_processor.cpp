@@ -21,6 +21,7 @@
 #include <xxhash.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <span>
@@ -234,8 +235,81 @@ static uint32_t sLinkTag = 0; // AURORA_XR_LINK_STATS: the game's GX link + 1 ("
 
 static void handle_draw(u8 cmd, ByteReader& reader) noexcept;
 static void handle_aurora(ByteReader& reader) noexcept;
+u64 decode_misses() noexcept;
+
+// AURORA_FIFO_PROBE=1: a frame whose commands kept the FIFO thread busy over
+// AURORA_FIFO_PROBE_MS (10) logs where it went (draws, Aurora's commands, the
+// rest), its slowest draw, and the decode misses and pipelines it made. (A
+// SpaceWarp late drop is the world's draws recorded late: on Yoshi's Story
+// every few seconds, the game thread done in time.)
+struct FifoProbe {
+  bool on = false;
+  int64_t thresholdNs = 10'000'000;
+  uint64_t seq = UINT64_MAX;
+  int64_t busyNs = 0, drawNs = 0, auroraNs = 0;
+  uint32_t draws = 0;
+  int64_t slowestNs = 0;
+  u16 slowestVerts = 0;
+  u8 slowestCmd = 0;
+  uint32_t slowestLink = 0;
+  u64 missesAt = 0;
+  uint32_t pipelinesAt = 0;
+  int logged = 0;
+  int64_t windowNs = 0;
+} sFifoProbe;
+
+static int64_t probe_now() noexcept {
+  return std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch())
+      .count();
+}
+
+// A new frame's commands: the last frame's line, if it was slow.
+static void fifo_probe_frame(int64_t now) noexcept {
+  auto& p = sFifoProbe;
+  const uint64_t seq = gfx::detail::recording_seq();
+  if (seq == p.seq)
+    return;
+  if (p.seq != UINT64_MAX && p.busyNs > p.thresholdNs) {
+    if (now - p.windowNs > 10'000'000'000) {
+      p.windowNs = now;
+      p.logged = 0;
+    }
+    if (p.logged++ < 12)
+      Log.info("FIFO probe: {:.1f} ms busy (draws {:.1f} in {}, Aurora's commands {:.1f}, the rest {:.1f}); slowest "
+               "draw {:.2f} ms ({} vertices, command 0x{:02X}, link {}); {} decode misses, {} pipelines made",
+               p.busyNs / 1e6, p.drawNs / 1e6, p.draws, p.auroraNs / 1e6, (p.busyNs - p.drawNs - p.auroraNs) / 1e6,
+               p.slowestNs / 1e6, p.slowestVerts, p.slowestCmd, static_cast<int>(p.slowestLink) - 1,
+               decode_misses() - p.missesAt, gfx::pipelines_created() - p.pipelinesAt);
+  }
+  p.seq = seq;
+  p.busyNs = p.drawNs = p.auroraNs = p.slowestNs = 0;
+  p.draws = 0;
+  p.missesAt = decode_misses();
+  p.pipelinesAt = gfx::pipelines_created();
+}
+
+static ProcessResult process_commands(const u8* data, u32 size) noexcept;
 
 ProcessResult process(const u8* data, u32 size) noexcept {
+  auto& p = sFifoProbe;
+  static const bool on = [] {
+    const char* v = std::getenv("AURORA_FIFO_PROBE");
+    const char* ms = std::getenv("AURORA_FIFO_PROBE_MS");
+    if (ms != nullptr && std::atof(ms) > 0)
+      sFifoProbe.thresholdNs = static_cast<int64_t>(std::atof(ms) * 1e6);
+    return v != nullptr && *v == '1';
+  }();
+  p.on = on;
+  if (!on)
+    return process_commands(data, size);
+  const int64_t start = probe_now();
+  fifo_probe_frame(start);
+  const ProcessResult result = process_commands(data, size);
+  p.busyNs += probe_now() - start;
+  return result;
+}
+
+static ProcessResult process_commands(const u8* data, u32 size) noexcept {
   ZoneScoped;
   ByteReader reader{{data, size}};
 
@@ -314,7 +388,13 @@ ProcessResult process(const u8* data, u32 size) noexcept {
     }
 
     case GX_AURORA: {
-      handle_aurora(reader);
+      if (sFifoProbe.on) {
+        const int64_t start = probe_now();
+        handle_aurora(reader);
+        sFifoProbe.auroraNs += probe_now() - start;
+      } else {
+        handle_aurora(reader);
+      }
       break;
     }
 
@@ -1038,6 +1118,9 @@ void sweep_decode_cache() noexcept {
   }
 }
 } // namespace
+
+// The decode cache's misses so far (the FIFO probe's count).
+u64 decode_misses() noexcept { return sDecodeCache.misses; }
 
 // `raw`'s key, reusing the one the merge check just worked out. The decode
 // takes it (`take`): it's for that draw only, and a later draw's data could
@@ -2373,7 +2456,23 @@ static void draw_prim(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, ByteReader& 
 static void handle_draw(u8 cmd, ByteReader& reader) noexcept {
   const auto fmt = static_cast<GXVtxFmt>(cmd & CP_VAT_MASK);
   const auto prim = static_cast<GXPrimitive>(cmd & CP_OPCODE_MASK);
-  draw_prim(prim, fmt, reader.read<u16>(), reader);
+  const u16 vtxCount = reader.read<u16>();
+  auto& p = sFifoProbe;
+  if (!p.on) {
+    draw_prim(prim, fmt, vtxCount, reader);
+    return;
+  }
+  const int64_t start = probe_now();
+  draw_prim(prim, fmt, vtxCount, reader);
+  const int64_t ns = probe_now() - start;
+  p.drawNs += ns;
+  ++p.draws;
+  if (ns > p.slowestNs) {
+    p.slowestNs = ns;
+    p.slowestVerts = vtxCount;
+    p.slowestCmd = cmd;
+    p.slowestLink = sLinkTag;
+  }
 }
 
 void handle_aurora(ByteReader& reader) noexcept {
