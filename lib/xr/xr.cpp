@@ -252,6 +252,10 @@ struct DynamicResolution {
   double marginNs = 0;                    // their 5th percentile (with 30 or more)
   bool haveMargin = false;
   double restNs = 0;        // frame GPU time outside the eye pass, running
+  // This step's readings, spikes included (the average leaves them out):
+  // a step up must fit its tail too (dynres_tail_fits).
+  std::array<float, 90> tail{};
+  size_t tailCount = 0, tailNext = 0;
   int level = 0;            // the current step: scale = minScale + level * kDynresStep
   uint64_t seenSeq = 0;     // R.timing.frameSeq last read
   int settle = 0;           // frames measured since the last scale change
@@ -2334,6 +2338,9 @@ struct PaceProbe {
   std::vector<std::pair<uint8_t, bool>> lateness; // latency drawn at, done over 1 ms after its release
   std::vector<float> idealMargins;           // ns from GPU done to the ideal latency's slot, for g_dynres
   std::vector<std::string> spikes;           // frames done after their slot, by hop (logged, a few)
+  std::vector<std::string> drops;            // SpaceWarp's late drops, by hop (logged, a few)
+  uint64_t lastSubmitTick = 0;               // render worker: the last 3D frame submitted, its tick
+  int64_t lastSubmitNs = 0;                  // ... and when
   uint32_t lateFrames = 0;                   // done over 1 ms after their slot (logged)
   bool started = false;
 } g_pace;
@@ -2439,11 +2446,32 @@ void pace_frame(int64_t recordStartNs, int64_t worldEndNs, int64_t gameDoneNs, i
   g_pace.slotWaitNs = 0;
 }
 
+// SpaceWarp's late drop (render_eyes): where the dropped frame's time went,
+// ms after its tick (its XR loop's start, `tickNs`): the game woken, its
+// recording started, its world recorded, the render worker's last submit
+// (of which tick), and the eyes about to start. Only submitted frames reach
+// the pacing probe, so without this the drops' cause isn't in the log.
+void pace_note_drop(uint64_t tickFrame, int64_t tickNs) {
+  const int64_t now = monotonic_ns();
+  std::lock_guard lock{g_pace.mutex};
+  if (g_pace.drops.size() >= 8)
+    return;
+  const auto& d = g_pace.displays[tickFrame % g_pace.displays.size()];
+  const auto ms = [&](int64_t ns) { return ns != 0 ? static_cast<float>(ns - tickNs) / 1e6f : -1.f; };
+  g_pace.drops.push_back(fmt::format(
+      "[woken {:.1f} recording {:.1f} world recorded {:.1f} last submit {:.1f} (tick {:+d}) eyes {:.1f}]",
+      ms(d.frame == tickFrame ? d.wakeNs : 0), ms(g_pace.next[0]), ms(g_pace.next[1]), ms(g_pace.lastSubmitNs),
+      g_pace.lastSubmitTick != 0 ? static_cast<int>(static_cast<int64_t>(g_pace.lastSubmitTick - tickFrame)) : 0,
+      ms(now)));
+}
+
 // The render worker's 3D image for `tickFrame`, submitted now (fd: a dup of
 // its Dawn sync fd, owned from here).
 void pace_submit(uint64_t tickFrame, int fd) {
 #ifdef __ANDROID__
   std::lock_guard lock{g_pace.mutex};
+  g_pace.lastSubmitTick = tickFrame;
+  g_pace.lastSubmitNs = monotonic_ns();
   if (!g_pace.started) {
     std::thread(pace_watch).detach();
     g_pace.started = true;
@@ -2471,6 +2499,13 @@ std::string pace_summary() {
     std::nth_element(v.begin(), v.begin() + static_cast<std::ptrdiff_t>(i), v.end());
     return v[i];
   };
+  if (!g_pace.drops.empty()) {
+    std::string drops;
+    for (const auto& d : g_pace.drops)
+      drops += " " + d;
+    Log.info("Frames dropped late (ms after the tick):{}", drops);
+    g_pace.drops.clear();
+  }
   if (g_pace.ms[PaceProbe::Done].empty())
     return {};
   static constexpr const char* kNames[] = {"woken",    "recording", "world recorded", "game done",
@@ -6788,13 +6823,23 @@ constexpr int kRoomSourceCaptured = static_cast<int>(kRoomPresets.size()) + 1;
 // The launcher's Lighting > Roomtone (Beta): the room capture, lit as the
 // user tuned it on the headset (AURORA_XR_ROOM_LIGHT=4,1,1,1,1,0,3,0,1,1,1,0,
 // 2026-10-24: the rest are RoomLight's defaults).
-const RoomLight kRoomtone = [] {
-  RoomLight r;
-  r.source = kRoomSourceCaptured;
-  r.unlit = 1.f;
-  r.shading = 3; // smooth normals where meshes have none
+// AURORA_XR_ROOMTONE_SHADING (0-3, as AURORA_XR_ROOM_LIGHT's shading) tries
+// another: FACET (2) makes its normals on the GPU, where SMOOTH's are made on
+// the CPU for every stage draw without its own, each frame (and only SMOOTH
+// divides out the stages' baked light). Read when first asked for: the
+// platform's env file is applied after static initialization.
+const RoomLight& roomtone() {
+  static const RoomLight r = [] {
+    RoomLight l;
+    l.source = kRoomSourceCaptured;
+    l.unlit = 1.f;
+    l.shading = 3; // smooth normals where meshes have none
+    if (const char* v = std::getenv("AURORA_XR_ROOMTONE_SHADING"))
+      l.shading = std::clamp(std::atoi(v), 0, 3);
+    return l;
+  }();
   return r;
-}();
+}
 
 // The points the light is made for (room_frame's ProbeGrid), each lifted
 // to about a fighter's middle (kCapLift, game units, so it scales with the
@@ -7349,7 +7394,7 @@ void init_room_light() {
   // The launcher's Lighting: Roomtone is the room capture with these
   // settings (tuned on the headset).
   if (g_config.xrRoomLight == 1)
-    r = kRoomtone;
+    r = roomtone();
   if (const char* v = std::getenv("AURORA_XR_ROOM_LIGHT")) {
     float f[12] = {0.f, r.fighters, r.stage, r.unlit, r.strength, r.yaw, 0.f, 0.f, r.delight, r.gloss, r.keys, 0.f};
     std::sscanf(v, "%f,%f,%f,%f,%f,%f,%f,%f,%f,%f,%f,%f", &f[0], &f[1], &f[2], &f[3], &f[4], &f[5], &f[6], &f[7],
@@ -7404,7 +7449,7 @@ void init_room_light() {
 // game's own, 1 Roomtone (the room capture, kept from before if there was
 // one), as init_room_light makes them.
 void set_room_light_mode(int mode) {
-  const RoomLight r = mode == 1 ? kRoomtone : RoomLight{};
+  const RoomLight r = mode == 1 ? roomtone() : RoomLight{};
   {
     std::lock_guard lock{g_room.mutex};
     g_room.value = g_room.defaults = r;
@@ -10532,6 +10577,7 @@ namespace {
 constexpr double kDynresFullSamples = 30;  // samples for full trust in a step
 constexpr double kDynresForget = 1200;     // frames for a step's trust to fall to 1/e (20 s)
 constexpr int kDynresUpDwell = 30;         // frames between steps up
+constexpr double kDynresTailShare = 0.9;   // the tail a step up must fit: the slowest tenth of frames
 
 double dynres_trust(const DynresCost& c, uint64_t frame) {
   if (c.samples <= 0)
@@ -10541,6 +10587,26 @@ double dynres_trust(const DynresCost& c, uint64_t frame) {
 }
 
 float dynres_scale(int level) { return g_dynres.minScale + kDynresStep * static_cast<float>(level); }
+
+// Whether step `to` fits the target with this step's slow frames, the
+// readings at the kDynresTailShare percentile, their eye pass scaled by
+// pixels. The average alone (spikes left out) had Battlefield climb from
+// 1.08 to 1.27 until its spikes reached 10-12 ms and frames went stale
+// (2026-10-25). Too few readings yet: no.
+bool dynres_tail_fits(int to) {
+  const auto& dr = g_dynres;
+  if (dr.tailCount < 45)
+    return false;
+  std::array<float, 90> sorted{};
+  std::copy_n(dr.tail.begin(), dr.tailCount, sorted.begin());
+  const size_t at = std::min(dr.tailCount - 1, static_cast<size_t>(kDynresTailShare * static_cast<double>(dr.tailCount)));
+  std::nth_element(sorted.begin(), sorted.begin() + static_cast<std::ptrdiff_t>(at),
+                   sorted.begin() + static_cast<std::ptrdiff_t>(dr.tailCount));
+  const double ns = sorted[at];
+  const double from = dynres_scale(dr.level), next = dynres_scale(to);
+  const double eye = std::max(ns - dr.restNs, 0.0);
+  return dr.restNs + eye * (next * next) / (from * from) <= dr.targetNs;
+}
 
 int dynres_levels() {
   const auto& dr = g_dynres;
@@ -10711,6 +10777,10 @@ void update_dynamic_resolution(bool missed) {
       if (!spike)
         dr.spikeRun = 0;
       ++dr.readings;
+      if (dr.settle > 4 && !compiling && dr.transientFrom < 0 && ns >= 2.0e6) {
+        dr.tail[dr.tailNext++ % dr.tail.size()] = static_cast<float>(ns);
+        dr.tailCount = std::min(dr.tailCount + 1, dr.tail.size());
+      }
       if (++dr.settle <= 4) {
         ++dr.skipSettle;
       } else if (compiling) {
@@ -10880,7 +10950,7 @@ void update_dynamic_resolution(bool missed) {
             break;
           }
       } else if (++dr.sinceStep >= kDynresUpDwell && dr.level + 1 < levels && (dr.haveMargin || dr.fixedTarget) &&
-                 predicted[dr.level + 1] <= dr.targetNs) {
+                 predicted[dr.level + 1] <= dr.targetNs && dynres_tail_fits(dr.level + 1)) {
         next = dr.level + 1;
       }
     }
@@ -10894,9 +10964,10 @@ void update_dynamic_resolution(bool missed) {
       dr.emaNs = 0;
       dr.settle = 0;
       dr.sinceStep = 0;
-      // Margins at the old step say nothing about this one.
+      // Margins and slow frames at the old step say nothing about this one.
       dr.marginCount = dr.marginNext = 0;
       dr.haveMargin = false;
+      dr.tailCount = dr.tailNext = 0;
     }
     dr.scale = dynres_scale(dr.level);
   }
@@ -11506,6 +11577,7 @@ bool render_eyes(const wgpu::CommandEncoder& cmd, gfx::detail::FramePacket& fram
     if (drop) {
       R.missedStereo = true;
       ++g_appSwDropped;
+      pace_note_drop(R.renderedTick, tickNs);
       g_skipPresent = !env_flag("AURORA_XR_FIGHT_SCREEN", false);
       return false;
     }
