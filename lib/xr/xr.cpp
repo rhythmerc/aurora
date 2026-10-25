@@ -6795,6 +6795,22 @@ float stage_gloss(int grkind) {
   }
 }
 
+// A stage's own tuning of the room's light, multiplying STRENGTH, KEY and
+// GLOSS while it plays (set by eye on the headset with the dev tools'
+// Light page, defaults otherwise). Corneria: the Great Fox's broad hull
+// took the key lights far too brightly (2026-10-25).
+struct StageLightTune {
+  float strength = 1.f, keys = 1.f, gloss = 1.f;
+};
+StageLightTune stage_light_tune(int grkind) {
+  switch (grkind) {
+  case 0x0E: // Corneria
+    return {0.65f, 0.35f, 0.5f};
+  default:
+    return {};
+  }
+}
+
 struct {
   std::mutex mutex;
   RoomLight value, defaults;
@@ -8075,6 +8091,11 @@ RoomFrame room_frame(const std::array<float, 16>& arena) {
     if (r.source != kRoomSourceCaptured)
       cap.sh.fill(g_room.sh[r.source - 1]);
   }
+  // The stage's own tuning, on top (the dev tools' values are the room's).
+  const StageLightTune tune = stage_light_tune(g_roomStage);
+  r.strength *= tune.strength;
+  r.keys *= tune.keys;
+  r.gloss *= tune.gloss;
   cap.grid = probe_grid(arena, r.probes == 1);
   if (static std::array<int, 3> logged{}; cap.grid.n != logged) {
     logged = cap.grid.n;
