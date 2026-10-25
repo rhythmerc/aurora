@@ -1014,9 +1014,46 @@ struct DecodeCache {
   u64 predicted = 0, looked = 0; // logged with the hits
   size_t bytes = 0;
   u32 sweptFrame = 0;
-  u64 hits = 0, misses = 0, hitBytes = 0, mismatches = 0;
+  u64 hits = 0, misses = 0, hitBytes = 0, mismatches = 0, unstored = 0;
   u32 loggedFrame = 0;
+  // Keys missed once lately (their low halves): a second miss stores one.
+  // Two generations, the older dropped every kDecodeGhostFrames; exact
+  // sets, open addressed (by low bits, two keys sharing a slot each evicted
+  // the other every frame, and neither was ever stored).
+  struct Ghosts {
+    std::vector<u64> slots = std::vector<u64>(1u << 15);
+    size_t count = 0;
+    bool insert(u64 lo) noexcept { // false when already in
+      lo |= 1; // 0 is an empty slot
+      const size_t mask = slots.size() - 1;
+      for (size_t i = (lo >> 17) & mask;; i = (i + 1) & mask) {
+        if (slots[i] == lo)
+          return false;
+        if (slots[i] == 0) {
+          slots[i] = lo;
+          ++count;
+          return true;
+        }
+      }
+    }
+    bool contains(u64 lo) const noexcept {
+      lo |= 1;
+      const size_t mask = slots.size() - 1;
+      for (size_t i = (lo >> 17) & mask; slots[i] != 0; i = (i + 1) & mask)
+        if (slots[i] == lo)
+          return true;
+      return false;
+    }
+    void clear() noexcept {
+      std::fill(slots.begin(), slots.end(), 0);
+      count = 0;
+    }
+  };
+  std::array<Ghosts, 2> ghosts{};
+  u32 ghostFlip = 0;
 };
+// A key missed again within this many to twice this many frames is stored.
+constexpr u32 kDecodeGhostFrames = 60;
 DecodeCache sDecodeCache;
 // The entry push_decoded_vertices last used, and the draw it was for: the
 // clip classification of the same draw follows it (push_gx_draw).
@@ -1094,7 +1131,7 @@ DecodeKey decode_key(const ShaderConfig& config, const u8* raw, u16 vtxCount) no
 
 // Every few seconds, and at once past the budget: entries unused for two
 // seconds go (a table of stale entries makes every lookup slower), then, if
-// still over the budget, everything not used this frame.
+// still over the budget, everything not used in the last two frames.
 void sweep_decode_cache() noexcept {
   auto& c = sDecodeCache;
   const u32 now = g_gxState.frameSerial;
@@ -1104,7 +1141,9 @@ void sweep_decode_cache() noexcept {
   c.order.clear();
   c.lastOrder.clear();
   sLastDecode = {};
-  for (u32 age : {120u, 1u}) {
+  // Entries used in the last two frames stay whatever the budget: the
+  // frame's own draws (none used yet as it sweeps) and the last one's.
+  for (u32 age : {120u, 3u}) {
     for (auto it = c.entries.begin(); it != c.entries.end();) {
       if (now - it->second.lastFrame >= age) {
         c.bytes -= it->second.bytes.size();
@@ -1198,6 +1237,23 @@ static gfx::Range push_decoded_vertices(const ShaderConfig& config, const u8* ra
   } else {
     decode_vertices(config, layout, raw, vtxCount, base);
     ++c.misses;
+    // Stored on the key's second miss within kDecodeGhostFrames only. A
+    // draw whose vertices change every frame (some 190 a frame on Yoshi's
+    // Story) left an entry each frame, never used again, until a sweep over
+    // the budget emptied the whole cache and the frame after decoded every
+    // draw again: a 23 ms FIFO frame every 2.5 s on the Quest, its world
+    // recorded too late for SpaceWarp (2026-10-25).
+    if (now - c.ghostFlip >= kDecodeGhostFrames || c.ghosts[0].count > c.ghosts[0].slots.size() / 2) {
+      c.ghostFlip = now;
+      std::swap(c.ghosts[0], c.ghosts[1]);
+      c.ghosts[0].clear();
+    }
+    if (!c.ghosts[1].contains(key.lo) && c.ghosts[0].insert(key.lo)) {
+      ++c.unstored;
+      c.order.push_back(nullptr); // keeps the next draws' predicted places
+      sLastDecode = {raw, vtxCount, now, nullptr};
+      return range;
+    }
     auto& e = c.entries[key];
     c.bytes += size - e.bytes.size();
     e.key = key;
@@ -1213,11 +1269,11 @@ static gfx::Range push_decoded_vertices(const ShaderConfig& config, const u8* ra
   }();
   if (stats && now - c.loggedFrame >= 600) {
     c.loggedFrame = now;
-    Log.info("Decoded-vertex cache: {} hits ({:.1f} MiB; {} predicted, {} looked up), {} misses, {} mismatches; "
-             "{} entries, {:.1f} MiB",
-             c.hits, static_cast<double>(c.hitBytes) / (1 << 20), c.predicted, c.looked, c.misses, c.mismatches,
-             c.entries.size(), static_cast<double>(c.bytes) / (1 << 20));
-    c.hits = c.misses = c.hitBytes = c.predicted = c.looked = 0;
+    Log.info("Decoded-vertex cache: {} hits ({:.1f} MiB; {} predicted, {} looked up), {} misses ({} not stored: "
+             "first seen), {} mismatches; {} entries, {:.1f} MiB",
+             c.hits, static_cast<double>(c.hitBytes) / (1 << 20), c.predicted, c.looked, c.misses, c.unstored,
+             c.mismatches, c.entries.size(), static_cast<double>(c.bytes) / (1 << 20));
+    c.hits = c.misses = c.hitBytes = c.predicted = c.looked = c.unstored = 0;
   }
   return range;
 }
