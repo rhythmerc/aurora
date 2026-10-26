@@ -173,6 +173,8 @@ struct Stream {
   bool ownFormat = false; // keeps its own format (not the color swapchains' sRGB one)
   bool unwaited = false;  // render worker: its slot was taken before the XR thread waited it
   bool dumped = false;
+  uint64_t dumpBAt = 0; // AURORA_XR_DUMP_AB: the Vanilla dump's release
+  bool dumpB = false;
   // Staged (create_ring): the render worker draws into images of ours, never
   // the runtime's, and the XR thread copies each into a swapchain image as
   // it hands it over (release_staged). Ring slots are Free, Rendering, Ready,
@@ -1854,7 +1856,7 @@ bool create_dump_buffer(Stream& st) {
 
 void write_dump(const Stream& st) {
   const auto* px = static_cast<const uint8_t*>(st.dumpPtr);
-  const std::string base = B.dumpDir + "/xr_" + st.name;
+  const std::string base = B.dumpDir + "/xr_" + st.name + (st.dumpB ? "_b" : "");
   if (FILE* f = std::fopen((base + ".ppm").c_str(), "wb")) {
     std::fprintf(f, "P6\n%u %u\n255\n", st.width, st.height * st.layers);
     for (size_t i = 0; i < static_cast<size_t>(st.width) * st.height * st.layers; ++i)
@@ -1868,6 +1870,19 @@ void write_dump(const Stream& st) {
     std::fclose(f);
   }
   Log.info("Dumped {} to {}.ppm", st.name, base);
+}
+
+// AURORA_XR_DUMP_AB=1: after the 3D dump (room light as set), Vanilla, and
+// a second dump (xr_3d_b) a few releases later (a pipeline the switch needs
+// can delay it).
+void dump_ab(Stream& st) {
+  static const bool ab = std::getenv("AURORA_XR_DUMP_AB") != nullptr;
+  if (!ab || st.dumpB || &st != &g_streams[kStereo])
+    return;
+  aurora_xr_set_room_light_held(true);
+  st.dumpB = true;
+  st.dumped = false;
+  st.dumpBAt = st.releases + 3;
 }
 
 // ---------------------------------------------------------------- XR thread: controller input
@@ -2135,6 +2150,7 @@ void retire_slot(Stream& st, Slot& s, int index) {
     st.dumpSlot = -1;
     st.dumped = true;
     write_dump(st);
+    dump_ab(st);
   }
 }
 
@@ -2844,7 +2860,7 @@ bool release_ready(Stream& st, bool& released) {
                                                    : VK_IMAGE_ASPECT_DEPTH_BIT;
     const VkImageLayout from = fromDawn.newLayout != VK_IMAGE_LAYOUT_UNDEFINED ? fromDawn.newLayout : home;
     const bool dumpNow = !st.ownFormat && !B.dumpDir.empty() && !st.dumped && st.dumpSlot < 0 &&
-                         st.releases >= static_cast<uint64_t>(env_float("AURORA_XR_DUMP_AFTER", 300.f)) &&
+                         st.releases >= (st.dumpBAt ? st.dumpBAt : static_cast<uint64_t>(env_float("AURORA_XR_DUMP_AFTER", 300.f))) &&
                          (st.dumpBuf || create_dump_buffer(st));
     const bool record = dumpNow || from != home;
     if (record) {
@@ -2923,6 +2939,7 @@ bool release_staged(Stream& st, bool& released) {
       st.dumpRing = -1;
       st.dumped = true;
       write_dump(st);
+      dump_ab(st);
     }
     std::lock_guard lock{g_mutex};
     r.inFlight = false; // read by the render worker under g_mutex (take_slot_locked)
@@ -3066,7 +3083,7 @@ bool release_staged(Stream& st, bool& released) {
                    VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
     VkImageLayout layout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
     const bool dumpNow = !st.ownFormat && !B.dumpDir.empty() && !st.dumped && st.dumpRing < 0 &&
-                         st.releases >= static_cast<uint64_t>(env_float("AURORA_XR_DUMP_AFTER", 300.f)) &&
+                         st.releases >= (st.dumpBAt ? st.dumpBAt : static_cast<uint64_t>(env_float("AURORA_XR_DUMP_AFTER", 300.f))) &&
                          (st.dumpBuf || create_dump_buffer(st));
     if (dumpNow) {
       const auto toSrc = barrier(s.image, layout, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_ACCESS_TRANSFER_WRITE_BIT,
@@ -10582,7 +10599,8 @@ static_assert(gfx::XrMaxClipPlanes == AURORA_XR_MAX_CLIPS && gfx::XrMaxClipPlane
 // game camera space), then last frame's own (from last frame's).
 // Then the room light's fields (shader.cpp's XrEye: room_m to room_probe).
 constexpr uint64_t kMultiviewEyeSize = 2 * 64 + 16 + gfx::XrMaxClipPlanes * 16 + gfx::XrMaxClipPlanes * 4 + 4 * 64 +
-                                       64 + 4 * 16 + kCapPoints * 9 * 16 + 4 * 16 + 2 * 16 + 2 * 16 + 4 * 16;
+                                       64 + 4 * 16 + kCapPoints * 9 * 16 + 4 * 16 + 2 * 16 + 2 * 16 + 4 * 16 +
+                                       gfx::XrRoomEmitters * 5 * 16;
 
 struct Renderer3D {
   uint64_t layoutKey = 0;
@@ -11850,6 +11868,11 @@ bool render_eyes(const wgpu::CommandEncoder& cmd, gfx::detail::FramePacket& fram
     // point, its blend).
     float roomLp[2][4];
     float roomProbe[4][4];
+    // The stage's emitters (the frame's xrEmitters) in game camera space:
+    // each its box's centre (w its reach squared) and three half axes, then
+    // the colours (w 1 when there).
+    float roomEbox[gfx::XrRoomEmitters][4][4];
+    float roomEcol[gfx::XrRoomEmitters][4];
   } mv[gfx::XrMaxTransforms]{};
   static_assert(sizeof(mv[0]) == kMultiviewEyeSize);
   std::array<Mat4, gfx::XrMaxTransforms> worldToRoom{}, cameraToRoom{};
@@ -12026,6 +12049,25 @@ bool render_eyes(const wgpu::CommandEncoder& cmd, gfx::detail::FramePacket& fram
               u.roomLp[l][c] = v[c] * k;
             u.roomLp[l][3] = 0.f;
           }
+        }
+        // The emitters: their boxes from the game's world into its camera
+        // space (the frame's view), the reach scaling as the box does.
+        for (int e = 0; e < gfx::XrRoomEmitters; ++e) {
+          const auto& em = frame.xrEmitters[e];
+          if (em[9] <= 0.f)
+            continue;
+          const auto& v = frame.xrWorldView;
+          float c[3], h[3];
+          for (int k = 0; k < 3; ++k)
+            c[k] = (em[k] + em[3 + k]) * 0.5f, h[k] = (em[3 + k] - em[k]) * 0.5f;
+          for (int r = 0; r < 3; ++r) {
+            u.roomEbox[e][0][r] = v[r * 4] * c[0] + v[r * 4 + 1] * c[1] + v[r * 4 + 2] * c[2] + v[r * 4 + 3];
+            for (int a = 0; a < 3; ++a)
+              u.roomEbox[e][1 + a][r] = v[r * 4 + a] * h[a];
+          }
+          u.roomEbox[e][0][3] = em[9] * em[9];
+          std::copy_n(&em[6], 3, u.roomEcol[e]);
+          u.roomEcol[e][3] = 1.f;
         }
         for (int eye = 0; eye < 2; ++eye) {
           const XrVector3f p = views[eye].pose.position;

@@ -130,6 +130,10 @@ void xr_set_world_transform(const float* m3x4);
 // The point (game world) the following draws take the room light's SH at,
 // instead of each vertex's place; null = none.
 void xr_set_light_probe(const float* pos);
+// FIFO thread: part of the room light's stage emitter `slot` this frame
+// (game world box lo, hi), with its colour and reach (game units): the
+// frame's emitter covers every part's box.
+void xr_add_emitter(int slot, const float* lo, const float* hi, const float* rgb, float reach) noexcept;
 // Clip plane (game world, 4 floats) then its fade band (game units, 0 = hard)
 // for the following world draws; null = none.
 void xr_set_world_clip(const float* plane);

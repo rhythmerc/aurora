@@ -46,6 +46,11 @@ constexpr int XrTransformFloats = 12 + XrClipFloats + XrProbeFloats;
 // The room light's probes (lib/xr's grid, the shader's room_sh): at most
 // this many points, nine SH coefficients each.
 constexpr int XrRoomProbes = 36;
+// The room light's stage emitters (glowing surfaces lighting the stage):
+// a frame's at most, and each one's floats (game world box lo and hi, its
+// colour, its reach in game units).
+constexpr int XrRoomEmitters = 2;
+constexpr int XrEmitterFloats = 10;
 
 using BindGroupRef = HashType;
 using PipelineRef = HashType;

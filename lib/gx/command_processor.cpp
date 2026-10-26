@@ -16,7 +16,10 @@
 #include "regs.hpp"
 #include "shader_info.hpp"
 #include "texture.hpp"
+#include "../gfx/texture_convert.hpp"
 
+#include <absl/container/flat_hash_map.h>
+#include <absl/container/flat_hash_set.h>
 #include <tracy/Tracy.hpp>
 #include <xxhash.h>
 
@@ -608,6 +611,8 @@ static bool xr_additive(const PipelineConfig& c) noexcept {
 // the fit up over the fit at its normal: the baked light divided out, as
 // the light from above; as much of it as the fit explains). AURORA_XR_ROOM_FIT=0
 // leaves it out (an A/B). aurora_xr_set_stage starts another.
+// The same window gathers the faces of the stage's translucent draws for
+// their soft normals (smooth_normals).
 struct RoomFit {
   u32 epoch = 0; // gfx::xr_room_fit_epoch() it's for
   u32 gen = 1;   // in the smooth draws' decode key
@@ -617,8 +622,59 @@ struct RoomFit {
   u32 draws = 0, lastAdd = 0;
   float c[4]{};
   float trust = 0.f; // how much of the fit is used, by how much it explains
+  // Soft normals: each translucent face once (by its points), as its mesh
+  // (position array), centre and normal at twice its area; when frozen,
+  // each mesh's radius and the faces sorted into cells of that size, with
+  // each cell's run of them.
+  struct SoftFace {
+    u64 mesh, cell = 0;
+    std::array<float, 3> c, a;
+  };
+  absl::flat_hash_set<u64> softSeen;
+  std::vector<SoftFace> soft;
+  absl::flat_hash_map<u64, float> softRadius;
+  absl::flat_hash_map<u64, std::pair<u32, u32>> softCells;
 };
 RoomFit sRoomFit;
+
+// The soft normals' cell holding `p`, moved by `d` cells.
+static u64 room_soft_cell(u64 mesh, const std::array<float, 3>& p, float radius,
+                          const std::array<s32, 3>& d = {}) noexcept {
+  const std::array<s32, 3> c{static_cast<s32>(std::floor(p[0] / radius)) + d[0],
+                             static_cast<s32>(std::floor(p[1] / radius)) + d[1],
+                             static_cast<s32>(std::floor(p[2] / radius)) + d[2]};
+  return XXH3_64bits_withSeed(c.data(), sizeof(c), mesh);
+}
+
+// A soft normal's reach: an eighth of its mesh's extent (Kongo Jungle's
+// foam: wide enough to pass over its ribbons' folds, not so wide that the
+// river's top and the falls' face run together).
+static void room_soft_freeze(RoomFit& f) noexcept {
+  absl::flat_hash_map<u64, std::array<float, 6>> box;
+  for (const auto& sf : f.soft) {
+    auto [it, fresh] = box.try_emplace(sf.mesh, std::array{sf.c[0], sf.c[1], sf.c[2], sf.c[0], sf.c[1], sf.c[2]});
+    for (int k = 0; k < 3; ++k) {
+      it->second[k] = std::min(it->second[k], sf.c[k]);
+      it->second[k + 3] = std::max(it->second[k + 3], sf.c[k]);
+    }
+  }
+  for (const auto& [mesh, b] : box) {
+    const float dx = b[3] - b[0], dy = b[4] - b[1], dz = b[5] - b[2];
+    f.softRadius[mesh] = std::max(std::sqrt(dx * dx + dy * dy + dz * dz) / 8.f, 1e-3f);
+  }
+  for (auto& sf : f.soft)
+    sf.cell = room_soft_cell(sf.mesh, sf.c, f.softRadius[sf.mesh]);
+  std::sort(f.soft.begin(), f.soft.end(), [](const auto& a, const auto& b) { return a.cell < b.cell; });
+  for (u32 i = 0; i < f.soft.size();) {
+    u32 j = i + 1;
+    while (j < f.soft.size() && f.soft[j].cell == f.soft[i].cell)
+      ++j;
+    f.softCells.emplace(f.soft[i].cell, std::pair{i, j});
+    i = j;
+  }
+  if (!f.soft.empty())
+    Log.info("XR room soft normals: {} translucent faces, {} meshes", f.soft.size(), f.softRadius.size());
+}
 
 static void room_fit_tick() noexcept {
   auto& f = sRoomFit;
@@ -629,9 +685,15 @@ static void room_fit_tick() noexcept {
     f.gen = gen;
     return;
   }
-  if (f.frozen || f.verts == 0 || g_gxState.frameSerial - f.lastAdd < 30)
+  if (f.frozen || (f.verts == 0 && f.soft.empty()) || g_gxState.frameSerial - f.lastAdd < 30)
     return;
   f.frozen = true;
+  // The draws decode again: translucent ones soft, and de-lit where the
+  // fit holds.
+  ++f.gen;
+  room_soft_freeze(f);
+  if (f.verts == 0)
+    return;
   // Normal equations, a little ridge on the directional terms.
   double m[4][5];
   for (int i = 0; i < 4; ++i) {
@@ -677,7 +739,6 @@ static void room_fit_tick() noexcept {
   const double r2 = sst > 0.0 ? 1.0 - sse / sst : 0.0;
   f.trust = std::clamp(static_cast<float>((r2 - 0.15) / 0.3), 0.f, 1.f);
   f.valid = use && f.c[0] + f.c[2] > 0.02f && f.trust > 0.f;
-  ++f.gen;
   Log.info("XR room fit: {} draws, {} vertices: luminance {:.3f} {:+.3f} x {:+.3f} y {:+.3f} z (up {:.3f}, down {:.3f}, "
            "side {:.3f}), R2 {:.2f}, used {:.0f}%",
            f.draws, f.verts, c[0], c[1], c[2], c[3], c[0] + c[2], c[0] - c[2], c[0], r2, f.valid ? f.trust * 100.f : 0.f);
@@ -692,8 +753,18 @@ static void room_fit_tick() noexcept {
 // agree, so a mesh's mixed windings don't cancel; the sum is then turned
 // outward by the winding of the vertex's own faces (front faces clockwise
 // on screen, GX's). Made on a decode cache miss only; a draw's own
-// triangles only (seams between draws keep a crease). In w, the vertex's
-// de-light factor (RoomFit), 1 where its draw isn't lit by vertex colours.
+// triangles only (seams between draws keep a crease). A translucent draw
+// (indexed positions), once the room fit's window has gathered its mesh,
+// takes a soft normal instead: its mesh's faces within a radius, from any
+// of its draws, by how near they are, connected or not, without the crease.
+// Kongo Jungle's waterfall foam is ribbons of 5 to 31 vertices, each its
+// own draw, folded and overlapping, sharing no corners: shaded as they
+// face, every ribbon showed; the effect needs the surface they make. In w,
+// the vertex's de-light factor (RoomFit), 1 where its draw isn't lit by
+// vertex colours.
+namespace {
+u64 array_content_hash(GXAttr attr) noexcept;
+}
 static void smooth_normals(const ShaderConfig& config, const DecodedLayout& layout, u16 vtxCount, u8* base,
                            u8 nrmOffset) noexcept {
   static const float cosCrease = [] {
@@ -725,10 +796,17 @@ static void smooth_normals(const ShaderConfig& config, const DecodedLayout& layo
   static std::vector<float> weight;
   static std::vector<std::array<u16, 3>> tris;
   static std::vector<u32> group, first, faces;
+  static std::vector<u64> softKey;
   static std::unordered_map<u64, u32> points;
   pos.resize(vtxCount);
   group.resize(vtxCount);
+  softKey.resize(vtxCount);
   points.clear();
+  const auto& cfg = sDrawCache.config;
+  const u8 posType = config.attrs[GX_VA_POS].attrType;
+  const u64 mesh = cfg.blendMode == GX_BM_BLEND && !xr_additive(cfg) && (posType == GX_INDEX8 || posType == GX_INDEX16)
+                       ? array_content_hash(GX_VA_POS)
+                       : 0;
   for (u32 v = 0; v < vtxCount; ++v) {
     std::memcpy(pos[v].data(), at(v, posOffset), 12);
     u32 key[4]{};
@@ -736,6 +814,7 @@ static void smooth_normals(const ShaderConfig& config, const DecodedLayout& layo
     if (mtxOffset >= 0)
       std::memcpy(&key[3], at(v, mtxOffset), 4);
     group[v] = points.try_emplace(XXH3_64bits(key, sizeof(key)), static_cast<u32>(points.size())).first->second;
+    softKey[v] = XXH3_64bits_withSeed(key, sizeof(key), mesh);
   }
   // The triangles, as prepare_idx_buffer makes them (its windings).
   tris.clear();
@@ -799,9 +878,27 @@ static void smooth_normals(const ShaderConfig& config, const DecodedLayout& layo
         for (const u16 v : tris[t])
           faces[fill[group[v]]++] = static_cast<u32>(t);
   }
+  // The soft normals' faces, each once (by its points, in any order), while
+  // the window is open.
+  auto& fit = sRoomFit;
+  if (mesh != 0 && !fit.frozen)
+    for (size_t t = 0; t < n; ++t) {
+      if (unit[t][0] == 0.f && unit[t][1] == 0.f && unit[t][2] == 0.f)
+        continue;
+      const auto& [a, b, c] = tris[t];
+      std::array<u64, 3> k{softKey[a], softKey[b], softKey[c]};
+      std::sort(k.begin(), k.end());
+      if (!fit.softSeen.insert(XXH3_64bits(k.data(), sizeof(k))).second)
+        continue;
+      fit.soft.push_back({mesh, 0,
+                          V3{(pos[a][0] + pos[b][0] + pos[c][0]) / 3.f, (pos[a][1] + pos[b][1] + pos[c][1]) / 3.f,
+                             (pos[a][2] + pos[b][2] + pos[c][2]) / 3.f},
+                          area[t]});
+      fit.lastAdd = g_gxState.frameSerial;
+    }
+  const auto softRadius = mesh != 0 && fit.frozen ? fit.softRadius.find(mesh) : fit.softRadius.end();
   // The fit's part: a stage draw lit by its vertex colours (as the census
   // tells them), with the game's view to take normals to the world.
-  const auto& cfg = sDrawCache.config;
   bool ras = false;
   for (u32 i = 0; i < config.tevStageCount; ++i) {
     const auto& st = config.tevStages[i];
@@ -810,7 +907,6 @@ static void smooth_normals(const ShaderConfig& config, const DecodedLayout& layo
   }
   const auto& cc = config.colorChannels[0];
   const float* view = gfx::xr_world_view();
-  auto& fit = sRoomFit;
   const bool baked = ras && clrOffset >= 0 && cc.matSrc == GX_SRC_VTX && !cc.lightingEnabled && view != nullptr &&
                      !xr_additive(cfg);
   const bool accumulate = baked && !fit.frozen;
@@ -850,19 +946,43 @@ static void smooth_normals(const ShaderConfig& config, const DecodedLayout& layo
       continue;
     const V3 r{ref[v][0] / rl, ref[v][1] / rl, ref[v][2] / rl};
     V3 sum{};
-    for (u32 i = first[group[v]]; i < first[group[v] + 1]; ++i) {
-      const u32 t = faces[i];
-      const float d = dot(unit[t], r);
-      if (std::abs(d) < cosCrease)
-        continue;
-      const float s = d < 0.f ? -1.f : 1.f;
-      for (int k = 0; k < 3; ++k)
-        sum[k] += s * area[t][k];
+    if (softRadius != fit.softRadius.end()) {
+      // The cells around it, each face as wound (the mesh's outward side, not
+      // this vertex's own faces': a fold's are the wrong way round), by
+      // (1 - (d / radius)^2)^2.
+      const float rad = softRadius->second;
+      for (s32 dz = -1; dz <= 1; ++dz)
+        for (s32 dy = -1; dy <= 1; ++dy)
+          for (s32 dx = -1; dx <= 1; ++dx) {
+            const auto cell = fit.softCells.find(room_soft_cell(mesh, pos[v], rad, {dx, dy, dz}));
+            if (cell == fit.softCells.end())
+              continue;
+            for (u32 i = cell->second.first; i < cell->second.second; ++i) {
+              const auto& sf = fit.soft[i];
+              const V3 d = sub(sf.c, pos[v]);
+              const float q = 1.f - dot(d, d) / (rad * rad);
+              if (q <= 0.f)
+                continue;
+              for (int k = 0; k < 3; ++k)
+                sum[k] += q * q * sf.a[k];
+            }
+          }
     }
+    const bool soft = dot(sum, sum) > 1e-30f;
+    if (!soft)
+      for (u32 i = first[group[v]]; i < first[group[v] + 1]; ++i) {
+        const u32 t = faces[i];
+        const float d = dot(unit[t], r);
+        if (std::abs(d) < cosCrease)
+          continue;
+        const float s = d < 0.f ? -1.f : 1.f;
+        for (int k = 0; k < 3; ++k)
+          sum[k] += s * area[t][k];
+      }
     const float sl = std::sqrt(dot(sum, sum));
     if (!(sl > 1e-30f))
       continue;
-    const float s = (dot(sum, wound[v]) < 0.f ? -1.f : 1.f) * outward / sl;
+    const float s = (soft || dot(sum, wound[v]) >= 0.f ? 1.f : -1.f) * outward / sl;
     float out[4] = {sum[0] * s, sum[1] * s, sum[2] * s, 1.f};
     if (accumulate || delight) {
       V3 w = to_world(v, {out[0], out[1], out[2]});
@@ -890,6 +1010,8 @@ static void smooth_normals(const ShaderConfig& config, const DecodedLayout& layo
         }
       }
     }
+    if (soft)
+      out[3] = -out[3]; // the shader leaves it unturned
     std::memcpy(at(v, nrmOffset), out, 16);
   }
 }
@@ -1464,10 +1586,314 @@ static XrClipClass classify_xr_clip(const ShaderConfig& config, const u8* raw, u
 // markers ("L<n>"): 1 fighters and their items (GX links 5 and 6), 2 the
 // stage (links 0 to 4), 0 anything else (effects, the HUD, unmarked draws).
 // 0 too while the room light is off.
+// A texture's content key for the room light's per-stage tables: its base
+// level (and palette), hashed once per texture object and version.
+static u64 xr_texture_key(const GXTexObj_& obj) noexcept {
+  struct Memo {
+    const void* data;
+    u32 version;
+    const void* tlut;
+    u64 key;
+  };
+  static std::unordered_map<const void*, Memo> memo;
+  const bool palette = is_palette_format(obj.format()) && obj.tlut < g_gxState.loadedTluts.size();
+  const GXTlutObj_* tlut = palette ? &g_gxState.loadedTluts[obj.tlut] : nullptr;
+  const void* tlutData = tlut != nullptr ? tlut->data : nullptr;
+  auto& m = memo[obj.data];
+  if (m.data == obj.data && m.version == obj.texDataVersion && m.tlut == tlutData)
+    return m.key;
+  const u64 seed = tlutData != nullptr ? XXH3_64bits(tlutData, static_cast<size_t>(tlut->numEntries) * 2) : 0;
+  const u32 bytes = GXGetTexBufferSize(obj.width(), obj.height(), obj.format(), false, 0);
+  m = {obj.data, obj.texDataVersion, tlutData, obj.data != nullptr ? XXH3_64bits_withSeed(obj.data, bytes, seed) : 0};
+  return m.key;
+}
+
+// A texture's base level as RGBA8 (empty: a format it can't convert).
+static gfx::ConvertedTexture xr_texture_rgba(const GXTexObj_& obj) noexcept {
+  gfx::ConvertedTexture px{};
+  const ArrayRef data{static_cast<const uint8_t*>(obj.data), UINT32_MAX};
+  if (is_palette_format(obj.format())) {
+    const auto& t = g_gxState.loadedTluts[obj.tlut];
+    if (t.data != nullptr)
+      px = gfx::convert_texture_palette(obj.format(), obj.width(), obj.height(), 1, data, t.format, t.numEntries,
+                                        {static_cast<const uint8_t*>(t.data), static_cast<size_t>(t.numEntries) * 2});
+  } else {
+    px = gfx::convert_texture(obj.format(), obj.width(), obj.height(), 1, data);
+  }
+  if (px.format != wgpu::TextureFormat::RGBA8Unorm || px.data.size() < size_t(obj.width()) * obj.height() * 4)
+    px.data = {};
+  return px;
+}
+
+// AURORA_XR_ROOM_TEXDUMP=dir (for AURORA_XR_ROOM_EMISSIVE's entries): each
+// texture a stage, fighter or item draw samples with the room light on,
+// once, as dir/<key>.ppm (over grey by alpha), with a log line (its link,
+// blend mode, and whether it's an EFB copy).
+static void xr_room_texdump() noexcept {
+  static const char* dir = std::getenv("AURORA_XR_ROOM_TEXDUMP");
+  if (dir == nullptr)
+    return;
+  static absl::flat_hash_set<u64> seen;
+  const auto& sc = sDrawCache.config.shaderConfig;
+  for (u32 i = 0; i < sc.tevStageCount; ++i) {
+    const auto map = sc.tevStages[i].texMapId;
+    if (map == GX_TEXMAP_NULL || map >= MaxTextures)
+      continue;
+    const auto& obj = g_gxState.loadedTextures[map];
+    if (obj.data == nullptr)
+      continue;
+    const bool copy = g_gxState.copyTextures.contains(obj.data);
+    const u64 key = copy ? reinterpret_cast<uintptr_t>(obj.data) : xr_texture_key(obj);
+    if (!seen.insert(key).second)
+      continue;
+    Log.info("XR room texture {:016x}: {}x{} format {}, link {}, blend {}, copy {}", key, obj.width(), obj.height(), obj.format(),
+             sLinkTag - 1, (int)sDrawCache.config.blendMode, copy);
+    if (copy)
+      continue;
+    const auto px = xr_texture_rgba(obj);
+    if (px.data.empty())
+      continue;
+    if (FILE* f = std::fopen(fmt::format("{}/{:016x}.ppm", dir, key).c_str(), "wb")) {
+      std::fprintf(f, "P6\n%u %u\n255\n", obj.width(), obj.height());
+      for (size_t p = 0; p < size_t(obj.width()) * obj.height(); ++p) {
+        const u8* c = px.data.data() + p * 4;
+        for (int k = 0; k < 3; ++k)
+          std::fputc((c[k] * c[3] + 128 * (255 - c[3])) / 255, f);
+      }
+      std::fclose(f);
+    }
+  }
+}
+
+// XR room lighting's emissive stage surfaces: drawn as the game draws them,
+// the room's light left out (lava, screens, glowing parts: a dark room
+// darkened them), by the textures they sample (xr_texture_key). An entry
+// with an emitter also lights the stage around it (lib/xr's room_ebox): its
+// draws' box in the game's world each frame, the texture's mean colour by
+// `gain`, reaching `reach` game units out from the box. Items too (link 6:
+// Corneria's Arwing and Great Fox lasers are items). Every EFB copy a stage
+// draw samples is a screen (Pokemon Stadium's, showing the fighters).
+// AURORA_XR_ROOM_EMISSIVE="key[:emitter:gain:reach],..." adds entries (hex
+// keys, as AURORA_XR_ROOM_TEXDUMP names them; emitter -1 for none).
+struct XrEmissive {
+  u64 tex;
+  s8 emitter;
+  float gain, reach;
+};
+constexpr XrEmissive kXrEmissive[] = {
+    // Battlefield: the orb under the stage (lighting its underside), the
+    // platforms' rainbow edges and the trims.
+    {0x3a28b2f5a4c58102, 1, 1.5f, 45.f},
+    {0x19068b36199d0936, -1, 0.f, 0.f},
+    {0x4650f649e5ba6c50, -1, 0.f, 0.f},
+    {0xed9d81f37efc710f, -1, 0.f, 0.f},
+    {0x8d1b9372a3533027, -1, 0.f, 0.f},
+    // Brinstar: the acid (lighting the stage from below as it rises), the
+    // light strips and panels.
+    {0x9a8c1205e32400b5, 0, 3.f, 80.f},
+    {0x55a7d331ff91e72b, -1, 0.f, 0.f},
+    {0xc63a8679b17881b8, -1, 0.f, 0.f},
+    {0xe208076c16b57ff6, -1, 0.f, 0.f},
+    {0x7d5f15aa3ba27a19, -1, 0.f, 0.f},
+    // Corneria: the glow sprites (engines, lights). Its lasers are items,
+    // marked by kind (melee-pc's pc_xr_glow_begin).
+    {0x15c2c6042abe7d09, -1, 0.f, 0.f},
+    {0x3dbb5b15935c94f6, -1, 0.f, 0.f},
+    {0x4380472ef3ff055b, -1, 0.f, 0.f},
+    {0xb0eeafe52dd16287, -1, 0.f, 0.f},
+    // Mute City: the GO signs, the light bars, and the underpasses' neon
+    // tubes (pink and blue; animated, a texture each frame).
+    {0x048f9b8b3cc10ca6, -1, 0.f, 0.f},
+    {0x09452562b35cf5d9, -1, 0.f, 0.f},
+    {0x0b934455646ea995, -1, 0.f, 0.f},
+    {0x29b8ced6c6ce79a3, -1, 0.f, 0.f},
+    {0x496f789610bb0d5e, -1, 0.f, 0.f},
+    {0xb99ff32a19a68dcf, -1, 0.f, 0.f},
+    {0x091409ee73dc5837, -1, 0.f, 0.f},
+    {0x270bc2afcc1198ec, -1, 0.f, 0.f},
+    {0x34fda0e7e4ba1b50, -1, 0.f, 0.f},
+    {0x433d2bdd220258de, -1, 0.f, 0.f},
+    {0x4f0b3b99376771c8, -1, 0.f, 0.f},
+    {0x68bef71433ba3878, -1, 0.f, 0.f},
+    {0x71300605363173d1, -1, 0.f, 0.f},
+    {0x82ff4643694cab76, -1, 0.f, 0.f},
+    {0xab08bed5cc0fe1fd, -1, 0.f, 0.f},
+    {0xab8879d69e3a8b60, -1, 0.f, 0.f},
+    {0xcb3b1dfa105854ec, -1, 0.f, 0.f},
+    {0x3d593f121c03673d, -1, 0.f, 0.f},
+    {0x439c83afe619add1, -1, 0.f, 0.f},
+    {0x805a8c3296f16c54, -1, 0.f, 0.f},
+    {0xc9bb812e002a7193, -1, 0.f, 0.f},
+    {0xf2fced2569cc9a56, -1, 0.f, 0.f},
+    {0x04b48943d6b25c1b, -1, 0.f, 0.f},
+    {0x0cf319c73f4e9a90, -1, 0.f, 0.f},
+    {0x2645b1eba3b50d99, -1, 0.f, 0.f},
+    {0x69b143be91dec939, -1, 0.f, 0.f},
+    {0xe7a54ce2df2325bd, -1, 0.f, 0.f},
+};
+
+static const XrEmissive* xr_emissive_entry(u64 key) noexcept {
+  static const auto table = [] {
+    absl::flat_hash_map<u64, XrEmissive> t;
+    for (const auto& e : kXrEmissive)
+      if (e.tex != 0)
+        t[e.tex] = e;
+    if (const char* v = std::getenv("AURORA_XR_ROOM_EMISSIVE")) {
+      for (const char* p = v; *p != '\0';) {
+        char* end = nullptr;
+        XrEmissive e{std::strtoull(p, &end, 16), -1, 1.f, 0.f};
+        if (end == p)
+          break;
+        p = end;
+        if (*p == ':')
+          e.emitter = static_cast<s8>(std::strtol(p + 1, &end, 10)), p = end;
+        if (*p == ':')
+          e.gain = std::strtof(p + 1, &end), p = end;
+        if (*p == ':')
+          e.reach = std::strtof(p + 1, &end), p = end;
+        t[e.tex] = e;
+        Log.info("XR room light: emissive texture {:016x}, emitter {}, gain {:.2f}, reach {:.0f}", e.tex, e.emitter,
+                 e.gain, e.reach);
+        while (*p == ',' || *p == ' ')
+          ++p;
+      }
+    }
+    return t;
+  }();
+  const auto it = table.find(key);
+  return it != table.end() ? &it->second : nullptr;
+}
+
+// The current draw's emissive entry (nullptr: none), and the texture it
+// matched by. A draw asks several times (its class decides its pipelines):
+// the last answer stands while the draw's textures and link are the same.
+static const XrEmissive* xr_room_emissive(const GXTexObj_** texOut = nullptr) noexcept {
+  static constexpr XrEmissive screen{0, -1, 0.f, 0.f};
+  const auto& sc = sDrawCache.config.shaderConfig;
+  u64 sig = sLinkTag;
+  for (u32 i = 0; i < sc.tevStageCount; ++i) {
+    const auto map = sc.tevStages[i].texMapId;
+    if (map != GX_TEXMAP_NULL && map < MaxTextures) {
+      const auto& obj = g_gxState.loadedTextures[map];
+      sig = (sig ^ reinterpret_cast<uintptr_t>(obj.data) ^ obj.texDataVersion) * 0x9E3779B97F4A7C15ull + map;
+    }
+  }
+  static u64 lastSig = 0;
+  static const XrEmissive* last = nullptr;
+  static const GXTexObj_* lastTex = nullptr;
+  if (sig == lastSig) {
+    if (texOut != nullptr)
+      *texOut = lastTex;
+    return last;
+  }
+  lastSig = sig;
+  last = nullptr;
+  lastTex = nullptr;
+  for (u32 i = 0; i < sc.tevStageCount && last == nullptr; ++i) {
+    const auto map = sc.tevStages[i].texMapId;
+    if (map == GX_TEXMAP_NULL || map >= MaxTextures)
+      continue;
+    const auto& obj = g_gxState.loadedTextures[map];
+    if (obj.data == nullptr)
+      continue;
+    if (sLinkTag - 1 <= 4 && g_gxState.copyTextures.contains(obj.data))
+      last = &screen, lastTex = &obj;
+    else if (const auto* e = xr_emissive_entry(xr_texture_key(obj)))
+      last = e, lastTex = &obj;
+  }
+  if (texOut != nullptr)
+    *texOut = lastTex;
+  return last;
+}
+
+// A texture's mean colour (by alpha), once per key.
+static std::array<float, 3> xr_texture_mean(const GXTexObj_& obj, u64 key) noexcept {
+  static absl::flat_hash_map<u64, std::array<float, 3>> means;
+  if (const auto it = means.find(key); it != means.end())
+    return it->second;
+  std::array<float, 3> mean{1.f, 1.f, 1.f};
+  const auto px = xr_texture_rgba(obj);
+  const size_t n = static_cast<size_t>(obj.width()) * obj.height();
+  if (!px.data.empty()) {
+    double sum[3]{}, wsum = 0.0;
+    for (size_t p = 0; p < n; ++p) {
+      const u8* c = px.data.data() + p * 4;
+      const double w = c[3] / 255.0;
+      for (int k = 0; k < 3; ++k)
+        sum[k] += w * c[k] / 255.0;
+      wsum += w;
+    }
+    if (wsum > 0.0)
+      for (int k = 0; k < 3; ++k)
+        mean[k] = static_cast<float>(sum[k] / wsum);
+  }
+  Log.info("XR room light: emitter texture {:016x}, mean colour {:.2f} {:.2f} {:.2f}", key, mean[0], mean[1], mean[2]);
+  return means[key] = mean;
+}
+
+// The current draw's vertices' box in the game's world (false: positions it
+// can't read).
+static bool xr_draw_world_box(const u8* raw, u16 vtxCount, float* lo, float* hi) noexcept {
+  const float* view = gfx::xr_world_view();
+  const auto& config = sDrawCache.config.shaderConfig;
+  const auto& pos = config.attrs[GX_VA_POS];
+  const auto& idx = config.attrs[GX_VA_PNMTXIDX];
+  if (view == nullptr || pos.attrType == GX_NONE || (idx.attrType != GX_NONE && idx.attrType != GX_DIRECT))
+    return false;
+  const u32 compSize = comp_type_size(GX_VA_POS, static_cast<GXCompType>(pos.compType));
+  const u32 comps = std::min<u32>(pos.cnt, 3);
+  std::fill_n(lo, 3, INFINITY);
+  std::fill_n(hi, 3, -INFINITY);
+  for (u32 v = 0; v < vtxCount; ++v) {
+    const u8* vtx = raw + v * config.vtxStride;
+    const u32 mtx = idx.attrType == GX_DIRECT ? std::min<u32>(vtx[idx.offset] / 3u, MaxPnMtx - 1)
+                                              : std::min<u32>(g_gxState.currentPnMtx, MaxPnMtx - 1);
+    bool le = false;
+    const u8* src = decoded_source(pos, GX_VA_POS, 0, vtx, le);
+    if (src == nullptr)
+      return false;
+    float p[3] = {0.f, 0.f, 0.f};
+    for (u32 c = 0; c < comps; ++c)
+      p[c] = decode_component(src + c * compSize, pos.compType, pos.frac, le);
+    // Model -> game camera -> the world (the view's inverse: its rotation's
+    // transpose).
+    const f32* m = reinterpret_cast<const f32*>(&g_gxState.pnMtx[mtx].pos);
+    float cam[3];
+    for (int r = 0; r < 3; ++r)
+      cam[r] = m[r * 4] * p[0] + m[r * 4 + 1] * p[1] + m[r * 4 + 2] * p[2] + m[r * 4 + 3] - view[r * 4 + 3];
+    for (int c = 0; c < 3; ++c) {
+      const float w = view[c] * cam[0] + view[4 + c] * cam[1] + view[8 + c] * cam[2];
+      lo[c] = std::min(lo[c], w);
+      hi[c] = std::max(hi[c], w);
+    }
+  }
+  return lo[0] <= hi[0];
+}
+
+// An emitter's draw (a world draw with an emissive entry that has one): its
+// box into this frame's emitter.
+static void xr_room_emitter(const u8* raw, u16 vtxCount) noexcept {
+  if (gfx::xr_room_light() == 0 || !gfx::xr_recording_world() || sLinkTag == 0 || sLinkTag - 1 > 4)
+    return;
+  const GXTexObj_* tex = nullptr;
+  const auto* e = xr_room_emissive(&tex);
+  float lo[3], hi[3];
+  if (e == nullptr || e->emitter < 0 || tex == nullptr || !xr_draw_world_box(raw, vtxCount, lo, hi))
+    return;
+  auto rgb = xr_texture_mean(*tex, xr_texture_key(*tex));
+  for (float& c : rgb)
+    c *= e->gain;
+  gfx::xr_add_emitter(e->emitter, lo, hi, rgb.data(), e->reach);
+}
+
 static u8 xr_room_class() noexcept {
   if (gfx::xr_room_light() == 0 || sLinkTag == 0 || xr_additive(sDrawCache.config))
     return 0;
   const u32 link = sLinkTag - 1;
+  if (link <= 6)
+    xr_room_texdump();
+  if (link <= 6 && xr_room_emissive() != nullptr)
+    return 0;
   return link == 5 || link == 6 ? 1 : link <= 4 ? 2 : 0;
 }
 
@@ -2194,8 +2620,10 @@ static void push_gx_draw(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, gfx::Rang
     XrClipClass cls;
     bool masked;
     xrPipeline = xr_world_pipeline(raw, vtxCount, &cls, outside.data(), &masked, unsolid.data());
-    if (gfx::xr_recording_world())
+    if (gfx::xr_recording_world()) {
       xr_room_census(vtxCount);
+      xr_room_emitter(raw, vtxCount);
+    }
     cls_inside = cls == XrClipClass::Inside;
     if (xrPipeline != 0 && cls != XrClipClass::Outside &&
         (xrMotionPipeline = xr_motion_pipeline(xrMotionKind, cls == XrClipClass::Straddle)) != 0)

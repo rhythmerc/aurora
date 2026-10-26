@@ -252,6 +252,9 @@ struct FramePacket {
   // Then XrMaxClipPlanes clip planes (all must pass; 0,0,0,1 always passes),
   // their fade bands (game units; 0 = a hard cut) and the draw's opacity.
   std::vector<std::array<float, XrTransformFloats>> xrTransforms; // move 3x4, clip planes 8x4, fades 8, opacity, probe
+  // The room light's stage emitters this frame (xr_add_emitter; reach 0:
+  // none).
+  std::array<std::array<float, XrEmitterFloats>, XrRoomEmitters> xrEmitters{};
   // XR early eyes (set_xr_early_eyes): whether this frame may split
   // (earlyEyes); the world was split off and its eyes queued (xrEarlySplit),
   // the uploads after that going to a second staging buffer (stagingBuffer2,

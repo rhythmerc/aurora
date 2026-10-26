@@ -634,6 +634,7 @@ void begin_recording(FramePacket& packet, size_t frameSlot) {
   packet.xrHasWorld = false;
   packet.xrHasHud = false;
   packet.xrTransforms.clear();
+  packet.xrEmitters = {};
 
   current_render_passes().emplace_back();
   auto& pass = current_render_passes()[0];
@@ -1540,6 +1541,19 @@ void xr_set_world_transform(const float* m3x4) {
     g_xrMove.reset();
   }
   update_xr_transform();
+}
+
+void xr_add_emitter(int slot, const float* lo, const float* hi, const float* rgb, float reach) noexcept {
+  if (!g_recorder.active() || slot < 0 || slot >= XrRoomEmitters)
+    return;
+  auto& e = g_recorder.frame().xrEmitters[slot];
+  const bool first = e[9] <= 0.f;
+  for (int c = 0; c < 3; ++c) {
+    e[c] = first ? lo[c] : std::min(e[c], lo[c]);
+    e[3 + c] = first ? hi[c] : std::max(e[3 + c], hi[c]);
+    e[6 + c] = rgb[c];
+  }
+  e[9] = reach;
 }
 
 void xr_set_light_probe(const float* pos) {
