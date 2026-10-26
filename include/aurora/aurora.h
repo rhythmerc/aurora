@@ -148,7 +148,7 @@ typedef struct {
    * OpenXR builds: how fights are lit. 0 the game's own lighting; 1
    * Roomtone, the room's light from the headset's passthrough cameras
    * (which needs their permission: without it the game's own lighting).
-   * aurora_xr_set_room_light changes it as the game runs;
+   * Set at launch only (its pipelines differ from the game's own);
    * AURORA_XR_ROOM_LIGHT overrides it.
    */
   int32_t xrRoomLight;

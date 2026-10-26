@@ -7998,23 +7998,6 @@ void init_room_light() {
   room_light_apply(r);
 }
 
-// The host's Lighting as the game runs (aurora_xr_set_room_light): 0 the
-// game's own, 1 Roomtone (the room capture, kept from before if there was
-// one), as init_room_light makes them.
-void set_room_light_mode(int mode) {
-  const RoomLight r = mode == 1 ? roomtone() : RoomLight{};
-  {
-    std::lock_guard lock{g_room.mutex};
-    g_room.value = g_room.defaults = r;
-  }
-  if (r.source == kRoomSourceCaptured)
-    capture_resume();
-  else
-    capture_stop();
-  room_light_apply(r);
-  Log.info("Room light: {} (the host's Lighting)", mode == 1 ? "Roomtone" : "off");
-}
-
 // What render_eyes puts in the eye uniform's room fields, for a frame.
 struct RoomFrame {
   bool on = false;
@@ -12944,8 +12927,6 @@ extern "C" void aurora_xr_set_room_light_held(bool vanilla) {
 extern "C" void aurora_xr_set_passthrough(bool on) { aurora::xr::g_passthroughWanted = on; }
 
 extern "C" void aurora_xr_set_stage_shadow(bool on) { aurora::xr::g_stageShadow = on ? 1 : 0; }
-
-extern "C" void aurora_xr_set_room_light(int mode) { aurora::xr::set_room_light_mode(mode); }
 
 extern "C" void aurora_xr_set_eye_scale(float scale) {
   aurora::xr::g_eyeScaleFixed = scale > 0.f ? std::clamp(scale, 0.5f, 2.f) : 0.f;
