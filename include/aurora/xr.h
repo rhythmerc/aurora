@@ -73,11 +73,6 @@ bool aurora_xr_pace_until(uint64_t count);
  * arena to move, turn and scale it instead of pressing Z. */
 void aurora_xr_set_paused(bool paused);
 
-/* Whether the match itself is stopped by a pause (not Slippi's overlay,
- * under which the match runs on): the room capture looks around then, as
- * while the stage is placed. Call with aurora_xr_set_paused. */
-void aurora_xr_set_match_stopped(bool stopped);
-
 /* The fight is held before it starts so the player can place the stage:
  * the hands grab the arena as in a pause. 0: not held; 1: held, showing
  * the button legend; 2: held, showing the how-to cards and the legend.

@@ -426,9 +426,6 @@ Footprint g_footprint;
 // Set by the game every fight frame (aurora_xr_set_paused): the fight is
 // paused, so the controllers point and grab instead of playing.
 std::atomic<bool> g_fightPaused{false};
-// And the match itself stopped (aurora_xr_set_match_stopped): a pause, not
-// Slippi's overlay.
-std::atomic<bool> g_matchStopped{false};
 // Set by the game (aurora_xr_set_placing): the fight is held before it
 // starts for placing the stage. 0 no; 1 with the legend; 2 with the cards.
 std::atomic<int> g_placing{0};
@@ -6851,8 +6848,8 @@ struct {
 // hits, become SH L2, up to two lights with a place in the room, and a
 // level that matches the brightness passthrough shows the room at, at the
 // stage. A capture runs 20 s from choosing ROOM, the head looking around,
-// then ambiently while ROOM stays the source (in the menus, while the stage
-// is placed, in a pause), at kCapAmbientMs a frame. In room_frame the
+// then ambiently while ROOM stays the source (in the menus and while the
+// stage is placed before a fight), at kCapAmbientMs a frame. In room_frame the
 // stage's unlit draws take the level from above (their tops the baked
 // colour times the level, times STRENGTH), and the fighters as the room's
 // mean light over every direction (kCapFighters times the level): a
@@ -6942,9 +6939,11 @@ struct Capture {
   std::mutex mutex;
   bool requested = false;
   int64_t untilNs = 0; // steady clock; 0: not started (no head pose yet)
-  // Ambient capture: while ROOM is the source, in the menus, while the stage
-  // is placed and in a pause (the head looks around the room there, past
-  // lights the camera's narrower view misses while it looks ahead).
+  // Ambient capture: while ROOM is the source, in the menus and while the
+  // stage is placed before a fight (the head looks around the room there,
+  // past lights the camera's narrower view misses while it looks ahead).
+  // Not in a pause: players walk round the stage then, and the light should
+  // hold still (2026-10-26).
   bool room = false, ambientOk = false;
   uint32_t ambientFrames = 0; // since the last log
   uint32_t casts = 0;
@@ -9658,9 +9657,9 @@ bool render_xr_frame() {
   // hold before a fight, or a grab in a pause.
   const bool placingNow = fight && (placing > 0 || (G.target == Target::Arena && (G.oneHand >= 0 || G.twoHands)));
   surface_frame(fight, placingNow, fs.predictedDisplayTime);
-  // Ambient capture in the menus, while the stage is placed and in a pause
-  // (where the stage is placed again; not Slippi's, the match runs on).
-  capture_ambient(!fight || placing > 0 || (g_fightPaused && g_matchStopped));
+  // Ambient capture in the menus and while the stage is placed before a
+  // fight; not in a pause (see Capture::room).
+  capture_ambient(!fight || placing > 0);
   // A room light calibration: its lights, and the fight (the placement
   // scene's) hidden under it.
   calibration_frame();
@@ -12790,7 +12789,6 @@ extern "C" bool aurora_xr_screen_back(void) {
 }
 
 extern "C" void aurora_xr_set_paused(bool paused) { aurora::xr::g_fightPaused = paused; }
-extern "C" void aurora_xr_set_match_stopped(bool stopped) { aurora::xr::g_matchStopped = stopped; }
 
 extern "C" void aurora_xr_set_placing(int mode) { aurora::xr::g_placing = mode; }
 
@@ -12976,7 +12974,7 @@ bool g_captureMakePending = false, g_captureLogPending = false;
 uint32_t g_captureLogFrames = 0;
 
 // XR thread, every frame: whether ambient capture may run (the menus, the
-// stage being placed, a pause). Leaving them, the light is made again (the
+// stage being placed before a fight). Leaving them, the light is made again (the
 // stage may have moved since the last frame) and what ambient capture
 // gathered logged, by the capture thread.
 void capture_ambient(bool ok) {
