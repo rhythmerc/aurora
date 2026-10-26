@@ -1774,8 +1774,11 @@ static bool roomtone_at_launch() {
 // Every recorded pair this build can still use, in the order draws first asked
 // for them, as the lighting at launch draws them: a pair recorded in the other
 // lighting gives this one's pipelines (Vanilla's: the room bits cleared;
-// Roomtone's: the variants pipeline_room recorded for the config, the config
-// itself where none were).
+// Roomtone's: the variants pipeline_room recorded for the config). A Vanilla
+// eye config Roomtone never drew is left out: it would build as Vanilla's,
+// which Roomtone draws for few eye configs (367 of 2633 in the 2026-10-26
+// sweep).
+// Without any records (a cache from before them), the config itself.
 /* unbuiltOnly: just the pairs not marked built for this app build and driver
  * (pipeline_built; the Quest launcher's precompile). */
 static std::vector<RecordedPair> load_recorded_pairs(bool unbuiltOnly = false) {
@@ -1831,7 +1834,7 @@ static std::vector<RecordedPair> load_recorded_pairs(bool unbuiltOnly = false) {
     sqlite3_finalize(stmt);
     stmt = nullptr;
     absl::flat_hash_set<HashType> queued;
-    size_t recorded = 0, derived = 0;
+    size_t recorded = 0, derived = 0, skipped = 0;
     const auto add = [&](ShaderType type, const auto& config, const RenderTargetLayout& layout) {
       const HashType cacheKey = xxh3_hash(config, static_cast<HashType>(type));
       if (!queued.insert(xxh3_hash(layout.key, cacheKey)).second || built.contains(xxh3_hash(layout.key, cacheKey)))
@@ -1867,7 +1870,10 @@ static std::vector<RecordedPair> load_recorded_pairs(bool unbuiltOnly = false) {
           const uint32_t mask =
               it == variants.end() ? 0 : (it->second >> (roomtone_eye_layout(layout) ? 0 : 16)) & 0xFFFF;
           if (mask == 0) {
-            add(type, config, layout);
+            if (roomBits || variants.empty() || !roomtone_eye_layout(layout))
+              add(type, config, layout);
+            else
+              ++skipped;
             continue;
           }
           for (uint8_t v = 0; v < gx::RoomtoneVariants; ++v)
@@ -1885,8 +1891,9 @@ static std::vector<RecordedPair> load_recorded_pairs(bool unbuiltOnly = false) {
         }
       }
     }
-    Log.info("Recorded pipelines for {}: {} pairs, {} of them taken from the other lighting's ({} to build)",
-             roomtone ? "Roomtone" : "Vanilla", recorded, derived, jobs.size());
+    Log.info("Recorded pipelines for {}: {} pairs, {} of them taken from the other lighting's, {} eye pairs it "
+             "never drew left out ({} to build)",
+             roomtone ? "Roomtone" : "Vanilla", recorded, derived, skipped, jobs.size());
     sqlite3_finalize(stmt);
   }
   return jobs;
