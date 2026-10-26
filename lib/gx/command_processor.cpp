@@ -1671,8 +1671,13 @@ static void xr_room_texdump() noexcept {
 // with an emitter also lights the stage around it (lib/xr's room_ebox): its
 // draws' box in the game's world each frame, the texture's mean colour by
 // `gain`, reaching `reach` game units out from the box. Items too (link 6:
-// Corneria's Arwing and Great Fox lasers are items). Every EFB copy a stage
-// draw samples is a screen (Pokemon Stadium's, showing the fighters).
+// Corneria's Arwing and Great Fox lasers are items). A colour EFB copy a
+// stage draw samples is a screen (Pokemon Stadium's, showing the fighters:
+// RGB565). Not the intensity ones: those are the fighters' shadows
+// (HSD_Shadow, 256x256 I4), cast on the stage; taken for screens, every
+// surface a shadow could fall on went Vanilla (Corneria's hull, Yoshi's
+// Story, Onett, Green Greens) and its Vanilla eye pipelines compiled
+// mid-match.
 // AURORA_XR_ROOM_EMISSIVE="key[:emitter:gain:reach],..." adds entries (hex
 // keys, as AURORA_XR_ROOM_TEXDUMP names them; emitter -1 for none).
 struct XrEmissive {
@@ -1695,12 +1700,12 @@ constexpr XrEmissive kXrEmissive[] = {
     {0xc63a8679b17881b8, -1, 0.f, 0.f},
     {0xe208076c16b57ff6, -1, 0.f, 0.f},
     {0x7d5f15aa3ba27a19, -1, 0.f, 0.f},
-    // Corneria: the glow sprites (engines, lights). Its lasers are items,
-    // marked by kind (melee-pc's pc_xr_glow_begin).
+    // Corneria: the glow sprites (engines, lights; blended). Its lasers are
+    // items, marked by kind (melee-pc's pc_xr_glow_begin). Not the glows its
+    // opaque draws sample (3dbb5b15..., b0eeafe5...): the Great Fox's hull
+    // takes them as reflections, and as entries the hull went Vanilla.
     {0x15c2c6042abe7d09, -1, 0.f, 0.f},
-    {0x3dbb5b15935c94f6, -1, 0.f, 0.f},
     {0x4380472ef3ff055b, -1, 0.f, 0.f},
-    {0xb0eeafe52dd16287, -1, 0.f, 0.f},
     // Mute City: the GO signs, the light bars, and the underpasses' neon
     // tubes (pink and blue; animated, a texture each frame).
     {0x048f9b8b3cc10ca6, -1, 0.f, 0.f},
@@ -1796,7 +1801,9 @@ static const XrEmissive* xr_room_emissive(const GXTexObj_** texOut = nullptr) no
     const auto& obj = g_gxState.loadedTextures[map];
     if (obj.data == nullptr)
       continue;
-    if (sLinkTag - 1 <= 4 && g_gxState.copyTextures.contains(obj.data))
+    const u32 fmt = obj.format();
+    const bool colour = fmt == GX_TF_RGB565 || fmt == GX_TF_RGB5A3 || fmt == GX_TF_RGBA8;
+    if (sLinkTag - 1 <= 4 && colour && g_gxState.copyTextures.contains(obj.data))
       last = &screen, lastTex = &obj;
     else if (const auto* e = xr_emissive_entry(xr_texture_key(obj)))
       last = e, lastTex = &obj;
