@@ -455,6 +455,40 @@ bool decoded_layout(const ShaderConfig& config, DecodedLayout& out) noexcept {
   return true;
 }
 
+PipelineConfig vanilla_config(const PipelineConfig& config) noexcept {
+  PipelineConfig c = config;
+  auto& sc = c.shaderConfig;
+  sc.xrRoom = 0;
+  sc.xrRoomPixel = 0;
+  sc.xrRoomView = 0;
+  sc.xrRoomFacet = 0;
+  sc.xrRoomGloss = 0;
+  sc.xrSmoothNrm = 0;
+  return c;
+}
+
+// Roomtone's shading is SMOOTH (lib/xr's roomtone()): facet normals per
+// pixel where the mesh has none, the CPU's smooth ones on the stage.
+PipelineConfig roomtone_config(const PipelineConfig& vanilla, u8 variant) noexcept {
+  PipelineConfig c = vanilla;
+  auto& sc = c.shaderConfig;
+  const u8 cls = variant & 3;
+  sc.xrSmoothNrm = (variant >> 3) & 1;
+  if (cls != 0) {
+    sc.xrRoom = cls;
+    sc.xrRoomFacet = 1;
+    sc.xrRoomPixel = 1;
+    sc.xrRoomGloss = cls == 2 && ((variant >> 2) & 1);
+  }
+  return c;
+}
+
+bool has_room_bits(const PipelineConfig& config) noexcept {
+  const auto& sc = config.shaderConfig;
+  return sc.xrRoom != 0 || sc.xrRoomPixel != 0 || sc.xrRoomView != 0 || sc.xrRoomFacet != 0 || sc.xrRoomGloss != 0 ||
+         sc.xrSmoothNrm != 0;
+}
+
 wgpu::RenderPipeline build_pipeline(const PipelineConfig& config, const gfx::RenderTargetLayout& layout,
                                     ArrayRef<wgpu::VertexBufferLayout> vtxBuffers, wgpu::ShaderModule shader,
                                     const char* label) noexcept {

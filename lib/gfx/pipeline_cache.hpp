@@ -28,7 +28,12 @@ void begin_pipeline_frame();
 void end_pipeline_frame();
 void rebuild_pipeline_cache();
 
-PipelineRef find_pipeline(const gx::PipelineConfig& config, const RenderTargetLayout& layout);
+// `roomtone`: the draw's Roomtone variant (gx::roomtone_config), recorded for
+// the other lighting's pipelines; 0xFF none.
+PipelineRef find_pipeline(const gx::PipelineConfig& config, const RenderTargetLayout& layout,
+                          uint8_t roomtone = 0xFF);
+// The same record for a pipeline asked for some other way.
+void note_roomtone_variant(const gx::PipelineConfig& config, const RenderTargetLayout& layout, uint8_t variant);
 PipelineRef find_pipeline(const clear::PipelineConfig& config, const RenderTargetLayout& layout);
 PipelineRef find_pipeline(const rmlui::PipelineConfig& config);
 

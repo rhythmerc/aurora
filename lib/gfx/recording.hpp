@@ -150,6 +150,11 @@ bool xr_soft_clip_active() noexcept;
 // Any thread.
 void set_xr_room_light(uint32_t bits) noexcept;
 uint32_t xr_room_light() noexcept;
+// Whether the launcher's Roomtone gives this stage's draws its gloss, lit or
+// not now (the pipeline cache records Roomtone's variants in Vanilla too).
+// Any thread.
+void set_xr_roomtone_gloss(bool gloss) noexcept;
+bool xr_roomtone_gloss() noexcept;
 // XR room lighting's fit of a stage's baked light: a new stage (any thread,
 // aurora_xr_set_stage) starts another, the FIFO thread sees the count change.
 void xr_room_fit_reset() noexcept;

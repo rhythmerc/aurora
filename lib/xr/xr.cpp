@@ -13195,6 +13195,7 @@ extern "C" void aurora_xr_set_stage(int stage, float x, float y, float z, float 
   }
   aurora_xr_set_room_grade(1.f, 1.f, 1.f, 1.f);
   g_roomStage = stage;
+  aurora::gfx::set_xr_roomtone_gloss(aurora::xr::roomtone().gloss > 0.f && aurora::xr::stage_gloss(stage) > 0.f);
   {
     RoomLight r;
     {

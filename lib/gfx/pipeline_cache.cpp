@@ -84,6 +84,9 @@ struct PipelineCacheWrite {
   bool pair = false;
   uint64_t layoutKey = 0;
   ByteBuffer layout;
+  // Roomtone variants of config `hash` (pipeline_room), OR'd into its row.
+  bool room = false;
+  uint32_t roomVariants = 0;
 };
 
 using SavedPipelineConfig = std::variant<gx::PipelineConfig, clear::PipelineConfig
@@ -187,6 +190,10 @@ static sqlite3_stmt* g_pipelineDeviceStmt = nullptr;
 static sqlite3_stmt* g_pipelineBuiltStmt = nullptr;
 static sqlite3_stmt* g_pipelinePairStmt = nullptr;
 static sqlite3_stmt* g_pipelineLayoutStmt = nullptr;
+static sqlite3_stmt* g_pipelineRoomStmt = nullptr;
+// Roomtone variants recorded this process (pipeline_room), by config.
+static std::mutex g_roomVariantsMutex;
+static absl::flat_hash_map<HashType, uint32_t> g_roomVariants;
 // Pairs recorded (or loaded as recorded) this session, by runtime key.
 static std::mutex g_recordedPairsMutex;
 static absl::flat_hash_set<PipelineRef> g_recordedPairs;
@@ -594,6 +601,42 @@ static void record_pipeline_pair(ShaderType type, HashType cacheKey, const Rende
   enqueue_pipeline_cache_write(std::move(write));
 }
 
+/* Roomtone's variants of the configs draws ask for (gx::roomtone_config), kept
+ * against the config with its room bits cleared, in either lighting: the eye
+ * pipelines' (multiview, not motion) in the low 16 bits, the others' above.
+ * With them the pairs either lighting recorded give the other's pipelines
+ * (load_recorded_pairs): Roomtone's differ from Vanilla's by the draw's class,
+ * which the config alone doesn't tell. */
+static bool roomtone_eye_layout(const RenderTargetLayout& layout) {
+  return layout.viewCount > 1 && layout.xrMotion == 0;
+}
+
+static void note_roomtone_variant(const gx::PipelineConfig& config, HashType cacheKey, const RenderTargetLayout& layout,
+                                  uint8_t variant) {
+  if (variant >= gx::RoomtoneVariants || config.shaderConfig.xrRoomView != 0)
+    return;
+  const uint32_t bit = 1u << (variant + (roomtone_eye_layout(layout) ? 0 : 16));
+  thread_local absl::flat_hash_set<HashType> seen;
+  if (!seen.insert(cacheKey ^ (bit * 0x9E3779B97F4A7C15ull)).second)
+    return;
+  const HashType key = gx::has_room_bits(config)
+                           ? xxh3_hash(gx::vanilla_config(config), static_cast<HashType>(ShaderType::GX))
+                           : cacheKey;
+  {
+    std::lock_guard lock{g_roomVariantsMutex};
+    auto& variants = g_roomVariants[key];
+    if ((variants & bit) != 0)
+      return;
+    variants |= bit;
+  }
+  enqueue_pipeline_cache_write(
+      PipelineCacheWrite{.type = ShaderType::GX, .hash = key, .room = true, .roomVariants = bit});
+}
+
+void note_roomtone_variant(const gx::PipelineConfig& config, const RenderTargetLayout& layout, uint8_t variant) {
+  note_roomtone_variant(config, xxh3_hash(config, static_cast<HashType>(ShaderType::GX)), layout, variant);
+}
+
 template <typename Queue>
 static auto find_pending_pipeline(Queue& queue, PipelineRef hash) {
   return std::find_if(queue.begin(), queue.end(), [=](const PendingPipeline& pending) { return pending.hash == hash; });
@@ -823,7 +866,7 @@ static void pipeline_cache_abort() {
     sqlite3_finalize(g_pipelineDeviceStmt);
     g_pipelineDeviceStmt = nullptr;
   }
-  for (auto* stmt : {&g_pipelinePairStmt, &g_pipelineLayoutStmt}) {
+  for (auto* stmt : {&g_pipelinePairStmt, &g_pipelineLayoutStmt, &g_pipelineRoomStmt}) {
     if (*stmt != nullptr) {
       sqlite3_finalize(*stmt);
       *stmt = nullptr;
@@ -1044,7 +1087,7 @@ static void seed_pipeline_cache() {
      * launcher precompiles, and its built-on-device marks, without which
      * DeviceBuiltRowsOnly would drop every seeded row at load. Not this
      * device's pipeline_built: its Dawn cache is still empty. */
-    uint32_t pairs = 0, layouts = 0, marks = 0;
+    uint32_t pairs = 0, layouts = 0, marks = 0, rooms = 0;
     if (!writeFailed && !readFailed) {
       sqlite3_finalize(seedStmt);
       seedStmt = nullptr;
@@ -1054,10 +1097,13 @@ static void seed_pipeline_cache() {
           !copy_seed_table(seedDb, "SELECT type, hash, layout_key, first_frame_used FROM pipeline_pair",
                            g_pipelinePairStmt, "recorded pairs", pairs) ||
           (DeviceBuiltRowsOnly && !copy_seed_table(seedDb, "SELECT type, hash FROM pipeline_device",
-                                                   g_pipelineDeviceStmt, "built-on-device marks", marks));
+                                                   g_pipelineDeviceStmt, "built-on-device marks", marks)) ||
+          !copy_seed_table(seedDb, "SELECT type, hash, variants FROM pipeline_room", g_pipelineRoomStmt,
+                           "Roomtone variants", rooms);
     }
-    if (pairs + layouts + marks > 0)
-      Log.info("Seeded {} recorded pairs, {} layouts and {} built-on-device marks", pairs, layouts, marks);
+    if (pairs + layouts + marks + rooms > 0)
+      Log.info("Seeded {} recorded pairs, {} layouts, {} built-on-device marks and {} Roomtone variants", pairs,
+               layouts, marks, rooms);
 
     if (!writeFailed && !readFailed) {
       tx.commit();
@@ -1230,7 +1276,10 @@ INSERT INTO aurora_schema VALUES ({});)",
                      "key INTEGER PRIMARY KEY, layout BLOB NOT NULL);"
                      "CREATE TABLE IF NOT EXISTS pipeline_pair ("
                      "type INTEGER NOT NULL, hash INTEGER NOT NULL, layout_key INTEGER NOT NULL, "
-                     "first_frame_used INTEGER NOT NULL, PRIMARY KEY (type, hash, layout_key)) WITHOUT ROWID;");
+                     "first_frame_used INTEGER NOT NULL, PRIMARY KEY (type, hash, layout_key)) WITHOUT ROWID;"
+                     "CREATE TABLE IF NOT EXISTS pipeline_room ("
+                     "type INTEGER NOT NULL, hash INTEGER NOT NULL, variants INTEGER NOT NULL, "
+                     "PRIMARY KEY (type, hash)) WITHOUT ROWID;");
   if (ret == SQLITE_OK) {
     ret = sqlite3_prepare_v3(g_pipelineCacheDb, "INSERT OR IGNORE INTO pipeline_layout (key, layout) VALUES (?, ?)",
                              -1, SQLITE_PREPARE_PERSISTENT, &g_pipelineLayoutStmt, nullptr);
@@ -1240,6 +1289,12 @@ INSERT INTO aurora_schema VALUES ({});)",
                              "INSERT OR IGNORE INTO pipeline_pair (type, hash, layout_key, first_frame_used) "
                              "VALUES (?, ?, ?, ?)",
                              -1, SQLITE_PREPARE_PERSISTENT, &g_pipelinePairStmt, nullptr);
+  }
+  if (ret == SQLITE_OK) {
+    ret = sqlite3_prepare_v3(g_pipelineCacheDb,
+                             "INSERT INTO pipeline_room (type, hash, variants) VALUES (?, ?, ?) "
+                             "ON CONFLICT (type, hash) DO UPDATE SET variants = variants | excluded.variants",
+                             -1, SQLITE_PREPARE_PERSISTENT, &g_pipelineRoomStmt, nullptr);
   }
   if (ret != SQLITE_OK) {
     Log.error("Failed to prepare pipeline_pair tables: {}", sqlite3_errmsg(g_pipelineCacheDb));
@@ -1429,6 +1484,25 @@ static bool write_pair_record(const PipelineCacheWrite& write) {
   return ret == SQLITE_OK;
 }
 
+static bool write_room_record(const PipelineCacheWrite& write) {
+  int ret = sqlite3_bind_int(g_pipelineRoomStmt, 1, underlying(write.type));
+  if (ret == SQLITE_OK) {
+    ret = sqlite3_bind_int64(g_pipelineRoomStmt, 2, static_cast<sqlite3_int64>(write.hash));
+  }
+  if (ret == SQLITE_OK) {
+    ret = sqlite3_bind_int64(g_pipelineRoomStmt, 3, write.roomVariants);
+  }
+  if (ret == SQLITE_OK) {
+    ret = sqlite3_step(g_pipelineRoomStmt) == SQLITE_DONE ? SQLITE_OK : SQLITE_ERROR;
+  }
+  if (ret != SQLITE_OK) {
+    Log.error("Failed to record a pipeline's Roomtone variants: {}", sqlite3_errmsg(g_pipelineCacheDb));
+  }
+  sqlite3_reset(g_pipelineRoomStmt);
+  sqlite3_clear_bindings(g_pipelineRoomStmt);
+  return ret == SQLITE_OK;
+}
+
 static void pipeline_cache_writer() {
 #ifdef TRACY_ENABLE
   tracy::SetThreadName("Pipeline cache writer thread");
@@ -1455,6 +1529,7 @@ static void pipeline_cache_writer() {
       } else {
         for (const auto& write : batch) {
           const bool ok = write.pair          ? write_pair_record(write)
+                          : write.room        ? write_room_record(write)
                           : write.deviceBuilt ? write_device_built_record(write)
                           : write.built       ? write_built_record(write)
                                               : write_pipeline_cache_record(write);
@@ -1638,7 +1713,7 @@ PipelineRef find_pipeline(const clear::PipelineConfig& config, const RenderTarge
 // per-thread set of ready ones.
 std::atomic<uint32_t> g_pipelinesGeneration{0};
 
-PipelineRef find_pipeline(const gx::PipelineConfig& config, const RenderTargetLayout& layout) {
+PipelineRef find_pipeline(const gx::PipelineConfig& config, const RenderTargetLayout& layout, uint8_t roomtone) {
   // A pipeline already built needs neither remembering nor resolving again:
   // both hashed the whole config, took the mutex, and resolving copied the
   // config into a creation callback it then threw away. That was about 5% of
@@ -1651,6 +1726,8 @@ PipelineRef find_pipeline(const gx::PipelineConfig& config, const RenderTargetLa
   }
   const auto cacheKey = xxh3_hash(config, static_cast<HashType>(ShaderType::GX));
   const PipelineRef runtimeKey = xxh3_hash(layout.key, cacheKey);
+  if (roomtone != 0xFF)
+    note_roomtone_variant(config, cacheKey, layout, roomtone);
   if (ready.contains(runtimeKey))
     return runtimeKey;
   // XR room lighting's variants are kept for prewarming the next launch
@@ -1682,12 +1759,28 @@ struct RecordedPair {
   RenderTargetLayout layout;
 };
 
+// The launcher's Lighting (AURORA_XR_ROOM_LIGHT overrides it), which this
+// process keeps: Roomtone's eye pipelines are its own.
+static bool roomtone_at_launch() {
+#if defined(AURORA_ENABLE_OPENXR) && !defined(__EMSCRIPTEN__)
+  if (const char* v = std::getenv("AURORA_XR_ROOM_LIGHT"); v != nullptr && *v != '\0')
+    return std::atoi(v) != 0;
+  return g_config.xrRoomLight == 1;
+#else
+  return false;
+#endif
+}
+
 // Every recorded pair this build can still use, in the order draws first asked
-// for them.
+// for them, as the lighting at launch draws them: a pair recorded in the other
+// lighting gives this one's pipelines (Vanilla's: the room bits cleared;
+// Roomtone's: the variants pipeline_room recorded for the config, the config
+// itself where none were).
 /* unbuiltOnly: just the pairs not marked built for this app build and driver
  * (pipeline_built; the Quest launcher's precompile). */
 static std::vector<RecordedPair> load_recorded_pairs(bool unbuiltOnly = false) {
   std::vector<RecordedPair> jobs;
+  const bool roomtone = roomtone_at_launch();
   {
     absl::flat_hash_map<uint64_t, RenderTargetLayout> layouts;
     sqlite3_stmt* stmt = nullptr;
@@ -1714,19 +1807,41 @@ static std::vector<RecordedPair> load_recorded_pairs(bool unbuiltOnly = false) {
     }
     sqlite3_finalize(stmt);
     stmt = nullptr;
-    const char* sql = unbuiltOnly && TrackBuiltPairs
-                          ? "SELECT p.type, p.layout_key, c.config FROM pipeline_pair p "
-                            "JOIN pipeline_cache c ON c.type = p.type AND c.hash = p.hash "
-                            "LEFT JOIN pipeline_built b ON b.type = p.type AND b.hash = p.hash "
-                            "AND b.layout_key = p.layout_key "
-                            "WHERE b.build_key IS NULL OR b.build_key != ?1 "
-                            "ORDER BY p.first_frame_used"
-                          : "SELECT p.type, p.layout_key, c.config FROM pipeline_pair p "
-                            "JOIN pipeline_cache c ON c.type = p.type AND c.hash = p.hash "
-                            "ORDER BY p.first_frame_used";
+    absl::flat_hash_map<HashType, uint32_t> variants;
+    if (roomtone &&
+        sqlite3_prepare_v2(g_pipelineCacheDb, "SELECT hash, variants FROM pipeline_room WHERE type = ?1", -1, &stmt,
+                           nullptr) == SQLITE_OK) {
+      sqlite3_bind_int(stmt, 1, underlying(ShaderType::GX));
+      while (sqlite3_step(stmt) == SQLITE_ROW)
+        variants.emplace(static_cast<HashType>(sqlite3_column_int64(stmt, 0)),
+                         static_cast<uint32_t>(sqlite3_column_int64(stmt, 1)));
+    }
+    sqlite3_finalize(stmt);
+    stmt = nullptr;
+    // Built here already (xxh3(layout key, cache key), as g_builtPairs).
+    absl::flat_hash_set<HashType> built;
+    if (unbuiltOnly && TrackBuiltPairs &&
+        sqlite3_prepare_v2(g_pipelineCacheDb, "SELECT hash, layout_key FROM pipeline_built WHERE build_key = ?1", -1,
+                           &stmt, nullptr) == SQLITE_OK) {
+      sqlite3_bind_int64(stmt, 1, static_cast<sqlite3_int64>(g_buildKey));
+      while (sqlite3_step(stmt) == SQLITE_ROW)
+        built.insert(xxh3_hash(static_cast<uint64_t>(sqlite3_column_int64(stmt, 1)),
+                               static_cast<HashType>(sqlite3_column_int64(stmt, 0))));
+    }
+    sqlite3_finalize(stmt);
+    stmt = nullptr;
+    absl::flat_hash_set<HashType> queued;
+    size_t recorded = 0, derived = 0;
+    const auto add = [&](ShaderType type, const auto& config, const RenderTargetLayout& layout) {
+      const HashType cacheKey = xxh3_hash(config, static_cast<HashType>(type));
+      if (!queued.insert(xxh3_hash(layout.key, cacheKey)).second || built.contains(xxh3_hash(layout.key, cacheKey)))
+        return;
+      jobs.push_back({type, config, layout});
+    };
+    const char* sql = "SELECT p.type, p.layout_key, c.config, p.hash FROM pipeline_pair p "
+                      "JOIN pipeline_cache c ON c.type = p.type AND c.hash = p.hash "
+                      "ORDER BY p.first_frame_used";
     if (sqlite3_prepare_v2(g_pipelineCacheDb, sql, -1, &stmt, nullptr) == SQLITE_OK) {
-      if (unbuiltOnly && TrackBuiltPairs)
-        sqlite3_bind_int64(stmt, 1, static_cast<sqlite3_int64>(g_buildKey));
       while (sqlite3_step(stmt) == SQLITE_ROW) {
         const auto type = static_cast<ShaderType>(sqlite3_column_int(stmt, 0));
         const auto layoutIt = layouts.find(static_cast<uint64_t>(sqlite3_column_int64(stmt, 1)));
@@ -1734,19 +1849,44 @@ static std::vector<RecordedPair> load_recorded_pairs(bool unbuiltOnly = false) {
         const int size = sqlite3_column_bytes(stmt, 2);
         if (layoutIt == layouts.end() || blob == nullptr)
           continue;
+        const auto& layout = layoutIt->second;
         if (type == ShaderType::GX && size == static_cast<int>(sizeof(gx::PipelineConfig))) {
           gx::PipelineConfig config;
           std::memcpy(&config, blob, sizeof(config));
-          if (config.version == gx::GXPipelineConfigVersion)
-            jobs.push_back({type, config, layoutIt->second});
+          if (config.version != gx::GXPipelineConfigVersion)
+            continue;
+          ++recorded;
+          const bool roomBits = gx::has_room_bits(config);
+          if (!roomtone) {
+            add(type, roomBits ? gx::vanilla_config(config) : config, layout);
+            derived += roomBits;
+            continue;
+          }
+          const auto it =
+              roomBits ? variants.end() : variants.find(static_cast<HashType>(sqlite3_column_int64(stmt, 3)));
+          const uint32_t mask =
+              it == variants.end() ? 0 : (it->second >> (roomtone_eye_layout(layout) ? 0 : 16)) & 0xFFFF;
+          if (mask == 0) {
+            add(type, config, layout);
+            continue;
+          }
+          for (uint8_t v = 0; v < gx::RoomtoneVariants; ++v)
+            if ((mask >> v) & 1) {
+              add(type, gx::roomtone_config(config, v), layout);
+              derived += v != 0;
+            }
         } else if (type == ShaderType::Clear && size == static_cast<int>(sizeof(clear::PipelineConfig))) {
           clear::PipelineConfig config;
           std::memcpy(&config, blob, sizeof(config));
-          if (config.version == clear::ClearPipelineConfigVersion)
-            jobs.push_back({type, config, layoutIt->second});
+          if (config.version == clear::ClearPipelineConfigVersion) {
+            ++recorded;
+            add(type, config, layout);
+          }
         }
       }
     }
+    Log.info("Recorded pipelines for {}: {} pairs, {} of them taken from the other lighting's ({} to build)",
+             roomtone ? "Roomtone" : "Vanilla", recorded, derived, jobs.size());
     sqlite3_finalize(stmt);
   }
   return jobs;

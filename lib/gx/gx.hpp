@@ -619,6 +619,15 @@ struct BindGroupRanges {
   std::array<gfx::Range, MaxIndexAttr> vaRanges{};
 };
 void populate_pipeline_config(PipelineConfig& config, GXPrimitive primitive, GXVtxFmt fmt) noexcept;
+/* Roomtone's pipelines, from Vanilla's (the pipeline cache's pipeline_room):
+ * a draw's variant is its class (bits 0-1, as ShaderConfig::xrRoom; eye
+ * pipelines only), its stage's gloss (bit 2) and SMOOTH normals (bit 3)
+ * under the launcher's Roomtone, whatever the lighting now. A config with
+ * every room bit cleared, and that config as Roomtone draws it. */
+constexpr u8 RoomtoneVariants = 16;
+PipelineConfig vanilla_config(const PipelineConfig& config) noexcept;
+PipelineConfig roomtone_config(const PipelineConfig& vanilla, u8 variant) noexcept;
+bool has_room_bits(const PipelineConfig& config) noexcept;
 wgpu::RenderPipeline build_pipeline(const PipelineConfig& config, const gfx::RenderTargetLayout& layout,
                                     ArrayRef<wgpu::VertexBufferLayout> vtxBuffers, wgpu::ShaderModule shader,
                                     const char* label) noexcept;

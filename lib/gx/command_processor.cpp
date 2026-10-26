@@ -1893,29 +1893,65 @@ static void xr_room_emitter(const u8* raw, u16 vtxCount) noexcept {
   gfx::xr_add_emitter(e->emitter, lo, hi, rgb.data(), e->reach);
 }
 
-static u8 xr_room_class() noexcept {
-  if (gfx::xr_room_light() == 0 || sLinkTag == 0 || xr_additive(sDrawCache.config))
+// The current draw's class by its link, lit or not: 0 none, 1 fighters, 2
+// the stage.
+static u8 xr_link_class() noexcept {
+  if (sLinkTag == 0 || xr_additive(sDrawCache.config))
     return 0;
   const u32 link = sLinkTag - 1;
-  if (link <= 6)
-    xr_room_texdump();
   if (link <= 6 && xr_room_emissive() != nullptr)
     return 0;
   return link == 5 || link == 6 ? 1 : link <= 4 ? 2 : 0;
 }
 
-// SMOOTH shading's normals for the current draw (ShaderConfig::xrSmoothNrm):
-// a stage triangle draw without its own normals, its every attribute
-// decoded, with room for one more.
-static bool xr_room_smooth(const ShaderConfig& sc) noexcept {
-  room_fit_tick();
-  if ((gfx::xr_room_light() & 32u) == 0 || xr_room_class() != 2 || !sc.decodedAll || sc.lineMode != 0 ||
-      sDrawPrim == 0 || sc.attrs[GX_VA_NRM].attrType != GX_NONE)
+static u8 xr_room_class() noexcept {
+  if (gfx::xr_room_light() == 0 || sLinkTag == 0 || xr_additive(sDrawCache.config))
+    return 0;
+  if (sLinkTag - 1 <= 6)
+    xr_room_texdump();
+  return xr_link_class();
+}
+
+// A triangle draw without its own normals, its every attribute decoded, with
+// room for SMOOTH shading's (the last config's answer stands for its draws;
+// `fresh`: a config not yet in sDrawCache.pipelineRef).
+static bool xr_smooth_fits(const ShaderConfig& sc, bool fresh = false) noexcept {
+  if (!sc.decodedAll || sc.lineMode != 0 || sDrawPrim == 0 || sc.attrs[GX_VA_NRM].attrType != GX_NONE)
     return false;
+  static gfx::PipelineRef lastRef = 0;
+  static bool lastFits = false;
+  if (!fresh && sDrawCache.pipelineRef == lastRef && lastRef != 0)
+    return lastFits;
   ShaderConfig with = sc;
   with.xrSmoothNrm = 1;
   DecodedLayout layout;
-  return decoded_layout(with, layout);
+  const bool fits = decoded_layout(with, layout);
+  if (!fresh) {
+    lastRef = sDrawCache.pipelineRef;
+    lastFits = fits;
+  }
+  return fits;
+}
+
+// SMOOTH shading's normals for the current draw (ShaderConfig::xrSmoothNrm):
+// a stage draw that fits them.
+static bool xr_room_smooth(const ShaderConfig& sc, bool fresh = false) noexcept {
+  room_fit_tick();
+  return (gfx::xr_room_light() & 32u) != 0 && xr_room_class() == 2 && xr_smooth_fits(sc, fresh);
+}
+
+// The current draw's variant under Roomtone, whatever the lighting now
+// (gx::roomtone_config), for the pipeline cache to record against the
+// pipelines it asks for: its eye pipelines' (`eye`), or its others', which
+// only SMOOTH normals change. Without the eyes, none (0xFF).
+static u8 xr_roomtone_variant(bool eye) noexcept {
+  if (gfx::xr_multiview_layout() == nullptr)
+    return 0xFF;
+  const u8 cls = xr_link_class();
+  const bool smooth = cls == 2 && xr_smooth_fits(sDrawCache.config.shaderConfig);
+  if (!eye)
+    return smooth ? 8 : 0;
+  return cls | (cls == 2 && gfx::xr_roomtone_gloss() ? 4 : 0) | (smooth ? 8 : 0);
 }
 
 // AURORA_XR_ROOM_CENSUS=1 (a survey, with or without the room light): how
@@ -2028,9 +2064,11 @@ static const PipelineConfig& xr_eye_config() noexcept {
 static gfx::PipelineRef xr_twin(const gfx::RenderTargetLayout& layout, gfx::PipelineRef& ref,
                                 gfx::PipelineRef& forPipeline, uint64_t& forLayout) noexcept {
   auto& cache = sDrawCache;
-  const uint64_t key = layout.key ^ xr_room_salt();
+  // The Roomtone variant too: a config drawn as another's is recorded once more.
+  const u8 variant = xr_roomtone_variant(true);
+  const uint64_t key = layout.key ^ xr_room_salt() ^ (variant + 1ull) * 0xC2B2AE3D27D4EB4Full;
   if (forPipeline != cache.pipelineRef || forLayout != key) {
-    ref = gfx::find_pipeline(xr_eye_config(), layout);
+    ref = gfx::find_pipeline(xr_eye_config(), layout, variant);
     forPipeline = cache.pipelineRef;
     forLayout = key;
   }
@@ -2252,7 +2290,7 @@ static gfx::PipelineRef xr_motion_pipeline(XrMotionKind kind, bool clipped = fal
   auto& cache = sDrawCache;
   auto& twin = cache.xrMotionTwin[slot];
   if (twin.forPipeline != cache.pipelineRef || twin.forLayout != layout->key) {
-    twin.ref = gfx::find_pipeline(xr_motion_twin_config(kind), *layout);
+    twin.ref = gfx::find_pipeline(xr_motion_twin_config(kind), *layout, xr_roomtone_variant(false));
     twin.forPipeline = cache.pipelineRef;
     twin.forLayout = layout->key;
   }
@@ -2288,9 +2326,10 @@ static gfx::PipelineRef xr_batch_pipeline(bool motion, XrMotionKind kind = XrMot
   auto& ref = motion ? cache.xrMotionBatchRef : cache.xrBatchRef;
   auto& forPipeline = motion ? cache.xrMotionBatchForPipeline : cache.xrBatchForPipeline;
   auto& forLayout = motion ? cache.xrMotionBatchForLayout : cache.xrBatchForLayout;
-  const uint64_t key = layout.key ^ (motion ? 0 : xr_room_salt());
+  const u8 variant = xr_roomtone_variant(!motion);
+  const uint64_t key = layout.key ^ (motion ? 0 : xr_room_salt()) ^ (variant + 1ull) * 0xC2B2AE3D27D4EB4Full;
   if (forPipeline != cache.pipelineRef || forLayout != key) {
-    ref = gfx::find_pipeline(motion ? xr_motion_twin_config(kind) : xr_eye_config(), layout);
+    ref = gfx::find_pipeline(motion ? xr_motion_twin_config(kind) : xr_eye_config(), layout, variant);
     forPipeline = cache.pipelineRef;
     forLayout = key;
   }
@@ -2454,6 +2493,11 @@ static void push_gx_draw(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, gfx::Rang
     const auto prevSampledTextures = cache.shaderInfo.sampledTextures;
     const auto prevSampledIndTextures = cache.shaderInfo.sampledIndTextures;
     populate_pipeline_config(cache.config, prim, fmt);
+#if defined(AURORA_ENABLE_OPENXR) && !defined(__EMSCRIPTEN__)
+    // SMOOTH normals first: the pipeline without them was asked for (and
+    // built) for nothing.
+    cache.config.shaderConfig.xrSmoothNrm = xr_room_smooth(cache.config.shaderConfig, true);
+#endif
     cache.shaderInfo = build_shader_info(cache.config.shaderConfig);
     cache.pipelineRef = gfx::pipeline_ref(cache.config);
     cache.targetLayoutKey = targetLayoutKey;
@@ -2471,6 +2515,17 @@ static void push_gx_draw(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, gfx::Rang
   if (const bool smooth = xr_room_smooth(cache.config.shaderConfig); smooth != cache.config.shaderConfig.xrSmoothNrm) {
     cache.config.shaderConfig.xrSmoothNrm = smooth;
     cache.pipelineRef = gfx::pipeline_ref(cache.config);
+  }
+  // Its Roomtone variant for the pipeline cache, as the eye and motion
+  // pipelines record theirs.
+  if (const u8 variant = xr_roomtone_variant(false); variant != 0xFF) {
+    static gfx::PipelineRef notedRef = 0;
+    static u8 notedVariant = 0xFF;
+    if (cache.pipelineRef != notedRef || variant != notedVariant) {
+      gfx::note_roomtone_variant(cache.config, gfx::get_render_target_layout(), variant);
+      notedRef = cache.pipelineRef;
+      notedVariant = variant;
+    }
   }
 #endif
 
