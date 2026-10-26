@@ -905,12 +905,15 @@ std::string xr_room_mat_src(const ShaderConfig& config, const ColorChannelConfig
 // the room adds its shading and colour; with smooth normals, the baked
 // light's own shading divided out (xr_dl, the vertex's de-light factor, by
 // the Light page's DELIGHT, xr.room_h.w). Diffuse and unlit ones add the
-// stage's emitters' light (xr_room_emit).
+// stage's emitters' light (xr_room_emit). A fighter's lit channels take the
+// room's light by xr.room_up.w (lib/xr's kFighterLight).
 std::string xr_room_mix(const ShaderConfig& config, const ColorChannelConfig& cc, u8 i, std::string_view target,
                         std::string_view nrm, std::string_view mat) {
   const std::string_view weight = !cc.lightingEnabled ? "xr.room_w.z"sv
                                   : config.xrRoom == 1 ? "xr.room_w.x"sv
                                                        : "xr.room_w.y"sv;
+  // The fighters' light over the stage's (lib/xr's kFighterLight).
+  const std::string_view fighter = config.xrRoom == 1 ? "xr.room_up.w"sv : "1.0"sv;
   std::string room;
   if (!cc.lightingEnabled) {
     room = config.xrRoomFacet ? fmt::format("xr_room_diffuse({0}) * (xr.room_w.w * xr_dl) + xr_room_emit({0})", nrm)
@@ -933,14 +936,14 @@ std::string xr_room_mix(const ShaderConfig& config, const ColorChannelConfig& cc
           let cos_attn = dot(light.cos_att, vec3f(1.0, attn, attn * attn));
           let dist_attn = {4};
           attn = max(0.0, cos_attn / dist_attn);
-          spec = attn * {5} * xr.room_col[0].rgb;
+          spec = attn * {5} * xr.room_col[0].rgb * {8};
           break;
       }}
       {1} = vec4f(mix({1}.rgb, ({6}).rgb * clamp(spec, vec3f(0.0), vec3f(1.0)), {7}), {1}.a);
     }})""",
-                       i, target, nrm, GX::MaxLights, distAttn, diff, mat, weight);
+                       i, target, nrm, GX::MaxLights, distAttn, diff, mat, weight, fighter);
   } else {
-    room = fmt::format("(xr_room_diffuse({0}) + xr_room_emit({0}))", nrm);
+    room = fmt::format("(xr_room_diffuse({0}) * {1} + xr_room_emit({0}))", nrm, fighter);
   }
   return fmt::format("\n    {0} = vec4f(mix({0}.rgb, ({1}).rgb * {2}, {3}), {0}.a);", target, mat, room, weight);
 }

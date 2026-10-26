@@ -6859,6 +6859,11 @@ struct {
 constexpr int64_t kCaptureNs = 20'000'000'000;
 // The fighters' mean light at level 1.
 constexpr float kCapFighters = 0.7f;
+// The fighters' light over the stage's, on top of STRENGTH (any source):
+// with the stage right at 0.5, they looked right at 0.55 (2026-10-26).
+// Only the fighters' pipelines take it (room_up.w), not the stage's lit
+// draws, which share the room's SH and lights.
+constexpr float kFighterLight = 1.1f;
 constexpr int kRoomSourceCaptured = static_cast<int>(kRoomPresets.size()) + 1;
 
 // The launcher's Lighting > Roomtone (Beta): the room capture, lit as the
@@ -8010,7 +8015,7 @@ void set_room_light_mode(int mode) {
 // What render_eyes puts in the eye uniform's room fields, for a frame.
 struct RoomFrame {
   bool on = false;
-  float w[4]{}, up[4]{};
+  float w[4]{}, up[4]{}; // up: an up-facing surface's light, w kFighterLight
   // The SH at each point of the grid (the room), for the shader to blend
   // between by a vertex's or pixel's place.
   float sh[kCapPoints][9][4]{};
@@ -8184,6 +8189,7 @@ RoomFrame room_frame(const std::array<float, 16>& arena) {
       e += std::max(f.dir[l][1], 0.f) * f.col[l][c];
     f.up[c] = std::clamp(e, 0.f, 1.f);
   }
+  f.up[3] = kFighterLight;
   // Unlit draws lit by normals: relative to an up-facing surface's light
   // (its brightness, as STRENGTH leaves it at 1), as baked stages are lit
   // from above: their tops keep the baked brightness, taking the room's
