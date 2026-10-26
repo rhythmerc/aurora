@@ -6815,14 +6815,21 @@ float stage_gloss(int grkind) {
 // A stage's own tuning of the room's light, multiplying STRENGTH, KEY and
 // GLOSS while it plays (set by eye on the headset with the dev tools'
 // Light page, defaults otherwise). Corneria: the Great Fox's broad hull
-// took the key lights far too brightly (2026-10-25).
+// took the key lights far too brightly (2026-10-25). Strengths set against
+// Roomtone's 0.5 (2026-10-26: Corneria and Big Blue liked at 0.6, Onett at
+// 0.4).
 struct StageLightTune {
   float strength = 1.f, keys = 1.f, gloss = 1.f;
 };
 StageLightTune stage_light_tune(int grkind) {
   switch (grkind) {
   case 0x0E: // Corneria
-    return {0.65f, 0.35f, 0.5f};
+    return {0.78f, 0.35f, 0.5f};
+  case 0x13: // Big Blue
+  case 0x22: // Big Blue's route
+    return {1.2f, 1.f, 1.f};
+  case 0x14: // Onett
+    return {0.8f, 1.f, 1.f};
   default:
     return {};
   }
@@ -6855,8 +6862,9 @@ constexpr float kCapFighters = 0.7f;
 constexpr int kRoomSourceCaptured = static_cast<int>(kRoomPresets.size()) + 1;
 
 // The launcher's Lighting > Roomtone (Beta): the room capture, lit as the
-// user tuned it on the headset (AURORA_XR_ROOM_LIGHT=4,1,1,1,1,0,3,0,1,1,1,0,
-// 2026-10-24: the rest are RoomLight's defaults).
+// user tuned it on the headset (AURORA_XR_ROOM_LIGHT=4,1,1,1,0.5,0,3,0,1,1,1,0:
+// strength 1 on 2026-10-24, 0.5 on 2026-10-26; the rest are RoomLight's
+// defaults).
 // AURORA_XR_ROOMTONE_SHADING (0-3, as AURORA_XR_ROOM_LIGHT's shading) tries
 // another: FACET (2) makes its normals on the GPU, where SMOOTH's are made on
 // the CPU for every stage draw without its own, each frame (and only SMOOTH
@@ -6867,6 +6875,7 @@ const RoomLight& roomtone() {
     RoomLight l;
     l.source = kRoomSourceCaptured;
     l.unlit = 1.f;
+    l.strength = 0.5f;
     l.shading = 3; // smooth normals where meshes have none
     if (const char* v = std::getenv("AURORA_XR_ROOMTONE_SHADING"))
       l.shading = std::clamp(std::atoi(v), 0, 3);
