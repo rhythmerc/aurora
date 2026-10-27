@@ -632,9 +632,6 @@ constexpr int RoomtoneShading = 2;
 PipelineConfig vanilla_config(const PipelineConfig& config) noexcept;
 // As that SHADING draws it (a variant's SMOOTH bit counts under SMOOTH only).
 PipelineConfig roomtone_config(const PipelineConfig& vanilla, u8 variant, int shading = RoomtoneShading) noexcept;
-// A stage draw whose SMOOTH normals are soft ones (translucent meshes:
-// blended, not additive, indexed positions), which FACET gives them too.
-bool soft_normals_fit(const PipelineConfig& config) noexcept;
 // A config with room bits: its variant, as roomtone_config takes it.
 u8 roomtone_variant(const PipelineConfig& config) noexcept;
 bool has_room_bits(const PipelineConfig& config) noexcept;
