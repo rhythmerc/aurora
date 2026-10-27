@@ -469,18 +469,23 @@ PipelineConfig vanilla_config(const PipelineConfig& config) noexcept {
 
 // Roomtone's shading is SMOOTH (lib/xr's roomtone()): facet normals per
 // pixel where the mesh has none, the CPU's smooth ones on the stage.
-PipelineConfig roomtone_config(const PipelineConfig& vanilla, u8 variant) noexcept {
+PipelineConfig roomtone_config(const PipelineConfig& vanilla, u8 variant, int shading) noexcept {
   PipelineConfig c = vanilla;
   auto& sc = c.shaderConfig;
   const u8 cls = variant & 3;
-  sc.xrSmoothNrm = (variant >> 3) & 1;
+  sc.xrSmoothNrm = shading == 3 && ((variant >> 3) & 1);
   if (cls != 0) {
     sc.xrRoom = cls;
-    sc.xrRoomFacet = 1;
-    sc.xrRoomPixel = 1;
+    sc.xrRoomFacet = shading >= 2;
+    sc.xrRoomPixel = shading >= 1;
     sc.xrRoomGloss = cls == 2 && ((variant >> 2) & 1);
   }
   return c;
+}
+
+u8 roomtone_variant(const PipelineConfig& config) noexcept {
+  const auto& sc = config.shaderConfig;
+  return (sc.xrRoom & 3) | (sc.xrRoomGloss ? 4 : 0) | (sc.xrSmoothNrm ? 8 : 0);
 }
 
 bool has_room_bits(const PipelineConfig& config) noexcept {

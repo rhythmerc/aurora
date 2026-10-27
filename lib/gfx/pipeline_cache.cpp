@@ -1771,6 +1771,21 @@ static bool roomtone_at_launch() {
 #endif
 }
 
+// Roomtone's SHADING at launch (gx::roomtone_config's): AURORA_XR_ROOM_LIGHT's
+// shading field where that is set (0 without one, as RoomLight), else
+// AURORA_XR_ROOMTONE_SHADING, else gx::RoomtoneShading (lib/xr's roomtone()).
+static int roomtone_shading_at_launch() {
+  if (const char* v = std::getenv("AURORA_XR_ROOM_LIGHT"); v != nullptr && *v != '\0') {
+    for (int field = 0; field < 6 && v != nullptr; ++field)
+      if ((v = std::strchr(v, ',')) != nullptr)
+        ++v;
+    return v != nullptr ? std::clamp(std::atoi(v), 0, 3) : 0;
+  }
+  if (const char* s = std::getenv("AURORA_XR_ROOMTONE_SHADING"))
+    return std::clamp(std::atoi(s), 0, 3);
+  return gx::RoomtoneShading;
+}
+
 // Every recorded pair this build can still use, in the order draws first asked
 // for them, as the lighting at launch draws them: a pair recorded in the other
 // lighting gives this one's pipelines (Vanilla's: the room bits cleared;
@@ -1784,6 +1799,7 @@ static bool roomtone_at_launch() {
 static std::vector<RecordedPair> load_recorded_pairs(bool unbuiltOnly = false) {
   std::vector<RecordedPair> jobs;
   const bool roomtone = roomtone_at_launch();
+  const int shading = roomtone ? roomtone_shading_at_launch() : gx::RoomtoneShading;
   {
     absl::flat_hash_map<uint64_t, RenderTargetLayout> layouts;
     sqlite3_stmt* stmt = nullptr;
@@ -1869,8 +1885,13 @@ static std::vector<RecordedPair> load_recorded_pairs(bool unbuiltOnly = false) {
               roomBits ? variants.end() : variants.find(static_cast<HashType>(sqlite3_column_int64(stmt, 3)));
           const uint32_t mask =
               it == variants.end() ? 0 : (it->second >> (roomtone_eye_layout(layout) ? 0 : 16)) & 0xFFFF;
+          if (roomBits) {
+            // Recorded in some shading: Roomtone's at launch.
+            add(type, gx::roomtone_config(gx::vanilla_config(config), gx::roomtone_variant(config), shading), layout);
+            continue;
+          }
           if (mask == 0) {
-            if (roomBits || variants.empty() || !roomtone_eye_layout(layout))
+            if (variants.empty() || !roomtone_eye_layout(layout))
               add(type, config, layout);
             else
               ++skipped;
@@ -1878,7 +1899,7 @@ static std::vector<RecordedPair> load_recorded_pairs(bool unbuiltOnly = false) {
           }
           for (uint8_t v = 0; v < gx::RoomtoneVariants; ++v)
             if ((mask >> v) & 1) {
-              add(type, gx::roomtone_config(config, v), layout);
+              add(type, gx::roomtone_config(config, v, shading), layout);
               derived += v != 0;
             }
         } else if (type == ShaderType::Clear && size == static_cast<int>(sizeof(clear::PipelineConfig))) {

@@ -625,8 +625,15 @@ void populate_pipeline_config(PipelineConfig& config, GXPrimitive primitive, GXV
  * under the launcher's Roomtone, whatever the lighting now. A config with
  * every room bit cleared, and that config as Roomtone draws it. */
 constexpr u8 RoomtoneVariants = 16;
+// Roomtone's SHADING (AURORA_XR_ROOM_LIGHT's: 0 per vertex, 1 per pixel,
+// 2 FACET, 3 SMOOTH) unless AURORA_XR_ROOMTONE_SHADING says otherwise:
+// FACET, which looked near SMOOTH on the headset and ran better (2026-10-26).
+constexpr int RoomtoneShading = 2;
 PipelineConfig vanilla_config(const PipelineConfig& config) noexcept;
-PipelineConfig roomtone_config(const PipelineConfig& vanilla, u8 variant) noexcept;
+// As that SHADING draws it (a variant's SMOOTH bit counts under SMOOTH only).
+PipelineConfig roomtone_config(const PipelineConfig& vanilla, u8 variant, int shading = RoomtoneShading) noexcept;
+// A config with room bits: its variant, as roomtone_config takes it.
+u8 roomtone_variant(const PipelineConfig& config) noexcept;
 bool has_room_bits(const PipelineConfig& config) noexcept;
 wgpu::RenderPipeline build_pipeline(const PipelineConfig& config, const gfx::RenderTargetLayout& layout,
                                     ArrayRef<wgpu::VertexBufferLayout> vtxBuffers, wgpu::ShaderModule shader,

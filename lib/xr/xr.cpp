@@ -6867,14 +6867,17 @@ constexpr float kFighterLight = 1.1f;
 constexpr int kRoomSourceCaptured = static_cast<int>(kRoomPresets.size()) + 1;
 
 // The launcher's Lighting > Roomtone (Beta): the room capture, lit as the
-// user tuned it on the headset (AURORA_XR_ROOM_LIGHT=4,1,1,1,0.7,0,3,0,1,1,0.1,0:
+// user tuned it on the headset (AURORA_XR_ROOM_LIGHT=4,1,1,1,0.7,0,2,0,1,1,0.1,0:
 // strength 1 on 2026-10-24, 0.5 then 0.7 with KEY 0.1 on 2026-10-26; the
 // rest are RoomLight's defaults).
+// Its shading is FACET (gx::RoomtoneShading), normals made on the GPU per
+// pixel: on the headset it looked near SMOOTH, and ran better, on most
+// stages (2026-10-26). SMOOTH makes its normals on the CPU for every stage
+// draw without its own, each frame (and only SMOOTH divides out the
+// stages' baked light).
 // AURORA_XR_ROOMTONE_SHADING (0-3, as AURORA_XR_ROOM_LIGHT's shading) tries
-// another: FACET (2) makes its normals on the GPU, where SMOOTH's are made on
-// the CPU for every stage draw without its own, each frame (and only SMOOTH
-// divides out the stages' baked light). Read when first asked for: the
-// platform's env file is applied after static initialization.
+// another. Read when first asked for: the platform's env file is applied
+// after static initialization.
 const RoomLight& roomtone() {
   static const RoomLight r = [] {
     RoomLight l;
@@ -6882,7 +6885,7 @@ const RoomLight& roomtone() {
     l.unlit = 1.f;
     l.strength = 0.7f;
     l.keys = 0.1f;
-    l.shading = 3; // smooth normals where meshes have none
+    l.shading = gx::RoomtoneShading;
     if (const char* v = std::getenv("AURORA_XR_ROOMTONE_SHADING"))
       l.shading = std::clamp(std::atoi(v), 0, 3);
     return l;
