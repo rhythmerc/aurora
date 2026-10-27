@@ -803,10 +803,7 @@ static void smooth_normals(const ShaderConfig& config, const DecodedLayout& layo
   softKey.resize(vtxCount);
   points.clear();
   const auto& cfg = sDrawCache.config;
-  const u8 posType = config.attrs[GX_VA_POS].attrType;
-  const u64 mesh = cfg.blendMode == GX_BM_BLEND && !xr_additive(cfg) && (posType == GX_INDEX8 || posType == GX_INDEX16)
-                       ? array_content_hash(GX_VA_POS)
-                       : 0;
+  const u64 mesh = gx::soft_normals_fit(cfg) ? array_content_hash(GX_VA_POS) : 0;
   for (u32 v = 0; v < vtxCount; ++v) {
     std::memcpy(pos[v].data(), at(v, posOffset), 12);
     u32 key[4]{};
@@ -907,8 +904,10 @@ static void smooth_normals(const ShaderConfig& config, const DecodedLayout& layo
   }
   const auto& cc = config.colorChannels[0];
   const float* view = gfx::xr_world_view();
-  const bool baked = ras && clrOffset >= 0 && cc.matSrc == GX_SRC_VTX && !cc.lightingEnabled && view != nullptr &&
-                     !xr_additive(cfg);
+  // Under SMOOTH only: FACET's soft normals (translucent draws alone) would
+  // fit the baked light from those draws and de-light them by it.
+  const bool baked = (gfx::xr_room_light() & 32u) != 0 && ras && clrOffset >= 0 && cc.matSrc == GX_SRC_VTX &&
+                     !cc.lightingEnabled && view != nullptr && !xr_additive(cfg);
   const bool accumulate = baked && !fit.frozen;
   const bool delight = baked && fit.frozen && fit.valid;
   const float up = fit.c[0] + fit.c[2];
@@ -1934,10 +1933,18 @@ static bool xr_smooth_fits(const ShaderConfig& sc, bool fresh = false) noexcept 
 }
 
 // SMOOTH shading's normals for the current draw (ShaderConfig::xrSmoothNrm):
-// a stage draw that fits them.
+// a stage draw that fits them. FACET gives the stage's translucent meshes
+// theirs (soft ones, gx::soft_normals_fit) and leaves the rest to its
+// facets: Kongo Jungle's waterfall crest, undulating ribbons, showed every
+// facet under it.
 static bool xr_room_smooth(const ShaderConfig& sc, bool fresh = false) noexcept {
   room_fit_tick();
-  return (gfx::xr_room_light() & 32u) != 0 && xr_room_class() == 2 && xr_smooth_fits(sc, fresh);
+  const u32 room = gfx::xr_room_light();
+  if (xr_room_class() != 2)
+    return false;
+  if ((room & 32u) == 0 && ((room & 16u) == 0 || !gx::soft_normals_fit(sDrawCache.config)))
+    return false;
+  return xr_smooth_fits(sc, fresh);
 }
 
 // The current draw's variant under Roomtone, whatever the lighting now

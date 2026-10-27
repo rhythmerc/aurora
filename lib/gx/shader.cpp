@@ -2329,6 +2329,31 @@ std::string build_shader_source(const ShaderConfig& config, uint32_t normalAttac
                                  : "(xr.room_up.rgb + xr_room_emit(vec3f(0.0)))"s;
     fragReturn.insert(0, fmt::format("\n    prev = vec4f(prev.rgb * mix(vec3f(1.0), {}, xr.room_w.z), prev.a);", room));
   }
+  // FACET's room SH (draws without normals) as an ambient cube made per
+  // vertex: the grid's blend is 8 points' SH, 72 uniform reads a pixel,
+  // which dipped frames with the stage close; a pixel now weighs six
+  // colours by its facet normal (the key lights stay per pixel). Packed in
+  // five varyings, where the draw has five to spare (WebGPU's default
+  // limit, 15 in compatibility mode, less one to be safe).
+  // AURORA_XR_ROOM_CUBE=0 blends per pixel again (an A/B).
+  static const bool xrCubeOn = [] {
+    const char* v = std::getenv("AURORA_XR_ROOM_CUBE");
+    return v == nullptr || std::atoi(v) != 0;
+  }();
+  if (xrCubeOn && xrRoomFacetNrm && !xrRoomSmoothNrm && config.xrRoomPixel && vtxOutIdx + 5 <= 14) {
+    for (int i = 0; i < 4; ++i)
+      vtxOutAttrs += fmt::format("\n    @location({}) xr_c{}: vec4f,", vtxOutIdx++, i);
+    vtxOutAttrs += fmt::format("\n    @location({}) xr_c4: vec2f,", vtxOutIdx++);
+    vtxXfrAttrsPre += "\n    let xr_cb = xr_room_cube();"
+                      "\n    out.xr_c0 = vec4f(xr_cb[0], xr_cb[1].x);"
+                      "\n    out.xr_c1 = vec4f(xr_cb[1].yz, xr_cb[2].xy);"
+                      "\n    out.xr_c2 = vec4f(xr_cb[2].z, xr_cb[3]);"
+                      "\n    out.xr_c3 = vec4f(xr_cb[4], xr_cb[5].x);"
+                      "\n    out.xr_c4 = xr_cb[5].yz;";
+    fragmentFnPre.insert(0, "\n    xr_vcube = true;"
+                            "\n    xr_cube = array<vec3f, 6>(in.xr_c0.xyz, vec3f(in.xr_c0.w, in.xr_c1.xy),"
+                            " vec3f(in.xr_c1.zw, in.xr_c2.x), in.xr_c2.yzw, in.xr_c3.xyz, vec3f(in.xr_c3.w, in.xr_c4));");
+  }
 
   /* Byte/half-word unpacking has no form every mobile compiler accepts:
    * PowerVR Rogue miscompiles extractBits on storage-buffer reads (vertex
@@ -2741,6 +2766,8 @@ fn fs_main(in: VertexOutput) -> {10} {{{6}{5}{11}
                                                   "\nvar<private> xr_she: vec3f;"
                                                   "\nvar<private> xr_sho: vec3f;"
                                                   "\nvar<private> xr_shs: f32;"
+                                                  "\nvar<private> xr_vcube: bool;"
+                                                  "\nvar<private> xr_cube: array<vec3f, 6>;"
                                                   "\nvar<private> xr_prev: vec4f;"
                                                   "\nfn gx_proj(p: vec3f) -> vec4f {{"
                                                   "\n    xr_cam = p;"
@@ -2779,35 +2806,80 @@ fn xr_room_n(n_cam: vec3f) -> vec3f {
 // The blended SH at a room-space normal, as its even part (constant and
 // quadratic) and odd part (linear): SH(n) = e + o, SH(-n) = e - o.
 struct XrShEo { e: vec3f, o: vec3f };
-fn xr_room_sh_eo(n: vec3f) -> XrShEo {
-    let dims = vec3u(u32(xr.room_probe[0].w), u32(xr.room_probe[1].w), u32(xr.room_probe[2].w));
-    var c0 = vec3u(0u);
-    var f = vec3f(0.0);
+// Where xr_rp is among the grid's points: its cell's first corner and the
+// fractions across it.
+struct XrCell { dims: vec3u, c0: vec3u, f: vec3f };
+fn xr_room_cell() -> XrCell {
+    var c: XrCell;
+    c.dims = vec3u(u32(xr.room_probe[0].w), u32(xr.room_probe[1].w), u32(xr.room_probe[2].w));
+    c.c0 = vec3u(0u);
+    c.f = vec3f(0.0);
     for (var a = 0u; a < 3u; a++) {
         let axis = xr.room_probe[a + 1u].xyz;
         let len2 = dot(axis, axis);
-        if (dims[a] > 1u && len2 > 1e-12) {
-            let u = clamp(dot(xr_rp - xr.room_probe[0].xyz, axis) / len2, 0.0, 1.0) * f32(dims[a] - 1u);
-            c0[a] = min(u32(u), dims[a] - 1u);
-            f[a] = u - f32(c0[a]);
+        if (c.dims[a] > 1u && len2 > 1e-12) {
+            let u = clamp(dot(xr_rp - xr.room_probe[0].xyz, axis) / len2, 0.0, 1.0) * f32(c.dims[a] - 1u);
+            c.c0[a] = min(u32(u), c.dims[a] - 1u);
+            c.f[a] = u - f32(c.c0[a]);
         }
     }
+    return c;
+}
+// A corner's weight in the blend, and where its SH starts in room_sh.
+fn xr_room_corner(c: XrCell, corner: u32) -> vec2f {
+    let up = vec3u(corner & 1u, (corner >> 1u) & 1u, (corner >> 2u) & 1u);
+    let w3 = select(vec3f(1.0) - c.f, c.f, up == vec3u(1u));
+    let ci = c.c0 + up;
+    return vec2f(w3.x * w3.y * w3.z, f32(((ci.z * c.dims.y + ci.y) * c.dims.x + ci.x) * 9u));
+}
+fn xr_room_sh_eo(n: vec3f) -> XrShEo {
+    let c = xr_room_cell();
     var r: XrShEo;
     r.e = vec3f(0.0);
     r.o = vec3f(0.0);
     for (var corner = 0u; corner < 8u; corner++) {
-        let up = vec3u(corner & 1u, (corner >> 1u) & 1u, (corner >> 2u) & 1u);
-        let w3 = select(vec3f(1.0) - f, f, up == vec3u(1u));
-        let k = w3.x * w3.y * w3.z;
+        let kb = xr_room_corner(c, corner);
+        let k = kb.x;
         if (k <= 0.0) { continue; }
-        let ci = c0 + up;
-        let b = ((ci.z * dims.y + ci.y) * dims.x + ci.x) * 9u;
+        let b = u32(kb.y);
         r.o += k * (xr.room_sh[b + 1u].rgb * n.y + xr.room_sh[b + 2u].rgb * n.z + xr.room_sh[b + 3u].rgb * n.x);
         r.e += k * (xr.room_sh[b].rgb + xr.room_sh[b + 4u].rgb * (n.x * n.y) + xr.room_sh[b + 5u].rgb * (n.y * n.z)
             + xr.room_sh[b + 6u].rgb * (3.0 * n.z * n.z - 1.0) + xr.room_sh[b + 7u].rgb * (n.x * n.z)
             + xr.room_sh[b + 8u].rgb * (n.x * n.x - n.y * n.y));
     }
     return r;
+}
+
+// The blended SH at xr_rp as an ambient cube: its light on the room's six
+// axis directions (+x, -x, +y, -y, +z, -z), for a pixel to weigh by its
+// normal (xr_room_cube_at). The SH's cross terms (xy, yz, xz) vanish on the
+// axes and are left out.
+fn xr_room_cube() -> array<vec3f, 6> {
+    let c = xr_room_cell();
+    var ex = vec3f(0.0); var ox = vec3f(0.0);
+    var ey = vec3f(0.0); var oy = vec3f(0.0);
+    var ez = vec3f(0.0); var oz = vec3f(0.0);
+    for (var corner = 0u; corner < 8u; corner++) {
+        let kb = xr_room_corner(c, corner);
+        let k = kb.x;
+        if (k <= 0.0) { continue; }
+        let b = u32(kb.y);
+        let s0 = xr.room_sh[b].rgb;
+        let s6 = xr.room_sh[b + 6u].rgb;
+        let s8 = xr.room_sh[b + 8u].rgb;
+        ox += k * xr.room_sh[b + 3u].rgb;
+        oy += k * xr.room_sh[b + 1u].rgb;
+        oz += k * xr.room_sh[b + 2u].rgb;
+        ex += k * (s0 - s6 + s8);
+        ey += k * (s0 - s6 - s8);
+        ez += k * (s0 + 2.0 * s6);
+    }
+    return array<vec3f, 6>(ex + ox, ex - ox, ey + oy, ey - oy, ez + oz, ez - oz);
+}
+fn xr_room_cube_at(n: vec3f) -> vec3f {
+    let n2 = n * n;
+    return n2.x * select(xr_cube[1], xr_cube[0], n.x >= 0.0) + n2.y * select(xr_cube[3], xr_cube[2], n.y >= 0.0)
+        + n2.z * select(xr_cube[5], xr_cube[4], n.z >= 0.0);
 }
 
 // A light's direction (game camera space, unit, toward it) and its colour's
@@ -2821,13 +2893,16 @@ fn xr_room_light(i: u32) -> vec4f {
 }
 
 // The room's light on a camera-space normal (none: the room's up): the SH
-// per vertex where the vertex stage made it (xr_vsh), else here; the key
+// per vertex where the vertex stage made it (xr_vsh), else from the vertex
+// stage's ambient cube where it made one (xr_vcube), else here; the key
 // lights here, in camera space (the room's placement turns and scales
 // evenly, so angles hold).
 fn xr_room_diffuse(n_cam: vec3f) -> vec3f {
     var e: vec3f;
     if (xr_vsh) {
         e = xr_she + xr_shs * xr_sho;
+    } else if (xr_vcube) {
+        e = xr_room_cube_at(xr_room_n(n_cam));
     } else {
         let r = xr_room_sh_eo(xr_room_n(n_cam));
         e = r.e + r.o;

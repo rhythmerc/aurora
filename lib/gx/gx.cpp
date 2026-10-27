@@ -473,7 +473,7 @@ PipelineConfig roomtone_config(const PipelineConfig& vanilla, u8 variant, int sh
   PipelineConfig c = vanilla;
   auto& sc = c.shaderConfig;
   const u8 cls = variant & 3;
-  sc.xrSmoothNrm = shading == 3 && ((variant >> 3) & 1);
+  sc.xrSmoothNrm = ((variant >> 3) & 1) && (shading == 3 || (shading == 2 && soft_normals_fit(c)));
   if (cls != 0) {
     sc.xrRoom = cls;
     sc.xrRoomFacet = shading >= 2;
@@ -481,6 +481,11 @@ PipelineConfig roomtone_config(const PipelineConfig& vanilla, u8 variant, int sh
     sc.xrRoomGloss = cls == 2 && ((variant >> 2) & 1);
   }
   return c;
+}
+
+bool soft_normals_fit(const PipelineConfig& config) noexcept {
+  const auto pos = config.shaderConfig.attrs[GX_VA_POS].attrType;
+  return config.blendMode == GX_BM_BLEND && config.blendFacDst != GX_BL_ONE && (pos == GX_INDEX8 || pos == GX_INDEX16);
 }
 
 u8 roomtone_variant(const PipelineConfig& config) noexcept {
