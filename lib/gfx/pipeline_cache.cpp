@@ -986,31 +986,65 @@ static bool copy_seed_table(sqlite3* seedDb, const char* select, sqlite3_stmt* i
   return ok;
 }
 
+/* A seed's identity: its SQLite header's file change counter and page count
+ * (bytes 24-31), which any rebuild of it changes. 0: no seed at `path`. */
+static uint64_t pipeline_cache_seed_id(const std::string& path) {
+  SDL_IOStream* io = SDL_IOFromFile(path.c_str(), "rb");
+  if (io == nullptr)
+    return 0;
+  uint8_t header[32];
+  const bool read = SDL_ReadIO(io, header, sizeof(header)) == sizeof(header);
+  SDL_CloseIO(io);
+  if (!read || std::memcmp(header, "SQLite format 3", 15) != 0)
+    return 0;
+  uint64_t id = 0;
+  for (int i = 24; i < 32; ++i)
+    id = id << 8 | header[i];
+  return id & INT64_MAX; // an SQLite integer
+}
+
+/* The bundled seed goes into an empty cache, and again into a filled one when
+ * the seed changed since the one it last took (pipeline_seed): an update's
+ * seed reaches players who already played, not only fresh installs (the
+ * Quest's 0.2.1 seed brought Roomtone, Classic and Adventure pipelines that
+ * 0.2.0's cache never asked for). Merging only adds: pipelines, pairs,
+ * layouts and marks are kept, Roomtone variants joined. */
 static void seed_pipeline_cache() {
   if (g_pipelineCacheBroken || g_pipelineCacheDb == nullptr || g_pipelineCacheUpsertStmt == nullptr) {
-    return;
-  }
-
-  // If the target database is already populated, skip re-seeding to accelerate startup
-  bool alreadySeeded = false;
-  sqlite::exec(g_pipelineCacheDb, "SELECT 1 FROM pipeline_cache LIMIT 1;",
-               [&alreadySeeded](int, char**, char**) { alreadySeeded = true; });
-  if (alreadySeeded) {
     return;
   }
 
   const auto seedPath = pipeline_cache_seed_path();
   const auto besideExe = pipeline_cache_seed_beside_exe_path();
   std::string usedPath = seedPath;
-  sqlite3* seedDb = open_pipeline_cache_seed_db(seedPath);
-  if (seedDb == nullptr && besideExe != seedPath) {
-    seedDb = open_pipeline_cache_seed_db(besideExe);
+  uint64_t seedId = pipeline_cache_seed_id(seedPath);
+  if (seedId == 0 && besideExe != seedPath) {
+    seedId = pipeline_cache_seed_id(besideExe);
     usedPath = besideExe;
   }
-  if (seedDb == nullptr) {
+  if (seedId == 0) {
     Log.info("No bundled initial pipeline cache found at '{}' or '{}'", seedPath, besideExe);
     return;
   }
+  bool populated = false;
+  sqlite::exec(g_pipelineCacheDb, "SELECT 1 FROM pipeline_cache LIMIT 1;",
+               [&populated](int, char**, char**) { populated = true; });
+  sqlite::exec(g_pipelineCacheDb, "CREATE TABLE IF NOT EXISTS pipeline_seed (id INTEGER NOT NULL);");
+  uint64_t mergedId = 0;
+  sqlite::exec(g_pipelineCacheDb, "SELECT id FROM pipeline_seed LIMIT 1;", [&mergedId](int, char** values, char**) {
+    if (values[0] != nullptr)
+      mergedId = std::strtoull(values[0], nullptr, 10);
+  });
+  if (populated && mergedId == seedId) {
+    return;
+  }
+  sqlite3* seedDb = open_pipeline_cache_seed_db(usedPath);
+  if (seedDb == nullptr) {
+    Log.info("Bundled initial pipeline cache at '{}' can't be read", usedPath);
+    return;
+  }
+  if (populated)
+    Log.info("Bundled pipeline cache changed since this cache took one: merging it in");
 
   sqlite3_stmt* seedStmt = nullptr;
   auto closeSeed = [&] {
@@ -1105,6 +1139,12 @@ static void seed_pipeline_cache() {
       Log.info("Seeded {} recorded pairs, {} layouts, {} built-on-device marks and {} Roomtone variants", pairs,
                layouts, marks, rooms);
 
+    if (!writeFailed && !readFailed) {
+      const auto id = std::to_string(seedId);
+      writeFailed = sqlite::exec(g_pipelineCacheDb,
+                                 ("DELETE FROM pipeline_seed; INSERT INTO pipeline_seed (id) VALUES (" + id + ");")
+                                     .c_str()) != SQLITE_OK;
+    }
     if (!writeFailed && !readFailed) {
       tx.commit();
     }
