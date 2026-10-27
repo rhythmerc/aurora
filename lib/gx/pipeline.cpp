@@ -13,6 +13,7 @@
 
 #include <array>
 #include <cstdlib>
+#include <deque>
 #include <string>
 
 #include "../internal.hpp"
@@ -281,6 +282,9 @@ struct XrBatcher {
   std::vector<uint8_t> staging = std::vector<uint8_t>(gfx::detail::XrBatchSlotSize);
   std::vector<const DrawData*> members;
   uint32_t memberIndices = 0;
+  // A replay's straddling draws as their two parts (render): stable for the
+  // members and buckets that point at them until the replay ends.
+  std::deque<DrawData> split;
   uint64_t draws = 0, batches = 0, batchedDraws = 0;
   // Motion replay (AURORA_XR_MOTION_SORT, on by default): the pass writes
   // only depth and motion, depth-tested, so its draws' order doesn't matter
@@ -477,7 +481,7 @@ void emit_batch(const wgpu::RenderPassEncoder& pass) {
       std::memcpy(rec + 17, slots.data() + size_t{i} * 16, 16 * sizeof(uint32_t));
     table[i * 2] = vbase;
     table[i * 2 + 1] = tableWord + n * 2 + i * kRecordWords;
-    if (d.indexCount == 0) {
+    if (d.indexCount == 0 && d.xrIndexCount == 0) {
       for (uint32_t v = 0; v < d.vtxCount; ++v)
         idx[written++] = vbase + v;
     } else {
@@ -548,6 +552,7 @@ void xr_batch_begin(const gfx::detail::FramePacket& frame, bool multiview, bool 
   }
   b.members.clear();
   b.memberIndices = 0;
+  b.split.clear();
   static const bool sort = [] {
     const char* v = std::getenv("AURORA_XR_MOTION_SORT");
     return v == nullptr || *v != '0';
@@ -645,6 +650,25 @@ void render(const DrawData& data, const wgpu::RenderPassEncoder& pass) {
 #if defined(AURORA_ENABLE_OPENXR) && !defined(__EMSCRIPTEN__)
   auto& b = sXrBatch;
   if (b.active) {
+    // A straddling draw split by the clip (xrSolid*): its solid triangles
+    // batch as an inside draw's do, and its triangles in the fade, which
+    // dither, go alone (render_direct's order: those, then the solid ones).
+    // Icicle Mountain's segments cross the box's fade all the time: 60% of
+    // its eye draws went out one by one, Battlefield's 23%.
+    if (data.xrSolidIndexCount != 0 && data.xrBatchPipeline != 0 && gfx::xr_multiview_replay() &&
+        !gfx::xr_motion_replay()) {
+      DrawData& edge = b.split.emplace_back(data);
+      edge.xrSolidIndexCount = 0;
+      edge.xrBatchPipeline = 0;
+      DrawData& solid = b.split.emplace_back(data);
+      solid.xrPipeline = data.xrSolidPipeline;
+      solid.xrIdxRange = data.xrSolidIdxRange;
+      solid.xrIndexCount = data.xrSolidIndexCount;
+      solid.xrSolidIndexCount = 0;
+      render(edge, pass);
+      render(solid, pass);
+      return;
+    }
     ++b.draws;
     if (b.sorting && gfx::xr_multiview_replay()) {
       // Order doesn't matter here: what can't batch goes out now.
@@ -655,9 +679,12 @@ void render(const DrawData& data, const wgpu::RenderPassEncoder& pass) {
       return;
     }
     if (b.eyeSorting && gfx::xr_multiview_replay() && !gfx::xr_motion_replay()) {
-      if (data.xrReorderable && batchable(data) && !xr_link_filter(data)) {
+      if (data.xrReorderable && !xr_link_filter(data)) {
         emit_members(pass); // a run before it keeps its place
-        bucket_add(data, pass);
+        if (batchable(data))
+          bucket_add(data, pass);
+        else
+          render_direct(data, pass); // reorderable too: the buckets stay open
         return;
       }
       emit_buckets(pass); // anything else comes after every bucketed draw

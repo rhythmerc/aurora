@@ -2676,6 +2676,7 @@ static void push_gx_draw(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, gfx::Rang
   gfx::PipelineRef xrSolidPipeline = 0;
   gfx::Range xrSolidIdxRange{};
   u32 xrSolidIndexCount = 0;
+  bool xrSolidOnly = false; // a straddling draw that's all solid (one plain draw)
   gfx::PipelineRef xrMotionPipeline = 0;
   bool cls_inside = false; // the draw lies wholly inside any clip (batchable)
 #if defined(AURORA_ENABLE_OPENXR) && !defined(__EMSCRIPTEN__)
@@ -2736,6 +2737,7 @@ static void push_gx_draw(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, gfx::Rang
       }
       if (kept.empty() && xrSolidIndexCount != 0) {
         // All of it solid: one plain draw.
+        xrSolidOnly = true;
         xrPipeline = xrSolidPipeline;
         xrIdxRange = xrSolidIdxRange;
         xrIndexCount = xrSolidIndexCount;
@@ -2845,7 +2847,9 @@ static void push_gx_draw(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, gfx::Rang
       .xrSolidIndexCount = xrSolidIndexCount,
       .xrMotionPipeline = xrMotionPipeline,
 #if defined(AURORA_ENABLE_OPENXR) && !defined(__EMSCRIPTEN__)
-      .xrBatchPipeline = xrPipeline != 0 && xrSolidIndexCount == 0 && cls_inside ? xr_batch_pipeline(false) : 0,
+      .xrBatchPipeline = xrPipeline != 0 && (cls_inside || xrSolidOnly || xrSolidIndexCount != 0)
+                             ? xr_batch_pipeline(false)
+                             : 0,
       .xrMotionBatchPipeline =
           xrMotionPipeline != 0 && cls_inside ? xr_batch_pipeline(true, xrMotionKind) : 0,
       .xrMotionMaterial = xrMotionKind != XrMotionKind::Plain,

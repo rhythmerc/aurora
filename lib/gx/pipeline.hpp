@@ -46,6 +46,8 @@ struct DrawData {
   // XR batching (AURORA_XR_BATCH): the batched twins of xrPipeline and
   // xrMotionPipeline (0: never batched), and the uniform without its
   // position and normal matrices, hashed (draws batch only when it agrees).
+  // A draw with a solid part (xrSolid*): the batched twin of xrSolidPipeline,
+  // for that part alone.
   gfx::PipelineRef xrBatchPipeline = 0;
   gfx::PipelineRef xrMotionBatchPipeline = 0;
   // The motion twin keeps the game's fragment stage (a cutout or translucent
