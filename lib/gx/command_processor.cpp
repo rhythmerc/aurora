@@ -3186,7 +3186,9 @@ void handle_aurora(ByteReader& reader) noexcept {
     } else if (category == 5 || category == 7 || category == 8) { // planes 3-4, 5-6, 7-8
       gfx::xr_set_world_clip_more(category == 5 ? 1 : category - 5, view.data());
     } else if (category == 9) { // aurora_xr_world_still
+#if defined(AURORA_ENABLE_OPENXR) && !defined(__EMSCRIPTEN__)
       sXrStill = hasView;
+#endif
     } else if (category == 10) { // aurora_xr_light_probe: the point in the view's first row
       gfx::xr_set_light_probe(hasView ? view.data() : nullptr);
     } else {
