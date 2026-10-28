@@ -11598,7 +11598,10 @@ void render_3d(const wgpu::CommandEncoder& cmd, gfx::detail::FramePacket& frame)
     R.missedStereo = false;
     R.renderedRect = {};
     R.renderedTick = frame.xrTickFrame;
-    pace_frame(frame.xrRecordStartNs, frame.xrWorldEndNs, frame.xrGameDoneNs, frame.xrRecordEndNs);
+    // A held frame's marks are the wait's (aurora_xr_set_held), not a game
+    // frame's: as margins they read as frames running late.
+    if (!frame.xrHeld)
+      pace_frame(frame.xrRecordStartNs, frame.xrWorldEndNs, frame.xrGameDoneNs, frame.xrRecordEndNs);
   }
   render_3d_frame(cmd, frame);
   gfx::set_xr_drop_flat_world((R.renderedStereo || R.missedStereo) && g_skipPresent &&
@@ -12217,8 +12220,16 @@ bool render_eyes(const wgpu::CommandEncoder& cmd, gfx::detail::FramePacket& fram
       if (g_multiview) {
         // One replay draws both eyes: view mask 0b11 over the image's two layers.
         float vw = static_cast<float>(stereo.width), vh = static_cast<float>(stereo.height);
+        // Held frames (aurora_xr_set_held) keep the scale and feed no
+        // readings: in a netplay wait the scale moved a step or two on
+        // timings that were the wait's. The readings after one settle anew.
+        static bool wasHeld = false;
+        if (wasHeld && !frame.xrHeld)
+          g_dynres.settle = 0;
+        wasHeld = frame.xrHeld;
         if (g_dynres.on) {
-          update_dynamic_resolution(false);
+          if (!frame.xrHeld)
+            update_dynamic_resolution(false);
           const auto even = [](float v) { return (static_cast<uint32_t>(v + 0.5f) + 1u) & ~1u; };
           const uint32_t rw = std::min(stereo.width, even(static_cast<float>(g_dynres.recWidth) * g_dynres.scale));
           const uint32_t rh = std::min(stereo.height, even(static_cast<float>(g_dynres.recHeight) * g_dynres.scale));
@@ -12258,7 +12269,7 @@ bool render_eyes(const wgpu::CommandEncoder& cmd, gfx::detail::FramePacket& fram
       // No 3D image this frame: still a fight, so don't present the flat
       // frame nobody sees (the headset keeps showing the last 3D image).
       R.missedStereo = true;
-      if (g_dynres.on)
+      if (g_dynres.on && !frame.xrHeld)
         update_dynamic_resolution(true);
       g_skipPresent = !env_flag("AURORA_XR_FIGHT_SCREEN", false);
     }
@@ -12775,6 +12786,7 @@ extern "C" bool aurora_xr_screen_back(void) {
 }
 
 extern "C" void aurora_xr_set_paused(bool paused) { aurora::xr::g_fightPaused = paused; }
+extern "C" void aurora_xr_set_held(bool held) { aurora::gfx::set_xr_held(held); }
 
 extern "C" void aurora_xr_set_placing(int mode) { aurora::xr::g_placing = mode; }
 

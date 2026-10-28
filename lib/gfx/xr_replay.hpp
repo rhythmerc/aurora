@@ -107,6 +107,10 @@ void set_xr_first_pass_timing(XrFirstPassTiming fn) noexcept;
 // the frames recorded from now on carry (FramePacket::xrTickFrame).
 void set_xr_game_frame_tick(uint64_t displayFrame) noexcept;
 uint64_t xr_game_frame_tick() noexcept;
+// Game thread: whether the frames begun from now on are held ones
+// (FramePacket::xrHeld; aurora_xr_set_held).
+void set_xr_held(bool held) noexcept;
+bool xr_held() noexcept;
 XrFrameHook xr_frame_hook() noexcept;
 
 } // namespace aurora::gfx

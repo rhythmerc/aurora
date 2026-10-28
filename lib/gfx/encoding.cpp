@@ -662,6 +662,9 @@ void set_xr_first_pass_timing(XrFirstPassTiming fn) noexcept { g_xrFirstPassTimi
 static std::atomic<uint64_t> g_xrGameFrameTick{0};
 void set_xr_game_frame_tick(uint64_t displayFrame) noexcept { g_xrGameFrameTick = displayFrame; }
 uint64_t xr_game_frame_tick() noexcept { return g_xrGameFrameTick; }
+static std::atomic<bool> g_xrHeld{false};
+void set_xr_held(bool held) noexcept { g_xrHeld = held; }
+bool xr_held() noexcept { return g_xrHeld; }
 void set_xr_drop_flat_world(bool drop) noexcept { g_xrDropFlatWorld = drop; }
 XrFrameHook xr_frame_hook() noexcept { return g_xrFrameHook; }
 

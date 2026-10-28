@@ -68,6 +68,12 @@ bool aurora_xr_pace(void);
 uint64_t aurora_xr_pace_count(void);
 bool aurora_xr_pace_until(uint64_t count);
 
+/* Whether the frames begun from now on are held ones: the scene drawn again
+ * without the game advancing (a netplay wait). They're shown as any frame,
+ * but the pacing probe and dynamic resolution leave them out, their timing
+ * being the wait's; dynamic resolution settles again once they end. */
+void aurora_xr_set_held(bool held);
+
 /* Whether the fight on screen is paused. Call every frame the fight camera
  * draws. While paused, the controllers show lasers and the grips grab the
  * arena to move, turn and scale it instead of pressing Z. */

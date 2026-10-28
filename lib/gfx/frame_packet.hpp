@@ -232,6 +232,10 @@ struct FramePacket {
   // XR lock-step: the display frame of the pacing tick that started this
   // frame (set_xr_game_frame_tick), for fixed-latency presentation.
   uint64_t xrTickFrame = 0;
+  // A held frame: the host drew its scene again without advancing it (a
+  // netplay wait, aurora_xr_set_held). Pacing and dynamic resolution leave
+  // it out; its timing is the wait's, not a game frame's.
+  bool xrHeld = false;
   // When the game thread began and ended recording it (steady clock ns;
   // lib/xr's pacing probe).
   int64_t xrRecordStartNs = 0, xrRecordEndNs = 0;

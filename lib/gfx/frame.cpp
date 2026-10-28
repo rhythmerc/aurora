@@ -862,6 +862,7 @@ bool begin_frame() {
   frame.frameIndex = g_frameIndex;
 #if defined(AURORA_ENABLE_OPENXR) && !defined(__EMSCRIPTEN__)
   frame.xrTickFrame = xr_game_frame_tick();
+  frame.xrHeld = xr_held();
   frame.xrRecordStartNs = std::chrono::steady_clock::now().time_since_epoch().count();
   frame.earlyEyes = xr_early_eyes();
 #endif
