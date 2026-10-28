@@ -1143,7 +1143,8 @@ bool initialize(AuroraBackend auroraBackend, bool allowCpu) {
 #ifndef __EMSCRIPTEN__
     g_device.SetLoggingCallback(wgpu_log);
 #endif
-#if defined(WEBGPU_DAWN) && !defined(__EMSCRIPTEN__)
+#if defined(WEBGPU_DAWN) && !defined(__EMSCRIPTEN__) && !defined(_WIN32)
+    /* Not on Windows: the prebuilt Dawn there doesn't export dawn::native. */
     if (const char* v = std::getenv("AURORA_DAWN_VALIDATION"); v != nullptr && v[0] == '1') {
       std::string used;
       for (const char* t : dawn::native::GetTogglesUsed(g_device.Get()))
