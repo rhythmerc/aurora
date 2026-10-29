@@ -1,3 +1,4 @@
+#include <chrono>
 #include <cstring>
 #include <cstdint>
 #include <mutex>
@@ -29,12 +30,16 @@ static bool cache_broken;
 static std::mutex cache_mutex;
 static std::vector<XXH128_hash_t> cache_keys_used;
 /* This launch's number (aurora_meta.session, one more than the last), the
- * session each row was last used in (cache.last_session), and whether this
- * launch's prune has run. */
+ * session each row was last used in (cache_used, a table of its own: marking
+ * cache.last_session rewrote each row's blob with it, gigabytes a launch), and
+ * whether this launch's prune has run. */
 static int64_t cache_session;
 static sqlite3_stmt* touch_stmt;
 static bool cache_pruned;
-static CacheStats cache_counters; /* guarded by cache_mutex */
+/* Its own lock, so a frame reading the counters never waits on the database
+ * (the prune holds cache_mutex for seconds). */
+static std::mutex stats_mutex;
+static CacheStats cache_counters; /* guarded by stats_mutex */
 #if defined(AURORA_CACHE_USE_ZSTD)
 static std::vector<uint8_t> compress_buffer;
 #endif
@@ -140,10 +145,13 @@ static bool cache_init_core() {
   }
 
   /* Caches made before last_session existed get it in place (an error here
-   * just means the column is there already), and this launch takes the next
-   * session number. */
+   * just means the column is there already; the store still fills it, but
+   * the prune goes by cache_used), and this launch takes the next session
+   * number. */
   sqlite::exec(db, "ALTER TABLE cache ADD COLUMN last_session INTEGER NOT NULL DEFAULT 0;");
-  ret = sqlite::exec(db, "CREATE TABLE IF NOT EXISTS aurora_meta(name TEXT PRIMARY KEY NOT NULL, value INTEGER);"
+  ret = sqlite::exec(db, "CREATE TABLE IF NOT EXISTS cache_used(key BLOB PRIMARY KEY NOT NULL, "
+                         "last_session INTEGER NOT NULL) WITHOUT ROWID;"
+                         "CREATE TABLE IF NOT EXISTS aurora_meta(name TEXT PRIMARY KEY NOT NULL, value INTEGER);"
                          "INSERT OR IGNORE INTO aurora_meta VALUES ('session', 0);"
                          "UPDATE aurora_meta SET value = value + 1 WHERE name = 'session';");
   if (ret != SQLITE_OK) {
@@ -170,8 +178,8 @@ static bool cache_init_core() {
     return false;
   }
 
-  ret = sqlite3_prepare_v3(db, "UPDATE cache SET last_session = ? WHERE key = ?", -1, SQLITE_PREPARE_PERSISTENT,
-                           &touch_stmt, nullptr);
+  ret = sqlite3_prepare_v3(db, "REPLACE INTO cache_used (key, last_session) VALUES (?2, ?1)", -1,
+                           SQLITE_PREPARE_PERSISTENT, &touch_stmt, nullptr);
   if (ret != SQLITE_OK) {
     Log.error("Failed to prepare statement: {}", sqlite3_errmsg(db));
     return false;
@@ -319,6 +327,7 @@ size_t load_from_cache(void const* key, size_t keySize, void* value, size_t valu
   } else if (ret == SQLITE_DONE) {
     // Miss
     foundSize = 0;
+    std::lock_guard stats(stats_mutex);
     ++cache_counters.misses;
   } else {
     Log.error("Looking up cache key failed: {}", sqlite3_errmsg(db));
@@ -343,6 +352,7 @@ size_t load_from_cache(void const* key, size_t keySize, void* value, size_t valu
     cache_keys_used.push_back(keyHash);
     /* Dawn asks for the size first (value == nullptr), then for the data;
      * only the second call is a hit. */
+    std::lock_guard stats(stats_mutex);
     ++cache_counters.hits;
     cache_counters.hitBytes += foundSize;
   }
@@ -409,19 +419,37 @@ void store_to_cache(void const* key, size_t keySize, void const* value, size_t v
   check(sqlite3_bind_null(store_stmt, 2));
   check(sqlite3_bind_null(store_stmt, 4));
 
+  check(sqlite3_bind_int64(touch_stmt, 1, cache_session));
+  check(sqlite3_bind_blob(touch_stmt, 2, &keyHash, sizeof(keyHash), SQLITE_TRANSIENT));
+  if (sqlite3_step(touch_stmt) != SQLITE_DONE) {
+    Log.error("Failed to mark cache key used: {}", sqlite3_errmsg(db));
+  }
+  check(sqlite3_reset(touch_stmt));
+
   tx.commit();
   cache_keys_used.push_back(keyHash);
+  std::lock_guard stats(stats_mutex);
   ++cache_counters.stores;
   cache_counters.storeBytes += valueSize;
 }
 
 CacheStats cache_stats() {
-  std::lock_guard lock(cache_mutex);
+  std::lock_guard lock(stats_mutex);
   return cache_counters;
 }
 
+static void prune_locked();
+
 void cache_prune() {
   std::lock_guard lock(cache_mutex);
+  const auto start = std::chrono::steady_clock::now();
+  prune_locked();
+  Log.info("Dawn cache prune took {} ms", std::chrono::duration_cast<std::chrono::milliseconds>(
+                                                std::chrono::steady_clock::now() - start)
+                                                .count());
+}
+
+static void prune_locked() {
   if (!cache_init()) {
     return;
   }
@@ -450,21 +478,32 @@ void cache_prune() {
     }
     totalRows = *totalRowsResult;
 
-    auto ret = sqlite::exec(db, fmt::format("UPDATE cache SET last_session = {} "
-                                            "WHERE key IN (SELECT key FROM cache_keys_used)",
+    /* This launch's keys, then rows cache_used doesn't know yet (from before
+     * it existed) as this launch's too: the first prune keeps everything.
+     * Only keys are read; the blobs stay where they are. */
+    auto ret = sqlite::exec(db, fmt::format("REPLACE INTO cache_used SELECT key, {0} FROM cache_keys_used;"
+                                            "INSERT OR IGNORE INTO cache_used SELECT key, {0} FROM cache;",
                                             cache_session)
                                     .c_str());
     if (ret != SQLITE_OK) {
       Log.error("Failed to mark used dawn cache rows: {}", sqlite3_errmsg(db));
       return;
     }
-    ret = sqlite::exec(db,
-                       fmt::format("DELETE FROM cache WHERE last_session <= {}", cache_session - KeepSessions).c_str());
+    const auto cutoff = cache_session - KeepSessions;
+    ret = sqlite::exec(
+        db,
+        fmt::format("DELETE FROM cache WHERE key IN (SELECT key FROM cache_used WHERE last_session <= {})", cutoff)
+            .c_str());
     if (ret != SQLITE_OK) {
       Log.error("Failed to prune dawn cache rows: {}", sqlite3_errmsg(db));
       return;
     }
     deletedRows = sqlite3_changes(db);
+    ret = sqlite::exec(db, fmt::format("DELETE FROM cache_used WHERE last_session <= {}", cutoff).c_str());
+    if (ret != SQLITE_OK) {
+      Log.error("Failed to prune dawn cache use rows: {}", sqlite3_errmsg(db));
+      return;
+    }
 
     tx.commit();
   }
@@ -494,7 +533,10 @@ void cache_shutdown() {
   compress_buffer.clear();
 #endif
   cache_keys_used.clear();
-  cache_counters = {};
+  {
+    std::lock_guard stats(stats_mutex);
+    cache_counters = {};
+  }
   if (load_stmt != nullptr) {
     check(sqlite3_finalize(load_stmt));
     load_stmt = nullptr;
