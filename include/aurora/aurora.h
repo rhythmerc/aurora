@@ -181,6 +181,12 @@ void aurora_set_resampler(AuroraSampler sampler);
 /** Keeps the previous frame instead of clearing, for hosts that pause the
  *  game: with nothing drawing, a cleared framebuffer presents as black. */
 void aurora_preserve_frame_buffer(bool preserve);
+/** Draws the RmlUi documents into the game's frame at this point of its draw
+ *  stream (inside the open render pass), so whatever the game draws after
+ *  covers them, instead of over the finished frame at present. That frame's
+ *  present composite is skipped. The documents are as last rendered (one
+ *  frame behind); not for documents with a backdrop filter. */
+void aurora_rmlui_draw_here(void);
 /** Sets the clock timescale. Default 1.0f. 0.0f is paused. Range 0.0f-16.0f. */
 void aurora_set_timescale(float scale);
 

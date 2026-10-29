@@ -691,6 +691,8 @@ void create_resample_pipeline() {
   g_ResampleUniformBuffer = g_device.CreateBuffer(&uniformBufferDescriptor);
 }
 
+wgpu::BindGroupLayout copy_bind_group_layout() { return g_CopyBindGroupLayout; }
+
 wgpu::BindGroup create_copy_bind_group(const TextureWithSampler& source) {
   const std::array bindGroupEntries{
       wgpu::BindGroupEntry{

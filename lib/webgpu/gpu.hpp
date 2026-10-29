@@ -73,6 +73,9 @@ TextureWithSampler create_render_texture(uint32_t width, uint32_t height, bool m
 bool enable_normal_buffer();
 const TextureWithSampler& present_source() noexcept;
 wgpu::BindGroup create_copy_bind_group(const TextureWithSampler& source);
+// The layout create_copy_bind_group's groups have (a filtering sampler, then
+// a 2D float texture), for other pipelines sampling them.
+wgpu::BindGroupLayout copy_bind_group_layout();
 void set_resampler(AuroraSampler sampler) noexcept;
 AuroraSampler get_resampler() noexcept;
 Viewport calculate_present_viewport(uint32_t surface_width, uint32_t surface_height, uint32_t content_width,

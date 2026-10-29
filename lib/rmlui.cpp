@@ -20,6 +20,10 @@
 #include "rmlui/WebGPURenderInterface.hpp"
 #include "webgpu/gpu.hpp"
 
+#include <aurora/gfx.hpp>
+#include <mutex>
+#include <unordered_map>
+
 namespace aurora::rmlui {
 Rml::Context* g_context = nullptr;
 FileInterface_SDL* g_fileInterface = nullptr;
@@ -42,6 +46,100 @@ std::array<TrackedTouch, MaxTrackedTouches> s_trackedTouches{};
 float s_uiScale = 0.0f;
 webgpu::TextureWithSampler s_renderTarget;
 wgpu::BindGroup s_renderTargetCopyBindGroup;
+
+// aurora_rmlui_draw_here: the documents drawn inside the game's frame (a
+// custom draw at that point of its stream) from the copy bind group of the
+// last render, under a lock as the render worker reads it.
+std::mutex s_layerMutex;
+wgpu::BindGroup s_layerBindGroup;
+gfx::DrawTypeId s_layerDraw = gfx::InvalidDrawType;
+std::atomic<bool> s_layerThisFrame{false};
+std::unordered_map<uint64_t, wgpu::RenderPipeline> s_layerPipelines; // by the pass's layout (render worker)
+
+wgpu::RenderPipeline layer_pipeline(const gfx::RenderTargetLayout& layout) {
+  if (auto it = s_layerPipelines.find(layout.key); it != s_layerPipelines.end())
+    return it->second;
+  wgpu::ShaderSourceWGSL source{};
+  source.code = R"""(
+@group(0) @binding(0) var layer_sampler: sampler;
+@group(0) @binding(1) var layer_texture: texture_2d<f32>;
+struct VertexOutput {
+    @builtin(position) pos: vec4<f32>,
+    @location(0) uv: vec2<f32>,
+};
+var<private> pos: array<vec2<f32>, 3> = array<vec2<f32>, 3>(vec2(-1.0, 1.0), vec2(-1.0, -3.0), vec2(3.0, 1.0));
+var<private> uvs: array<vec2<f32>, 3> = array<vec2<f32>, 3>(vec2(0.0, 0.0), vec2(0.0, 2.0), vec2(2.0, 0.0));
+@vertex
+fn vs_main(@builtin(vertex_index) i: u32) -> VertexOutput {
+    var out: VertexOutput;
+    out.pos = vec4<f32>(pos[i], 0.0, 1.0);
+    out.uv = uvs[i];
+    return out;
+}
+@fragment
+fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
+    return textureSample(layer_texture, layer_sampler, in.uv);
+}
+)""";
+  const wgpu::ShaderModuleDescriptor moduleDesc{.nextInChain = &source, .label = "RmlUi in-frame layer"};
+  auto module = webgpu::g_device.CreateShaderModule(&moduleDesc);
+  const auto bgl = webgpu::copy_bind_group_layout();
+  const wgpu::PipelineLayoutDescriptor layoutDesc{.bindGroupLayoutCount = 1, .bindGroupLayouts = &bgl};
+  auto pipelineLayout = webgpu::g_device.CreatePipelineLayout(&layoutDesc);
+  // Premultiplied alpha over the scene colour; the other attachments untouched.
+  static const wgpu::BlendState blend{
+      .color = {.operation = wgpu::BlendOperation::Add, .srcFactor = wgpu::BlendFactor::One,
+                .dstFactor = wgpu::BlendFactor::OneMinusSrcAlpha},
+      .alpha = {.operation = wgpu::BlendOperation::Add, .srcFactor = wgpu::BlendFactor::One,
+                .dstFactor = wgpu::BlendFactor::OneMinusSrcAlpha},
+  };
+  std::array<wgpu::ColorTargetState, gfx::MaxColorAttachments> targets{};
+  for (uint32_t i = 0; i < layout.colorAttachmentCount; ++i) {
+    const bool scene = i == gfx::SceneColorAttachmentIndex;
+    targets[i] = {.format = layout.colorAttachments[i].format, .blend = scene ? &blend : nullptr,
+                  .writeMask = scene ? wgpu::ColorWriteMask::All : wgpu::ColorWriteMask::None};
+  }
+  const wgpu::FragmentState fragment{
+      .module = module, .entryPoint = "fs_main", .targetCount = layout.colorAttachmentCount, .targets = targets.data()};
+  wgpu::DepthStencilState depth{};
+  const bool hasDepth = layout.depthStencilFormat != wgpu::TextureFormat::Undefined;
+  if (hasDepth) {
+    depth.format = layout.depthStencilFormat;
+    depth.depthWriteEnabled = wgpu::OptionalBool::False;
+    depth.depthCompare = wgpu::CompareFunction::Always;
+  }
+  const wgpu::RenderPipelineDescriptor desc{
+      .label = "RmlUi in-frame layer",
+      .layout = pipelineLayout,
+      .vertex = {.module = module, .entryPoint = "vs_main"},
+      .primitive = {.topology = wgpu::PrimitiveTopology::TriangleList},
+      .depthStencil = hasDepth ? &depth : nullptr,
+      .multisample = {.count = layout.sampleCount, .mask = UINT32_MAX},
+      .fragment = &fragment,
+  };
+  auto pipeline = webgpu::g_device.CreateRenderPipeline(&desc);
+  s_layerPipelines.emplace(layout.key, pipeline);
+  return pipeline;
+}
+
+void layer_draw(const gfx::DrawContext& ctx, const wgpu::RenderPassEncoder& pass, const void*, size_t, void*) {
+  const auto& layout = ctx.layout;
+  if (layout.viewCount > 1 || layout.colorAttachmentCount == 0)
+    return; // not into an XR eye pass
+  wgpu::BindGroup bindGroup;
+  {
+    std::lock_guard lock{s_layerMutex};
+    bindGroup = s_layerBindGroup;
+  }
+  if (!bindGroup)
+    return;
+  const auto& color = layout.colorAttachments[gfx::SceneColorAttachmentIndex];
+  pass.SetPipeline(layer_pipeline(layout));
+  pass.SetBindGroup(0, bindGroup);
+  pass.SetViewport(0.f, 0.f, static_cast<float>(color.width), static_cast<float>(color.height), 0.f, 1.f);
+  pass.SetScissorRect(0, 0, color.width, color.height);
+  pass.Draw(3);
+}
 
 WebGPURenderInterface* get_render_interface() noexcept {
   return static_cast<WebGPURenderInterface*>(Backend::GetRenderInterface()); // NOLINT(*-pro-type-static-cast-downcast)
@@ -84,6 +182,8 @@ void ensure_render_target(Rml::Vector2i dimensions) noexcept {
   }
   s_renderTarget = webgpu::create_render_texture(width, height, false);
   s_renderTargetCopyBindGroup = webgpu::create_copy_bind_group(s_renderTarget);
+  std::lock_guard lock{s_layerMutex};
+  s_layerBindGroup = s_renderTargetCopyBindGroup;
 }
 
 bool element_has_visible_backdrop_filter(const Rml::Element* element) noexcept {
@@ -481,14 +581,30 @@ RecordedFrame record_frame(const webgpu::Viewport& presentViewport) noexcept {
   g_context->Render();
   Backend::PresentFrame();
 
-  if (!renderInterface->EndFrame()) {
-    // We didn't render anything
+  const bool drawn = renderInterface->EndFrame();
+  {
+    // What the next aurora_rmlui_draw_here draws: this render, or nothing.
+    std::lock_guard lock{s_layerMutex};
+    s_layerBindGroup = drawn && !needsBackdrop ? s_renderTargetCopyBindGroup : wgpu::BindGroup{};
+  }
+  if (!drawn || s_layerThisFrame.exchange(false)) {
+    // Nothing rendered, or the game drew the documents inside its frame
+    // already (aurora_rmlui_draw_here): no composite at present.
     return {};
   }
   return {
       .bindGroup = s_renderTargetCopyBindGroup,
       .overlay = !needsBackdrop,
   };
+}
+
+void draw_here() noexcept {
+  if (g_context == nullptr)
+    return;
+  if (s_layerDraw == gfx::InvalidDrawType)
+    s_layerDraw = gfx::register_draw_type({.label = "RmlUi in-frame layer", .draw = layer_draw});
+  if (gfx::push_custom_draw(s_layerDraw, nullptr, 0))
+    s_layerThisFrame = true;
 }
 
 void shutdown() noexcept {
@@ -502,5 +618,10 @@ void shutdown() noexcept {
   g_context = nullptr;
   s_renderTarget = {};
   s_renderTargetCopyBindGroup = {};
+  {
+    std::lock_guard lock{s_layerMutex};
+    s_layerBindGroup = {};
+  }
+  s_layerPipelines.clear();
 }
 } // namespace aurora::rmlui

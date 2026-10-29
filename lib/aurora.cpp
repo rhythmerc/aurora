@@ -618,6 +618,12 @@ void aurora_set_resampler(AuroraSampler sampler) {
   (void)sampler;
 #endif
 }
+void aurora_rmlui_draw_here() {
+#if AURORA_ENABLE_RMLUI
+  aurora::rmlui::draw_here();
+#endif
+}
+
 void aurora_preserve_frame_buffer(bool preserve) {
 #ifdef AURORA_ENABLE_GX
   aurora::gfx::set_preserve_frame_buffer(preserve);
