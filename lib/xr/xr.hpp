@@ -54,6 +54,8 @@ bool skip_present() noexcept;
 // screen at 1.5 m covers on a Quest 3. The window's size is irrelevant; an
 // immersive Quest app's window spans the whole display panel.
 void screen_size(uint32_t contentWidth, uint32_t contentHeight, uint32_t& width, uint32_t& height) noexcept;
+// That height alone, which needs no content size.
+uint32_t screen_height() noexcept;
 
 // Render worker only. Returns the texture to draw the presented frame into,
 // or null when XR is unavailable (the caller falls back to the window

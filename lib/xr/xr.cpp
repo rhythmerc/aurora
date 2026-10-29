@@ -12504,12 +12504,16 @@ bool active() noexcept { return g_phase == Phase::Imported && g_sessionRunning; 
 
 bool skip_present() noexcept { return g_skipPresent; }
 
+uint32_t screen_height() noexcept {
+  return static_cast<uint32_t>(std::clamp(env_float("AURORA_XR_SCREEN_HEIGHT", 1080.f), 240.f, 4096.f));
+}
+
 void screen_size(uint32_t contentWidth, uint32_t contentHeight, uint32_t& width, uint32_t& height) noexcept {
   static uint32_t fixedW = 0, fixedH = 0;
   if (fixedW == 0) {
     const auto vp = webgpu::calculate_present_viewport(8192, 8192, contentWidth, contentHeight);
     const float aspect = vp.height > 0.f ? vp.width / vp.height : 4.f / 3.f;
-    fixedH = static_cast<uint32_t>(std::clamp(env_float("AURORA_XR_SCREEN_HEIGHT", 1080.f), 240.f, 4096.f));
+    fixedH = screen_height();
     fixedW = (static_cast<uint32_t>(static_cast<float>(fixedH) * aspect + 0.5f) + 1u) & ~1u;
   }
   width = fixedW;

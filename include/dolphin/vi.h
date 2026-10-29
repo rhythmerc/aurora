@@ -46,6 +46,15 @@ void VICenterWindow();
 void VISetFrameBufferScale(float scale);
 
 /**
+ * While on, the internal framebuffer is as tall as the picture it's shown as
+ * (the window's, or an OpenXR session's virtual screen), whatever the scale
+ * above: for screens of fine 2D work, such as UI drawn inside the frame
+ * (aurora_rmlui_draw_here), which would otherwise be resampled from the EFB.
+ * Off again, the scale above applies.
+ */
+void VISetFrameBufferPresentSize(bool on);
+
+/**
  * \brief Lock the GX framebuffer to a specific aspect ratio, without changing the native framebuffer.
  *
  * @param width Width part of the aspect ratio fraction.

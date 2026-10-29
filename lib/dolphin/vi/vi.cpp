@@ -52,4 +52,5 @@ void VISetWindowSize(uint32_t width, uint32_t height) { aurora::window::set_wind
 void VISetWindowPosition(uint32_t x, uint32_t y) { aurora::window::set_window_position(x, y); }
 void VICenterWindow() { aurora::window::center_window(); }
 void VISetFrameBufferScale(float scale) { aurora::window::set_frame_buffer_scale(scale); }
+void VISetFrameBufferPresentSize(bool on) { aurora::window::set_frame_buffer_present_size(on); }
 }

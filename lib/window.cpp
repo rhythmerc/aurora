@@ -6,6 +6,9 @@
 #endif
 #include "input.hpp"
 #include "internal.hpp"
+#ifdef AURORA_ENABLE_OPENXR
+#include "xr/xr.hpp"
+#endif
 
 #include <aurora/aurora.h>
 #include <aurora/event.h>
@@ -46,6 +49,7 @@ constexpr Module Log{"aurora::window"};
 SDL_Window* g_window;
 SDL_Renderer* g_renderer;
 float g_frameBufferScale = 0.f;
+bool g_frameBufferPresent = false; // VISetFrameBufferPresentSize
 float g_frameBufferAspect = 0.f; // 0 = follow the native surface
 AuroraWindowSize g_windowSize;
 std::vector<AuroraEvent> g_events;
@@ -496,6 +500,23 @@ AuroraWindowSize get_window_size() {
       fb_h = scaledH;
     }
 #endif
+    if (g_frameBufferPresent) {
+      // As tall as the picture it's shown as: the window's, or the headset's
+      // virtual screen (whose size the window's has nothing to do with).
+      int shown = native_fb_h;
+#ifdef AURORA_ENABLE_OPENXR
+      if (xr::wanted())
+        shown = static_cast<int>(xr::screen_height());
+#endif
+      const auto [baseW, baseH] = vi::configured_fb_size();
+      if (baseH > 0 && shown > 0) {
+        const auto [shownW, shownH] = scale_frame_buffer_to_aspect(
+            static_cast<int>(baseW), static_cast<int>(baseH), static_cast<float>(shown) / static_cast<float>(baseH),
+            aspect);
+        fb_w = shownW;
+        fb_h = shownH;
+      }
+    }
     if (g_frameBufferAspect > 0.f) {
       const auto [fitW, fitH] = fit_frame_buffer_to_aspect(fb_w, fb_h, g_frameBufferAspect);
       fb_w = fitW;
@@ -617,6 +638,14 @@ void set_frame_buffer_scale(float scale) {
     return;
   }
   g_frameBufferScale = scale;
+  request_frame_buffer_resize();
+}
+
+void set_frame_buffer_present_size(bool on) {
+  if (g_frameBufferPresent == on) {
+    return;
+  }
+  g_frameBufferPresent = on;
   request_frame_buffer_resize();
 }
 
