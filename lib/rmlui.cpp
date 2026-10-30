@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstring>
 #include <thread>
 
 #include <RmlUi/Core.h>
@@ -13,6 +14,7 @@
 #include "window.hpp"
 #include "internal.hpp"
 #include "imgui.hpp"
+#include "gfx/recording.hpp"
 #include "rmlui/FileInterface_SDL.h"
 #include "rmlui/GlassFilter.hpp"
 #include "rmlui/ImageEffects.hpp"
@@ -55,6 +57,13 @@ wgpu::BindGroup s_layerBindGroup;
 gfx::DrawTypeId s_layerDraw = gfx::InvalidDrawType;
 std::atomic<bool> s_layerThisFrame{false};
 std::unordered_map<uint64_t, wgpu::RenderPipeline> s_layerPipelines; // by the pass's layout (render worker)
+// The layer's quad, a strip: top-left, top-right, bottom-left, bottom-right.
+// Positions are clip space, so a warped quad maps the documents
+// perspective-correctly (aurora_rmlui_draw_here_warped).
+struct LayerVertex {
+  float pos[4];
+  float uv[2];
+};
 
 wgpu::RenderPipeline layer_pipeline(const gfx::RenderTargetLayout& layout) {
   if (auto it = s_layerPipelines.find(layout.key); it != s_layerPipelines.end())
@@ -67,13 +76,11 @@ struct VertexOutput {
     @builtin(position) pos: vec4<f32>,
     @location(0) uv: vec2<f32>,
 };
-var<private> pos: array<vec2<f32>, 3> = array<vec2<f32>, 3>(vec2(-1.0, 1.0), vec2(-1.0, -3.0), vec2(3.0, 1.0));
-var<private> uvs: array<vec2<f32>, 3> = array<vec2<f32>, 3>(vec2(0.0, 0.0), vec2(0.0, 2.0), vec2(2.0, 0.0));
 @vertex
-fn vs_main(@builtin(vertex_index) i: u32) -> VertexOutput {
+fn vs_main(@location(0) pos: vec4<f32>, @location(1) uv: vec2<f32>) -> VertexOutput {
     var out: VertexOutput;
-    out.pos = vec4<f32>(pos[i], 0.0, 1.0);
-    out.uv = uvs[i];
+    out.pos = pos;
+    out.uv = uv;
     return out;
 }
 @fragment
@@ -108,11 +115,17 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     depth.depthWriteEnabled = wgpu::OptionalBool::False;
     depth.depthCompare = wgpu::CompareFunction::Always;
   }
+  static const std::array<wgpu::VertexAttribute, 2> attributes{
+      wgpu::VertexAttribute{.format = wgpu::VertexFormat::Float32x4, .offset = 0, .shaderLocation = 0},
+      wgpu::VertexAttribute{.format = wgpu::VertexFormat::Float32x2, .offset = 16, .shaderLocation = 1},
+  };
+  static const wgpu::VertexBufferLayout vertexLayout{
+      .arrayStride = sizeof(LayerVertex), .attributeCount = attributes.size(), .attributes = attributes.data()};
   const wgpu::RenderPipelineDescriptor desc{
       .label = "RmlUi in-frame layer",
       .layout = pipelineLayout,
-      .vertex = {.module = module, .entryPoint = "vs_main"},
-      .primitive = {.topology = wgpu::PrimitiveTopology::TriangleList},
+      .vertex = {.module = module, .entryPoint = "vs_main", .bufferCount = 1, .buffers = &vertexLayout},
+      .primitive = {.topology = wgpu::PrimitiveTopology::TriangleStrip},
       .depthStencil = hasDepth ? &depth : nullptr,
       .multisample = {.count = layout.sampleCount, .mask = UINT32_MAX},
       .fragment = &fragment,
@@ -122,10 +135,15 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
   return pipeline;
 }
 
-void layer_draw(const gfx::DrawContext& ctx, const wgpu::RenderPassEncoder& pass, const void*, size_t, void*) {
+void layer_draw(const gfx::DrawContext& ctx, const wgpu::RenderPassEncoder& pass, const void* payload, size_t,
+                void*) {
   const auto& layout = ctx.layout;
   if (layout.viewCount > 1 || layout.colorAttachmentCount == 0)
     return; // not into an XR eye pass
+  gfx::Range quad;
+  std::memcpy(&quad, payload, sizeof quad);
+  if (quad.size == 0)
+    return;
   wgpu::BindGroup bindGroup;
   {
     std::lock_guard lock{s_layerMutex};
@@ -138,7 +156,8 @@ void layer_draw(const gfx::DrawContext& ctx, const wgpu::RenderPassEncoder& pass
   pass.SetBindGroup(0, bindGroup);
   pass.SetViewport(0.f, 0.f, static_cast<float>(color.width), static_cast<float>(color.height), 0.f, 1.f);
   pass.SetScissorRect(0, 0, color.width, color.height);
-  pass.Draw(3);
+  pass.SetVertexBuffer(0, ctx.vertexBuffer, quad.offset, quad.size);
+  pass.Draw(4);
 }
 
 WebGPURenderInterface* get_render_interface() noexcept {
@@ -598,12 +617,25 @@ RecordedFrame record_frame(const webgpu::Viewport& presentViewport) noexcept {
   };
 }
 
-void draw_here() noexcept {
+void draw_here(const float corners[4][4]) noexcept {
+  static constexpr float Whole[4][4] = {{-1.f, 1.f, 0.f, 1.f}, {1.f, 1.f, 0.f, 1.f}, {-1.f, -1.f, 0.f, 1.f},
+                                        {1.f, -1.f, 0.f, 1.f}};
+  static constexpr float Uvs[4][2] = {{0.f, 0.f}, {1.f, 0.f}, {0.f, 1.f}, {1.f, 1.f}};
   if (g_context == nullptr)
     return;
   if (s_layerDraw == gfx::InvalidDrawType)
     s_layerDraw = gfx::register_draw_type({.label = "RmlUi in-frame layer", .draw = layer_draw});
-  if (gfx::push_custom_draw(s_layerDraw, nullptr, 0))
+  if (corners == nullptr)
+    corners = Whole;
+  std::array<LayerVertex, 4> quad{};
+  for (size_t i = 0; i < quad.size(); ++i) {
+    std::memcpy(quad[i].pos, corners[i], sizeof quad[i].pos);
+    std::memcpy(quad[i].uv, Uvs[i], sizeof quad[i].uv);
+  }
+  const auto range = gfx::push_verts(reinterpret_cast<const uint8_t*>(quad.data()), sizeof quad, 16);
+  if (range.size == 0)
+    return;
+  if (gfx::push_custom_draw(s_layerDraw, &range, sizeof range))
     s_layerThisFrame = true;
 }
 

@@ -17,8 +17,9 @@ struct RecordedFrame {
 void initialize(const AuroraWindowSize& size) noexcept;
 void handle_event(SDL_Event& event) noexcept;
 RecordedFrame record_frame(const webgpu::Viewport& presentViewport) noexcept;
-// aurora_rmlui_draw_here (game thread, during the game's frame).
-void draw_here() noexcept;
+// aurora_rmlui_draw_here[_warped] (game thread, during the game's frame);
+// corners null for the whole frame.
+void draw_here(const float corners[4][4]) noexcept;
 void shutdown() noexcept;
 
 } // namespace aurora::rmlui

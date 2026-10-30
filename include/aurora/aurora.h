@@ -187,6 +187,12 @@ void aurora_preserve_frame_buffer(bool preserve);
  *  present composite is skipped. The documents are as last rendered (one
  *  frame behind); not for documents with a backdrop filter. */
 void aurora_rmlui_draw_here(void);
+/** aurora_rmlui_draw_here with the documents' corners moved, so they follow a
+ *  turn of the camera the game draws them under: the clip-space positions
+ *  (x, y, z, w) of their top-left, top-right, bottom-left and bottom-right
+ *  corners, mapped perspective-correctly. The documents still lay out on the
+ *  whole frame; this only moves where that picture lands. */
+void aurora_rmlui_draw_here_warped(const float corners[4][4]);
 /** Sets the clock timescale. Default 1.0f. 0.0f is paused. Range 0.0f-16.0f. */
 void aurora_set_timescale(float scale);
 

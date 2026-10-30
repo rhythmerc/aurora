@@ -620,7 +620,14 @@ void aurora_set_resampler(AuroraSampler sampler) {
 }
 void aurora_rmlui_draw_here() {
 #if AURORA_ENABLE_RMLUI
-  aurora::rmlui::draw_here();
+  aurora::rmlui::draw_here(nullptr);
+#endif
+}
+void aurora_rmlui_draw_here_warped(const float corners[4][4]) {
+#if AURORA_ENABLE_RMLUI
+  aurora::rmlui::draw_here(corners);
+#else
+  (void)corners;
 #endif
 }
 
