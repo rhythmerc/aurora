@@ -15,6 +15,7 @@
 #include "internal.hpp"
 #include "imgui.hpp"
 #include "gfx/recording.hpp"
+#include "gx/fifo.hpp"
 #include "rmlui/FileInterface_SDL.h"
 #include "rmlui/GlassFilter.hpp"
 #include "rmlui/ImageEffects.hpp"
@@ -627,6 +628,10 @@ void draw_here(const float corners[4][4]) noexcept {
     s_layerDraw = gfx::register_draw_type({.label = "RmlUi in-frame layer", .draw = layer_draw});
   if (corners == nullptr)
     corners = Whole;
+  // The GX FIFO's worker pushes into the same frame pools: finish its work
+  // before taking our share, or both append at once and the quad's vertices
+  // come out mixed with a GX draw's (a flickering, misplaced layer).
+  gx::fifo::drain();
   std::array<LayerVertex, 4> quad{};
   for (size_t i = 0; i < quad.size(); ++i) {
     std::memcpy(quad[i].pos, corners[i], sizeof quad[i].pos);
