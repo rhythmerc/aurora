@@ -1,5 +1,6 @@
 #include <aurora/aurora.h>
 #include <aurora/time.hpp>
+#include <atomic>
 #include <cmath>
 
 #ifdef AURORA_ENABLE_GX
@@ -295,6 +296,10 @@ const AuroraEvent* update() noexcept {
   return window::poll_events();
 }
 
+// aurora_set_frame_discard: asked for, and the frame begun last.
+std::atomic_bool g_discardAsked{false};
+bool g_discardFrame = false;
+
 bool begin_frame() noexcept {
   ZoneScoped;
 #ifdef AURORA_ENABLE_GX
@@ -320,6 +325,10 @@ bool begin_frame() noexcept {
   if (!gfx::begin_frame()) {
     return false;
   }
+  // The last frame's commands were all processed at its end_frame (drain),
+  // so none of this frame's can see the old setting.
+  g_discardFrame = g_discardAsked.load(std::memory_order_relaxed);
+  gx::fifo::set_discard_draws(g_discardFrame);
   gx::fifo::begin_frame();
 #endif
   return true;
@@ -354,7 +363,7 @@ void end_frame() noexcept {
   }
 #endif
 
-  gfx::end_frame([rmlBindGroup = std::move(rmlBindGroup), rmlOverlay, viewport,
+  gfx::end_frame([rmlBindGroup = std::move(rmlBindGroup), rmlOverlay, viewport, discard = g_discardFrame,
                   contentWidth = presentSource.size.width, contentHeight = presentSource.size.height,
                   imguiDrawData = std::move(imguiDrawData)](
                      wgpu::CommandEncoder& encoder, std::vector<gfx::AfterSubmitCallback> afterSubmitCallbacks) {
@@ -362,13 +371,14 @@ void end_frame() noexcept {
     wgpu::TextureView currentView;
     auto surfaceStatus = wgpu::SurfaceGetCurrentTextureStatus::Error;
     bool presentToXr = false;
-    bool skipPresent = false;
+    bool skipPresent = discard;
 #ifdef AURORA_ENABLE_OPENXR
     // The frame goes to the headset's virtual screen instead of the window
     // when an OpenXR session is up; xr::begin_frame returns null otherwise.
     // During a 3D fight nothing shows the flat frame, so it is not presented
     // at all.
-    if (xr::wanted() && xr::skip_present()) {
+    if (skipPresent) {
+    } else if (xr::wanted() && xr::skip_present()) {
       skipPresent = true;
     } else if (xr::wanted()) {
       uint32_t xrWidth = 0, xrHeight = 0;
@@ -533,7 +543,7 @@ void end_frame() noexcept {
         Log.warn("Surface present failed");
         webgpu::release_surface();
       }
-    } else if (g_surface) {
+    } else if (g_surface && !skipPresent) { // a skipped present acquired no texture
       switch (surfaceStatus) {
       case wgpu::SurfaceGetCurrentTextureStatus::Timeout:
         Log.warn("Surface texture acquisition timed out");
@@ -628,6 +638,14 @@ void aurora_rmlui_draw_here_warped(const float corners[4][4]) {
   aurora::rmlui::draw_here(corners);
 #else
   (void)corners;
+#endif
+}
+
+void aurora_set_frame_discard(bool discard) {
+#ifdef AURORA_ENABLE_GX
+  aurora::g_discardAsked.store(discard, std::memory_order_relaxed);
+#else
+  (void)discard;
 #endif
 }
 

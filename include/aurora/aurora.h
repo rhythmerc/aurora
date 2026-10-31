@@ -181,6 +181,11 @@ void aurora_set_resampler(AuroraSampler sampler);
 /** Keeps the previous frame instead of clearing, for hosts that pause the
  *  game: with nothing drawing, a cleared framebuffer presents as black. */
 void aurora_preserve_frame_buffer(bool preserve);
+/** Discards the frames begun from now on, until called with false: their
+ *  commands still run (state, textures, EFB copies, the draw-done token the
+ *  host may wait on), but draws are skipped and nothing is presented. For
+ *  hosts that run faster than real time and need only some frames shown. */
+void aurora_set_frame_discard(bool discard);
 /** Draws the RmlUi documents into the game's frame at this point of its draw
  *  stream (inside the open render pass), so whatever the game draws after
  *  covers them, instead of over the finished frame at present. That frame's

@@ -1,3 +1,4 @@
+#include <atomic>
 #include <bit>
 #include <cstdlib>
 #include <cstring>
@@ -2890,8 +2891,22 @@ static void handle_draw_unmerged(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, g
   push_gx_draw(prim, fmt, vtxCount, vertRange, idxRange, numIndices, raw);
 }
 
+static std::atomic_bool sDiscardDraws{false};
+
+void set_discard_draws(bool discard) noexcept { sDiscardDraws.store(discard, std::memory_order_relaxed); }
+
 static void draw_prim(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, ByteReader& reader) noexcept {
   ZoneScoped;
+  if (sDiscardDraws.load(std::memory_order_relaxed))
+    UNLIKELY {
+      // Only the vertices are skipped: the state they'd be drawn with stays
+      // dirty for the next frame that draws.
+      const u32 bytes = vtxCount * (g_gxState.lastVtxFmt == fmt ? g_gxState.lastVtxSize : calc_vtx_size(fmt));
+      if (bytes > reader.remaining())
+        UNLIKELY { handle_draw_overrun(bytes, reader); }
+      reader.take(bytes);
+      return;
+    }
   sDrawPrim = prim;
   u32 vtxSize;
   if (g_gxState.lastVtxFmt == fmt)
