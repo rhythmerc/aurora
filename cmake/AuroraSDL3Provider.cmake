@@ -151,6 +151,9 @@ elseif (_aurora_sdl3_provider STREQUAL "vendor")
       COMMAND ${CMAKE_COMMAND}
         -DSDL_SOURCE_DIR=<SOURCE_DIR>
         -P "${CMAKE_CURRENT_LIST_DIR}/patches/apply-sdl3-uikit-vision-idiom.cmake"
+      COMMAND ${CMAKE_COMMAND}
+        -DSDL_SOURCE_DIR=<SOURCE_DIR>
+        -P "${CMAKE_CURRENT_LIST_DIR}/patches/apply-sdl3-gamecube-adapter-without-libusb.cmake"
       EXCLUDE_FROM_ALL
     )
     # SDL declares no C++20 modules, but CMake >= 3.28 still scans its one C++
