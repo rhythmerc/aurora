@@ -33,6 +33,11 @@ bool wanted() noexcept;
 // images. False (and XR off) when OpenXR is unavailable. Main thread.
 bool prepare_device() noexcept;
 
+// Right after the WebGPU device is created, before other threads use it:
+// whether the OpenXR runtime gets a queue of its own in Dawn's queue family
+// or shares Dawn's one (lib/webgpu/queue_guard.hpp). Main thread.
+void device_created() noexcept;
+
 // After the WebGPU device is gone: destroys the OpenXR instance, which
 // created Dawn's Vulkan device and so has to outlive it.
 void release_instance() noexcept;

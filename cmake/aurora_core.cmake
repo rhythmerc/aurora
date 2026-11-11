@@ -79,7 +79,9 @@ if (AURORA_ENABLE_GX)
             lib/dawn/BackendBinding.cpp
             lib/dawn/TracyPlatform.cpp
     )
-    if (CMAKE_CXX_COMPILER_FRONTEND_VARIANT STREQUAL "GNU")
+    # Dawn is built without RTTI. CMake before 3.26 leaves GCC's front-end
+    # variant unset (the Steam Linux Runtime SDK has 3.25), hence the ID too.
+    if (CMAKE_CXX_COMPILER_FRONTEND_VARIANT STREQUAL "GNU" OR CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
         set_source_files_properties(lib/dawn/TracyPlatform.cpp PROPERTIES COMPILE_FLAGS -fno-rtti)
     endif ()
     target_link_libraries(aurora_core PRIVATE dawn::webgpu_dawn)

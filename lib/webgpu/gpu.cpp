@@ -1142,6 +1142,11 @@ bool initialize(AuroraBackend auroraBackend, bool allowCpu) {
     if (!g_device) {
       return false;
     }
+#ifdef AURORA_ENABLE_OPENXR
+    // Before any other thread uses the device: whether it shares its one
+    // queue with the OpenXR runtime (queue_guard.hpp).
+    xr::device_created();
+#endif
 #ifndef __EMSCRIPTEN__
     g_device.SetLoggingCallback(wgpu_log);
 #endif

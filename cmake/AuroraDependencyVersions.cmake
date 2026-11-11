@@ -31,3 +31,6 @@ _aurora_dependency_version(AURORA_ROOMTONE_COMMIT "d3e54795fab16b92894e97ccbb9d1
         "dd6e0f581dcd23b32907131077717a3b0babcf20" "952c1544dae4110fb9effb1e278a44b1ac56f74e" "09e30de6dc8f5d230d748d519ea11efe980eaaf1"
         "0969826eefd833c2bf7a6ab0ad11ae4b8939cb95" "dae9b534b46427426c3df76ee646f5e84ac8c02d") # Previous versions
 set(AURORA_OPENXR_ANDROID_SHA256 "622419d2f6741c3443a3beb4779af0764318edd01830de967f24c741ebcded73")
+# Desktop OpenXR SDK (AURORA_ENABLE_OPENXR off Android, when the system's is older): Khronos' OpenXR-SDK
+_aurora_dependency_version(AURORA_OPENXR_SDK_VERSION "1.1.63" "KhronosGroup/OpenXR-SDK release built when the system's is older")
+set(AURORA_OPENXR_SDK_SHA256 "5b8dac0608f49498fe8e95f562fe6bcf0bc781e561f137348a8c251d06a88b6f")

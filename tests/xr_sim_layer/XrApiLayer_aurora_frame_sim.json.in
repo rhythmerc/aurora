@@ -1,0 +1,17 @@
+{
+    "file_format_version": "1.0.0",
+    "api_layer": {
+        "name": "XR_APILAYER_AURORA_frame_sim",
+        "library_path": "./$<TARGET_FILE_NAME:XrApiLayer_aurora_frame_sim>",
+        "api_version": "1.0",
+        "implementation_version": "1",
+        "description": "Test only: makes a desktop runtime look like SteamVR on the Steam Frame (aurora tests/xr_sim_layer)",
+        "instance_extensions": [
+            {
+                "name": "XR_VALVE_frame_controller_interaction",
+                "extension_version": "1"
+            }
+        ],
+        "disable_environment": "DISABLE_XR_APILAYER_AURORA_FRAME_SIM"
+    }
+}

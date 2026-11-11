@@ -216,3 +216,18 @@ target_include_directories(os_alloc_tests PRIVATE
 target_compile_definitions(os_alloc_tests PRIVATE AURORA TARGET_PC)
 target_link_libraries(os_alloc_tests PRIVATE gtest gtest_main fmt::fmt)
 gtest_discover_tests(os_alloc_tests)
+
+# The OpenXR presenter's decisions (lib/xr/xr_policy.cpp): pure, so built
+# whether or not OpenXR is.
+add_executable(xr_policy_tests
+  xr_policy_test.cpp
+  ../lib/xr/xr_policy.cpp
+)
+target_include_directories(xr_policy_tests PRIVATE ../lib)
+target_link_libraries(xr_policy_tests PRIVATE gtest gtest_main)
+gtest_discover_tests(xr_policy_tests)
+
+# A Steam Frame personality for a desktop OpenXR runtime (xr_sim_layer/).
+if (AURORA_ENABLE_OPENXR AND NOT ANDROID AND TARGET OpenXR::headers)
+  add_subdirectory(xr_sim_layer)
+endif ()

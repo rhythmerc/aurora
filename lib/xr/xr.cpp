@@ -6,9 +6,12 @@
 #include "../webgpu/gpu.hpp"
 #include "../gfx/frame.hpp"
 #include "../gfx/recording.hpp"
+#include "../gfx/render_worker.hpp"
 #include "../gfx/xr_replay.hpp"
 #include "../gx/gx.hpp"
 #include "../dolphin/pad/fight.hpp"
+#include "../webgpu/queue_guard.hpp"
+#include "xr_policy.hpp"
 
 #include <aurora/gfx.hpp>
 #include <dolphin/pad.h>
@@ -193,6 +196,9 @@ std::mutex g_mutex;
 std::condition_variable g_slotFreeCv; // a slot became Free (XR thread -> render worker)
 std::atomic<Phase> g_phase{Phase::Idle};
 std::atomic<bool> g_stop{false};
+// Set by shutdown before g_stop: begin_frame hands out no more swapchain
+// images, so none is in use when the XR thread destroys them.
+std::atomic<bool> g_stopping{false};
 std::atomic<bool> g_sessionRunning{false};
 std::thread g_thread;
 std::array<Stream, kStreamCount> g_streams;
@@ -455,6 +461,11 @@ std::array<PlacingClip, 6> g_placingClips;
 // Set by the game (aurora_xr_set_passthrough): mixed reality shows the room,
 // full VR doesn't. The XR thread pauses or starts passthrough to match.
 std::atomic<bool> g_passthroughWanted{true};
+// Whether the room can show at all (aurora_xr_passthrough_available): -1
+// until the session has found out, then 0 or 1.
+std::atomic<int> g_roomAvailable{-1};
+// The controllers in the player's hands (aurora_xr_controllers).
+std::atomic<int> g_controllers{AURORA_XR_CONTROLLERS_NONE};
 
 // The game's rumble motor (aurora_xr_set_rumble); the XR thread drives the
 // controllers' haptics to match.
@@ -465,6 +476,8 @@ std::atomic<bool> g_rumbleWanted{false};
 // (aurora_xr_get_pad), through the fight mapping in a fight.
 std::mutex g_padMutex;
 PADFightRaw g_touchRaw{};
+// The Steam Frame's D-pad, as GameCube D-pad buttons (update_input).
+u16 g_frameDpad = 0;
 bool g_padValid = false;
 // Where a laser points on the virtual screen's picture, for the game
 // (aurora_xr_screen_pointer). Under g_padMutex.
@@ -476,6 +489,8 @@ ScreenPointer g_screenPointer;
 // A hand is pressing the screen's Back button (aurora_xr_screen_back).
 // Under g_padMutex.
 bool g_screenBack = false;
+// The View button went down since aurora_xr_take_view_press last took it.
+std::atomic<bool> g_viewPressed{false};
 // The frame's size as the game draws it: the picture is letterboxed on the
 // screen when its aspect differs from the screen's.
 std::atomic<uint32_t> g_contentW{0}, g_contentH{0};
@@ -491,6 +506,17 @@ struct Bridge {
   XrPassthroughFB passthrough = XR_NULL_HANDLE;
   XrPassthroughLayerFB passthroughLayer = XR_NULL_HANDLE;
   bool running = false;
+  // How the room shows behind the game (create_session): XR_FB_passthrough's
+  // layer (the Quest), or the frame blended over it by its alpha where the
+  // system offers ALPHA_BLEND and no such layer (the Steam Frame on the
+  // headset), or not at all. Blending, every frame starts with a clear
+  // projection layer (roomSwapchain, at the views of frameViews): the Steam
+  // Frame shows the room only behind a projection layer, and menus have none.
+  policy::Room room = policy::Room::None;
+  bool alphaBlendOffered = false;
+  XrSwapchain roomSwapchain = XR_NULL_HANDLE;
+  std::array<XrView, 2> frameViews{};
+  bool frameViewsValid = false;
 
   // Dawn's device (borrowed: Dawn owns it), set by begin_frame before the XR
   // thread starts. `queue` is the spare queue Dawn created for us (index
@@ -501,6 +527,9 @@ struct Bridge {
   VkQueue queue = VK_NULL_HANDLE;
   uint32_t queueFamily = 0;
   uint32_t queueIndex = 1;
+  // The family has no spare queue (Turnip, RADV): the runtime and the XR
+  // thread share Dawn's, under lib/webgpu/queue_guard.hpp's lock.
+  bool sharedQueue = false;
   VkCommandPool pool = VK_NULL_HANDLE;
   VkPhysicalDeviceMemoryProperties memProps{};
   PFN_vkImportSemaphoreFdKHR importSemaphoreFd = nullptr;
@@ -590,7 +619,14 @@ struct Bridge {
   XrAction btnA = XR_NULL_HANDLE, btnB = XR_NULL_HANDLE, btnX = XR_NULL_HANDLE, btnY = XR_NULL_HANDLE;
   XrAction btnStart = XR_NULL_HANDLE;
   std::array<XrAction, 2> gripBtn{}, stickClick{}; // left, right
+  XrAction btnView = XR_NULL_HANDLE;               // the Steam Frame's left View button (aurora_xr_take_view_press)
   XrAction trigL = XR_NULL_HANDLE, trigR = XR_NULL_HANDLE;
+  // The GameCube D-pad (up, down, left, right): the Steam Frame controller's.
+  std::array<XrAction, 4> dpad{};
+  // XR_VALVE_frame_controller_interaction (the Steam Frame's controllers),
+  // and what each hand holds now (xrGetCurrentInteractionProfile).
+  bool hasFrameControllerExt = false;
+  std::array<policy::Profile, 2> handProfile{policy::Profile::None, policy::Profile::None};
   // Pointing and grabbing the arena while a fight is paused.
   std::array<XrAction, 2> aim{}, grab{};
   std::array<XrSpace, 2> aimSpace{};
@@ -661,6 +697,14 @@ Bridge B;
       return false;                                                                                                    \
     }                                                                                                                  \
   } while (0)
+// Vulkan and OpenXR calls that may use the queue the runtime has (Dawn's,
+// when it is shared: lib/webgpu/queue_guard.hpp). The XR thread's waits for
+// the lock are counted.
+#define ON_QUEUE(x)                                                                                                    \
+  [&] {                                                                                                                \
+    const webgpu::QueueGuard queueGuard_{true, #x};                                                                    \
+    return (x);                                                                                                        \
+  }()
 
 bool env_flag(const char* name, bool def) {
   const char* v = std::getenv(name);
@@ -726,6 +770,10 @@ VkImageMemoryBarrier barrier(VkImage img, VkImageLayout from, VkImageLayout to, 
 
 // ---------------------------------------------------------------- XR thread: setup
 
+// The Steam Frame controller's interaction profile (SteamVR 2.15.1 and later),
+// newer than the OpenXR headers aurora builds with.
+constexpr const char* kFrameControllerExt = "XR_VALVE_frame_controller_interaction";
+
 bool create_instance() {
 #ifdef __ANDROID__
   auto* env = static_cast<JNIEnv*>(SDL_GetAndroidJNIEnv());
@@ -783,6 +831,7 @@ bool create_instance() {
 #ifdef XR_META_environment_depth
     B.hasEnvDepthExt |= !std::strcmp(p.extensionName, XR_META_ENVIRONMENT_DEPTH_EXTENSION_NAME);
 #endif
+    B.hasFrameControllerExt |= !std::strcmp(p.extensionName, kFrameControllerExt);
   }
   if (!hasVk2) {
     Log.error("OpenXR runtime lacks XR_KHR_vulkan_enable2");
@@ -804,11 +853,17 @@ bool create_instance() {
   // On wherever the runtime offers it, unless the host turned it off
   // (AuroraConfig::xrNoSpaceWarp; AURORA_XR_APPSW=0/1 overrides). Multiview
   // is decided later (with Dawn's device): size_stereo_stream.
-  B.hasSpaceWarpExt &= env_flag("AURORA_XR_APPSW", !g_config.xrNoSpaceWarp);
+  // Off by default on SteamVR (it offers the Steam Frame's controllers): it
+  // switches the loop between the display's rate and half of it every few
+  // frames there, and the game re-paced each time. AURORA_XR_APPSW=1 forces it.
+  B.hasSpaceWarpExt &= env_flag("AURORA_XR_APPSW", !g_config.xrNoSpaceWarp && !B.hasFrameControllerExt);
   if (B.hasSpaceWarpExt)
     exts.push_back(XR_FB_SPACE_WARP_EXTENSION_NAME);
   // AURORA_XR_HANDS=0 leaves hand tracking off, for measuring what it costs.
-  B.hasHandTrackingExt &= env_flag("AURORA_XR_HANDS", true);
+  // Off by default where the runtime offers the Steam Frame's controllers:
+  // the Frame tracks no hands, and SteamVR's joints there are made up from
+  // the controllers, which would then point by pinching, not the trigger.
+  B.hasHandTrackingExt &= env_flag("AURORA_XR_HANDS", !B.hasFrameControllerExt);
   if (B.hasHandTrackingExt)
     exts.push_back(XR_EXT_HAND_TRACKING_EXTENSION_NAME);
 #ifdef XR_META_boundary_visibility
@@ -836,6 +891,12 @@ bool create_instance() {
   B.hasLocalFloorExt &= env_flag("AURORA_XR_LOCAL_FLOOR", true);
   if (B.hasLocalFloorExt)
     exts.push_back(XR_EXT_LOCAL_FLOOR_EXTENSION_NAME);
+  // The Steam Frame's controllers, with their own bindings (create_input)
+  // rather than SteamVR's emulation of Touch controllers.
+  // AURORA_XR_FRAME_BINDINGS=0 leaves them to the emulation.
+  B.hasFrameControllerExt &= env_flag("AURORA_XR_FRAME_BINDINGS", true);
+  if (B.hasFrameControllerExt)
+    exts.push_back(kFrameControllerExt);
   // The room's grade by colour LUT; without it, brightness, contrast and
   // saturation (AURORA_XR_GRADE_LUT=0 forces those, AURORA_XR_GRADE=0 none).
   B.hasColorLutExt &= B.hasPassthroughExt && grade_wanted() &&
@@ -881,6 +942,31 @@ bool create_instance() {
   XrSystemGetInfo si{XR_TYPE_SYSTEM_GET_INFO};
   si.formFactor = XR_FORM_FACTOR_HEAD_MOUNTED_DISPLAY;
   XR_TRY(xrGetSystem(B.instance, &si, &B.systemId));
+  {
+    // ALPHA_BLEND: the room behind the frame where XR_FB_passthrough isn't
+    // offered (the Steam Frame on the headset; SteamVR streaming to it offers
+    // only OPAQUE).
+    uint32_t nb = 0;
+    std::vector<XrEnvironmentBlendMode> modes;
+    if (XR_SUCCEEDED(xrEnumerateEnvironmentBlendModes(B.instance, B.systemId, XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO,
+                                                      0, &nb, nullptr)) &&
+        nb > 0) {
+      modes.resize(nb);
+      if (XR_FAILED(xrEnumerateEnvironmentBlendModes(B.instance, B.systemId, XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO,
+                                                     nb, &nb, modes.data())))
+        modes.clear();
+    }
+    std::string list;
+    for (const auto m : modes) {
+      B.alphaBlendOffered |= m == XR_ENVIRONMENT_BLEND_MODE_ALPHA_BLEND;
+      list += fmt::format("{}{}", list.empty() ? "" : ", ",
+                          m == XR_ENVIRONMENT_BLEND_MODE_OPAQUE        ? "opaque"
+                          : m == XR_ENVIRONMENT_BLEND_MODE_ADDITIVE    ? "additive"
+                          : m == XR_ENVIRONMENT_BLEND_MODE_ALPHA_BLEND ? "alpha blend"
+                                                                       : "other");
+    }
+    Log.info("Environment blend modes: {}", list.empty() ? std::string{"none listed"} : list);
+  }
   {
     XrSystemProperties sp{XR_TYPE_SYSTEM_PROPERTIES};
     XrSystemEnvironmentRaycastPropertiesMETA raycast{XR_TYPE_SYSTEM_ENVIRONMENT_RAYCAST_PROPERTIES_META};
@@ -1230,6 +1316,47 @@ VkImageCreateInfo swapchain_image_info(const Stream& st) {
   return ici;
 }
 
+// Every swapchain is counted. Runtimes cap them (the Steam Frame's SteamVR
+// at 16 a session), so an optional one (a picture that can come later: the
+// shadow, placing cards and clips, the dev panel, SpaceWarp's zero vectors)
+// is created only within the budget: AURORA_XR_MAX_SWAPCHAINS, or how many
+// were alive when the runtime first refused one (XR_ERROR_LIMIT_REACHED).
+// The screen, the 3D view, the HUD and the lasers are always tried.
+int g_liveSwapchains = 0, g_peakSwapchains = 0;
+int g_swapchainBudget = -1;      // -1: not read yet; 0: none known
+bool g_swapchainLimited = false; // the last refusal was the budget's (worth trying again later)
+
+XrResult new_swapchain(const XrSwapchainCreateInfo& ci, XrSwapchain& out, bool optional) {
+  if (g_swapchainBudget < 0)
+    g_swapchainBudget = std::max(0, static_cast<int>(env_float("AURORA_XR_MAX_SWAPCHAINS", 0.f)));
+  g_swapchainLimited = false;
+  if (!policy::swapchain_admit(g_liveSwapchains, g_swapchainBudget, !optional)) {
+    g_swapchainLimited = true;
+    return XR_ERROR_LIMIT_REACHED;
+  }
+  const XrResult r = ON_QUEUE(xrCreateSwapchain(B.session, &ci, &out));
+  if (r == XR_ERROR_LIMIT_REACHED) {
+    g_swapchainLimited = true;
+    if (g_swapchainBudget == 0 || g_swapchainBudget > g_liveSwapchains) {
+      g_swapchainBudget = g_liveSwapchains;
+      Log.warn("The runtime allows {} swapchains: optional pictures only as they fit", g_swapchainBudget);
+    }
+  } else if (XR_SUCCEEDED(r) && ++g_liveSwapchains > g_peakSwapchains) {
+    g_peakSwapchains = g_liveSwapchains;
+    Log.info("Swapchains alive: {}, the most yet{}", g_peakSwapchains,
+             g_swapchainBudget > 0 ? fmt::format(" (budget {})", g_swapchainBudget) : std::string{});
+  }
+  return r;
+}
+
+void free_swapchain(XrSwapchain& sc) {
+  if (sc == XR_NULL_HANDLE)
+    return;
+  ON_QUEUE(xrDestroySwapchain(sc));
+  --g_liveSwapchains;
+  sc = XR_NULL_HANDLE;
+}
+
 bool create_swapchain(Stream& st) {
   if (st.width == 0)
     return true; // not in use (the SpaceWarp streams without AURORA_XR_APPSW)
@@ -1247,7 +1374,7 @@ bool create_swapchain(Stream& st) {
   ci.faceCount = 1;
   ci.arraySize = st.layers;
   ci.mipCount = 1;
-  XR_TRY(xrCreateSwapchain(B.session, &ci, &st.swapchain));
+  XR_TRY(new_swapchain(ci, st.swapchain, false));
   uint32_t n = 0;
   XR_TRY(xrEnumerateSwapchainImages(st.swapchain, 0, &n, nullptr));
   std::vector<XrSwapchainImageVulkan2KHR> imgs(n, {XR_TYPE_SWAPCHAIN_IMAGE_VULKAN2_KHR});
@@ -1618,7 +1745,7 @@ bool density_build(const std::vector<std::pair<uint32_t, uint32_t>>& sizes, cons
   VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
   si.commandBufferCount = 1;
   si.pCommandBuffers = &up.cmd;
-  if (vkQueueSubmit(B.queue, 1, &si, up.fence) != VK_SUCCESS)
+  if (ON_QUEUE(vkQueueSubmit(B.queue, 1, &si, up.fence)) != VK_SUCCESS)
     return fail();
   std::lock_guard lock{fd.mutex};
   for (const auto& p : parts) {
@@ -1746,7 +1873,7 @@ bool create_session() {
   XrSessionCreateInfo sci{XR_TYPE_SESSION_CREATE_INFO};
   sci.next = &gb;
   sci.systemId = B.systemId;
-  XR_TRY(xrCreateSession(B.instance, &sci, &B.session));
+  XR_TRY(ON_QUEUE(xrCreateSession(B.instance, &sci, &B.session)));
 
   XrReferenceSpaceCreateInfo rsci{XR_TYPE_REFERENCE_SPACE_CREATE_INFO};
   rsci.referenceSpaceType = XR_REFERENCE_SPACE_TYPE_LOCAL;
@@ -1812,7 +1939,12 @@ bool create_session() {
 #endif
   (void)offered;
 
-  if (B.createPassthrough && B.createPassthroughLayer && env_flag("AURORA_XR_PASSTHROUGH", true)) {
+  // AURORA_XR_ROOM=auto|fb|blend|none picks how the room shows (blend: by
+  // alpha even with XR_FB_passthrough offered); AURORA_XR_PASSTHROUGH=0
+  // shows none.
+  const bool roomOn = env_flag("AURORA_XR_PASSTHROUGH", true);
+  const auto roomPref = roomOn ? policy::parse_room_pref(std::getenv("AURORA_XR_ROOM")) : policy::RoomPref::None;
+  if (B.createPassthrough && B.createPassthroughLayer && policy::try_fb_layer(roomPref)) {
     XrPassthroughCreateInfoFB pci{XR_TYPE_PASSTHROUGH_CREATE_INFO_FB};
     pci.flags = XR_PASSTHROUGH_IS_RUNNING_AT_CREATION_BIT_FB;
     if (XR_SUCCEEDED(B.createPassthrough(B.session, &pci, &B.passthrough))) {
@@ -1827,11 +1959,15 @@ bool create_session() {
       B.passthrough = XR_NULL_HANDLE;
     }
   }
+  // The room's clear projection layer is made in setup (room_swapchain).
+  B.room = policy::room_mode(B.passthroughLayer != XR_NULL_HANDLE, B.alphaBlendOffered, roomPref);
   Log.info("Swapchains: screen {}x{}, 3D {}x{} (two {}x{} eyes, format {}), HUD {}x{} (format {}), passthrough {}",
            g_streams[kScreen].width, g_streams[kScreen].height, g_streams[kStereo].width, g_streams[kStereo].height,
            g_multiview ? g_streams[kStereo].width : g_streams[kStereo].width / 2, g_streams[kStereo].height,
-           g_streams[kStereo].swapFormat,
-           g_streams[kHud].width, g_streams[kHud].height, B.swapFormat, B.passthroughLayer ? "on" : "off");
+           g_streams[kStereo].swapFormat, g_streams[kHud].width, g_streams[kHud].height, B.swapFormat,
+           B.room == policy::Room::Fb      ? "on (XR_FB_passthrough layer)"
+           : B.room == policy::Room::Alpha ? "on (alpha blend)"
+                                           : "off");
   return true;
 }
 
@@ -1924,6 +2060,33 @@ bool suggest(const char* profile, const std::vector<std::pair<XrAction, const ch
   return XR_SUCCEEDED(r);
 }
 
+// What each hand holds (after the action set is attached, and when the
+// runtime says it changed): whether its tracked joints are a bare hand
+// (locate_pinch), and which legend the placing hold shows (aurora_xr_controllers).
+void update_hand_profiles() {
+  for (int h = 0; h < 2; ++h) {
+    XrInteractionProfileState st{XR_TYPE_INTERACTION_PROFILE_STATE};
+    std::string name;
+    if (XR_SUCCEEDED(
+            xrGetCurrentInteractionProfile(B.session, path(h == 0 ? "/user/hand/left" : "/user/hand/right"), &st)) &&
+        st.interactionProfile != XR_NULL_PATH) {
+      char buf[XR_MAX_PATH_LENGTH];
+      uint32_t n = 0;
+      if (XR_SUCCEEDED(xrPathToString(B.instance, st.interactionProfile, sizeof buf, &n, buf)))
+        name = buf;
+    }
+    const auto kind = policy::classify_profile(name);
+    if (kind != B.handProfile[h])
+      Log.info("{} hand: {}", h == 0 ? "Left" : "Right", name.empty() ? std::string{"nothing"} : name);
+    B.handProfile[h] = kind;
+  }
+  const auto either = [](policy::Profile p) { return B.handProfile[0] == p || B.handProfile[1] == p; };
+  g_controllers = either(policy::Profile::Frame)             ? AURORA_XR_CONTROLLERS_FRAME
+                  : either(policy::Profile::Touch)           ? AURORA_XR_CONTROLLERS_TOUCH
+                  : either(policy::Profile::OtherController) ? AURORA_XR_CONTROLLERS_OTHER
+                                                             : AURORA_XR_CONTROLLERS_NONE;
+}
+
 bool create_input() {
   XrActionSetCreateInfo asi{XR_TYPE_ACTION_SET_CREATE_INFO};
   std::strncpy(asi.actionSetName, "gamecube", XR_MAX_ACTION_SET_NAME_SIZE - 1);
@@ -1945,43 +2108,132 @@ bool create_input() {
       !create_action(B.aim[0], "aim_left", "Left pointer", XR_ACTION_TYPE_POSE_INPUT) ||
       !create_action(B.aim[1], "aim_right", "Right pointer", XR_ACTION_TYPE_POSE_INPUT) ||
       !create_action(B.grab[0], "grab_left", "Left grab", XR_ACTION_TYPE_FLOAT_INPUT) ||
-      !create_action(B.grab[1], "grab_right", "Right grab", XR_ACTION_TYPE_FLOAT_INPUT))
+      !create_action(B.grab[1], "grab_right", "Right grab", XR_ACTION_TYPE_FLOAT_INPUT) ||
+      !create_action(B.dpad[0], "dpad_up", "D-pad up", XR_ACTION_TYPE_BOOLEAN_INPUT) ||
+      !create_action(B.dpad[1], "dpad_down", "D-pad down", XR_ACTION_TYPE_BOOLEAN_INPUT) ||
+      !create_action(B.dpad[2], "dpad_left", "D-pad left", XR_ACTION_TYPE_BOOLEAN_INPUT) ||
+      !create_action(B.dpad[3], "dpad_right", "D-pad right", XR_ACTION_TYPE_BOOLEAN_INPUT) ||
+      !create_action(B.btnView, "view", "Room or skybox", XR_ACTION_TYPE_BOOLEAN_INPUT))
     return false;
-
-  std::vector<std::pair<XrAction, const char*>> touchBindings{
-      {B.stickMain, "/user/hand/left/input/thumbstick"},
-      {B.stickC, "/user/hand/right/input/thumbstick"},
-      {B.btnA, "/user/hand/right/input/a/click"},
-      {B.btnB, "/user/hand/right/input/b/click"},
-      {B.btnX, "/user/hand/left/input/x/click"},
-      {B.btnY, "/user/hand/left/input/y/click"},
-      {B.gripBtn[0], "/user/hand/left/input/squeeze/value"},
-      {B.gripBtn[1], "/user/hand/right/input/squeeze/value"},
-      {B.stickClick[0], "/user/hand/left/input/thumbstick/click"},
-      {B.stickClick[1], "/user/hand/right/input/thumbstick/click"},
-      {B.btnStart, "/user/hand/left/input/menu/click"},
-      {B.trigL, "/user/hand/left/input/trigger/value"},
-      {B.trigR, "/user/hand/right/input/trigger/value"},
-      {B.aim[0], "/user/hand/left/input/aim/pose"},
-      {B.aim[1], "/user/hand/right/input/aim/pose"},
-      {B.grab[0], "/user/hand/left/input/squeeze/value"},
-      {B.grab[1], "/user/hand/right/input/squeeze/value"},
+  const bool rumble = create_action(B.rumble, "rumble", "Rumble", XR_ACTION_TYPE_VIBRATION_OUTPUT);
+  const auto bindings = [](const std::vector<policy::Binding>& table) {
+    std::vector<std::pair<XrAction, const char*>> out;
+    for (const auto& [act, binding] : table) {
+      using policy::Act;
+      XrAction a = XR_NULL_HANDLE;
+      switch (act) {
+      case Act::Stick:
+        a = B.stickMain;
+        break;
+      case Act::CStick:
+        a = B.stickC;
+        break;
+      case Act::A:
+        a = B.btnA;
+        break;
+      case Act::B:
+        a = B.btnB;
+        break;
+      case Act::X:
+        a = B.btnX;
+        break;
+      case Act::Y:
+        a = B.btnY;
+        break;
+      case Act::GripL:
+        a = B.gripBtn[0];
+        break;
+      case Act::GripR:
+        a = B.gripBtn[1];
+        break;
+      case Act::StickClickL:
+        a = B.stickClick[0];
+        break;
+      case Act::StickClickR:
+        a = B.stickClick[1];
+        break;
+      case Act::Start:
+        a = B.btnStart;
+        break;
+      case Act::L:
+        a = B.trigL;
+        break;
+      case Act::R:
+        a = B.trigR;
+        break;
+      case Act::AimL:
+        a = B.aim[0];
+        break;
+      case Act::AimR:
+        a = B.aim[1];
+        break;
+      case Act::GrabL:
+        a = B.grab[0];
+        break;
+      case Act::GrabR:
+        a = B.grab[1];
+        break;
+      case Act::DUp:
+        a = B.dpad[0];
+        break;
+      case Act::DDown:
+        a = B.dpad[1];
+        break;
+      case Act::DLeft:
+        a = B.dpad[2];
+        break;
+      case Act::DRight:
+        a = B.dpad[3];
+        break;
+      case Act::View:
+        a = B.btnView;
+        break;
+      case Act::RumbleL:
+      case Act::RumbleR:
+        a = B.rumble;
+        break;
+      }
+      out.emplace_back(a, binding);
+    }
+    return out;
   };
+
   // The game's rumble on both controllers' haptics. Suggested with the pad's
   // bindings (a later suggestion for a profile replaces the earlier one), and
   // the pad alone again if the runtime turns that down.
-  bool touch = false;
-  if (create_action(B.rumble, "rumble", "Rumble", XR_ACTION_TYPE_VIBRATION_OUTPUT)) {
-    auto withHaptics = touchBindings;
-    withHaptics.push_back({B.rumble, "/user/hand/left/output/haptic"});
-    withHaptics.push_back({B.rumble, "/user/hand/right/output/haptic"});
-    touch = suggest("/interaction_profiles/oculus/touch_controller", withHaptics);
-  }
+  bool touch =
+      rumble && suggest("/interaction_profiles/oculus/touch_controller", bindings(policy::touch_bindings(true)));
+  bool haptics = touch;
   if (!touch) {
-    B.rumble = XR_NULL_HANDLE;
     Log.warn("Touch controller haptics not bound: no rumble");
-    touch = suggest("/interaction_profiles/oculus/touch_controller", touchBindings);
+    touch = suggest("/interaction_profiles/oculus/touch_controller", bindings(policy::touch_bindings(false)));
   }
+  // The Steam Frame's controllers: shoulders Z, grips only grab, A/B/X/Y and
+  // Start on the right, the D-pad on the left. The first variant the runtime
+  // takes (it rejects a whole suggestion over one path it doesn't know).
+  bool frame = false;
+  if (B.hasFrameControllerExt) {
+    for (const auto& variant : policy::frame_binding_variants()) {
+      const bool withRumble = std::any_of(variant.begin(), variant.end(),
+                                          [](const policy::Binding& b) { return b.act == policy::Act::RumbleL; });
+      if (withRumble && !rumble)
+        continue;
+      if (suggest("/interaction_profiles/valve/frame_controller_valve", bindings(variant))) {
+        frame = true;
+        haptics |= withRumble;
+        std::string kept;
+        for (const auto& b : variant)
+          if (b.act == policy::Act::GripL || b.act == policy::Act::GripR || b.act == policy::Act::DUp ||
+              b.act == policy::Act::View)
+            kept += fmt::format("{}{}", kept.empty() ? "" : ", ", b.path);
+        Log.info("Steam Frame controller bindings: {}{}", kept.empty() ? std::string{"no Z or D-pad"} : kept,
+                 withRumble ? ", rumble" : ", no rumble");
+        break;
+      }
+    }
+  }
+  if (!haptics)
+    B.rumble = XR_NULL_HANDLE;
   // Pointing and grabbing only, no pad buttons: the Quest reports bare
   // hands as this profile, select being a pinch, and a pinch must grab,
   // not press A or B. (Monado's keyboard/mouse controllers come through it
@@ -2002,7 +2254,9 @@ bool create_input() {
     asci.poseInActionSpace.orientation.w = 1.f;
     XR_TRY(xrCreateActionSpace(B.session, &asci, &B.aimSpace[h]));
   }
-  Log.info("Controller input ready ({})", touch ? "Touch controller bindings" : "simple controller only");
+  Log.info("Controller input ready ({}{})", touch ? "Touch controller bindings" : "simple controller only",
+           frame ? ", Steam Frame controller bindings" : "");
+  update_hand_profiles();
   return true;
 }
 
@@ -2126,8 +2380,25 @@ void update_input() {
   press(l > 0.9f, PAD_FIGHT_LEFT_TRIGGER);
   press(r > 0.9f, PAD_FIGHT_RIGHT_TRIGGER);
   raw.start = action_bool(B.btnStart);
+  // The Steam Frame's D-pad: no input of the Touch fight table, so the
+  // GameCube's D-pad as it is, added after the table (aurora_xr_get_pad).
+  u16 dpad = 0;
+  dpad |= action_bool(B.dpad[0]) ? PAD_BUTTON_UP : 0;
+  dpad |= action_bool(B.dpad[1]) ? PAD_BUTTON_DOWN : 0;
+  dpad |= action_bool(B.dpad[2]) ? PAD_BUTTON_LEFT : 0;
+  dpad |= action_bool(B.dpad[3]) ? PAD_BUTTON_RIGHT : 0;
+  // The View button: no GameCube button; a press waits for the game to take it.
+  static bool viewWas = false;
+  const bool view = action_bool(B.btnView);
+  if (view && !viewWas) {
+    g_viewPressed = true;
+    if (env_flag("AURORA_XR_INPUT_LOG", false))
+      Log.info("XR View pressed");
+  }
+  viewWas = view;
   std::lock_guard lock{g_padMutex};
   g_touchRaw = raw;
+  g_frameDpad = dpad;
   g_padValid = true;
 }
 
@@ -2199,7 +2470,7 @@ bool acquire_ahead(Stream& st, int64_t waitNs = 2'000'000) {
                            &st == &g_streams[kMotionDepth]);
   if (pending < 0 && held < st.slots.size() && (!haveWaited || preAcquire)) {
     uint32_t index = 0;
-    XR_TRY(xrAcquireSwapchainImage(st.swapchain, nullptr, &index));
+    XR_TRY(ON_QUEUE(xrAcquireSwapchainImage(st.swapchain, nullptr, &index)));
     std::lock_guard lock{g_mutex};
     st.slots[index].state = SlotState::Acquired;
     st.slots[index].acquireSeq = ++st.acquireSeq;
@@ -2899,11 +3170,11 @@ bool release_ready(Stream& st, bool& released) {
     si.pWaitDstStageMask = stages.data();
     si.commandBufferCount = record ? 1 : 0;
     si.pCommandBuffers = &s.cmd;
-    VK_TRY(vkQueueSubmit(B.queue, 1, &si, s.fence));
+    VK_TRY(ON_QUEUE(vkQueueSubmit(B.queue, 1, &si, s.fence)));
     s.inFlight = true;
     if (&st == &g_streams[kStereo])
       trace_counter("XR 3D released", static_cast<int64_t>(st.releases & 1));
-    XR_TRY(xrReleaseSwapchainImage(st.swapchain, nullptr));
+    XR_TRY(ON_QUEUE(xrReleaseSwapchainImage(st.swapchain, nullptr)));
     {
       std::lock_guard lock{g_mutex};
       s.state = SlotState::Released;
@@ -3033,7 +3304,7 @@ bool release_staged(Stream& st, bool& released) {
       si.waitSemaphoreCount = static_cast<uint32_t>(r.waitSems.size());
       si.pWaitSemaphores = r.waitSems.data();
       si.pWaitDstStageMask = stages.data();
-      VK_TRY(vkQueueSubmit(B.queue, 1, &si, r.fence));
+      VK_TRY(ON_QUEUE(vkQueueSubmit(B.queue, 1, &si, r.fence)));
       {
         std::lock_guard lock{g_mutex};
         r.inFlight = true;
@@ -3109,14 +3380,14 @@ bool release_staged(Stream& st, bool& released) {
     si.pWaitDstStageMask = stages.data();
     si.commandBufferCount = 1;
     si.pCommandBuffers = &r.cmd;
-    VK_TRY(vkQueueSubmit(B.queue, 1, &si, r.fence));
+    VK_TRY(ON_QUEUE(vkQueueSubmit(B.queue, 1, &si, r.fence)));
     {
       std::lock_guard lock{g_mutex};
       r.inFlight = true;
     }
     if (&st == &g_streams[kStereo])
       trace_counter("XR 3D released", static_cast<int64_t>(st.releases & 1));
-    XR_TRY(xrReleaseSwapchainImage(st.swapchain, nullptr));
+    XR_TRY(ON_QUEUE(xrReleaseSwapchainImage(st.swapchain, nullptr)));
     {
       std::lock_guard lock{g_mutex};
       s.state = SlotState::Released;
@@ -3165,6 +3436,18 @@ void request_performance_levels() {
   request("AURORA_XR_PERF_GPU", "off", XR_PERF_SETTINGS_DOMAIN_GPU_EXT, "GPU");
 }
 
+// The rate wanted (0: none) and whether the runtime last granted it. SteamVR
+// on the Steam Frame lists only the rate it runs at and grants only that one,
+// while its auto-adjust moves it among 72, 90, 108, 120 and 144 Hz, with no
+// change event: the rate is asked for again whenever the display's changes
+// (update_pacing), up to kMaxRefreshAsks times, so it is taken when it comes
+// by, until the runtime refuses a rate it offers (SteamVR 2.18 refuses them
+// all: there only the headset's settings hold 120 Hz).
+float g_wantedHz = 0.f;
+bool g_refreshGranted = false;
+int g_refreshAsks = 0;
+constexpr int kMaxRefreshAsks = 60;
+
 void request_refresh_rate() {
   if (!B.enumerateRefreshRates || !B.requestRefreshRate)
     return;
@@ -3177,47 +3460,95 @@ void request_refresh_rate() {
   std::string list;
   for (float r : rates)
     list += fmt::format("{}{:.0f}", list.empty() ? "" : ", ", r);
-  const auto offered = [&](float want) {
-    return std::any_of(rates.begin(), rates.end(), [&](float r) { return std::abs(r - want) < 0.5f; });
-  };
-  float pick = 0.f;
-  if (const float wanted = env_float("AURORA_XR_REFRESH", 0.f); wanted > 0.f && offered(wanted))
-    pick = wanted;
-  else if (offered(60.f))
-    pick = 60.f;
-  else if (offered(120.f))
-    pick = 120.f;
-  if (pick > 0.f && XR_SUCCEEDED(B.requestRefreshRate(B.session, pick)))
+  // AURORA_XR_REFRESH if offered, else 60, else 120; a runtime listing a
+  // single rate (the Steam Frame: the one it runs at) is asked for 120.
+  const float pick = policy::pick_refresh(rates, env_float("AURORA_XR_REFRESH", 0.f));
+  if (pick <= 0.f) {
+    Log.info("Display refresh rates offered: {}; keeping the {}", list, rates.size() == 1 ? "headset's" : "default");
+    return;
+  }
+  ++g_refreshAsks;
+  g_wantedHz = pick;
+  const XrResult r = B.requestRefreshRate(B.session, pick);
+  g_refreshGranted = XR_SUCCEEDED(r);
+  const bool listed =
+      std::any_of(rates.begin(), rates.end(), [pick](float rate) { return std::abs(rate - pick) < 0.5f; });
+  if (g_refreshGranted) {
     Log.info("Display refresh rates offered: {}; requested {:.0f} Hz", list, pick);
-  else
-    Log.info("Display refresh rates offered: {}; keeping the default", list);
+  } else if (listed) {
+    // Refused although offered (SteamVR 2.18 on the Steam Frame): the runtime
+    // takes no requests; its own settings decide.
+    g_wantedHz = 0.f;
+    Log.info(
+        "Display refresh rates offered: {}; {:.0f} Hz refused although offered (XrResult {}): the "
+        "runtime picks the rate itself, so set the headset to 120 Hz",
+        list, pick, static_cast<int>(r));
+  } else {
+    Log.info("Display refresh rates offered: {}; {:.0f} Hz refused (XrResult {}), asked again when the rate changes",
+             list, pick, static_cast<int>(r));
+  }
+}
+
+// The display's rate changed (update_pacing): the wanted one asked for again
+// unless it was granted and is the rate shown.
+void refresh_rate_moved(float displayHz) {
+  if (g_wantedHz <= 0.f || (g_refreshGranted && std::abs(displayHz - g_wantedHz) < 0.5f))
+    return;
+  if (g_refreshAsks >= kMaxRefreshAsks) {
+    if (g_refreshAsks++ == kMaxRefreshAsks)
+      Log.warn("Display refresh rate: asked for {:.0f} Hz {} times; no longer asking", g_wantedHz, kMaxRefreshAsks);
+    return;
+  }
+  request_refresh_rate();
 }
 
 // Recompute how many display frames each game frame gets from the current
-// display rate (on session start and on XR_FB_display_refresh_rate changes).
-// The XR loop's period while Application SpaceWarp runs it at half the
-// display rate (xrWaitFrame's predictedDisplayPeriod; 0: the display's).
+// display rate (on session start, on XR_FB_display_refresh_rate changes and
+// when xrWaitFrame's period changes). The XR loop's period while Application
+// SpaceWarp runs it at half the display rate (xrWaitFrame's
+// predictedDisplayPeriod; 0: the display's).
 int64_t g_loopPeriodNs = 0;
+// xrWaitFrame's predictedDisplayPeriod without SpaceWarp: the display's
+// period, whatever the runtime reports (0: no frame yet).
+int64_t g_displayPeriodNs = 0;
+// Their changes count once they last (policy::period_changed): SteamVR
+// reports a held frame's period for one frame now and then.
+constexpr int kPeriodSettleFrames = 12;
+policy::PeriodWatch g_loopWatch, g_displayWatch;
 
 void update_pacing() {
-  float rate = 0.f;
+  float reported = 0.f;
   if (B.getRefreshRate)
-    B.getRefreshRate(B.session, &rate);
-  g_refreshHz = rate;
+    B.getRefreshRate(B.session, &reported);
+  g_refreshHz = reported;
   // SpaceWarp: the loop runs at what xrWaitFrame paces it to, and the game
-  // ticks on that.
-  if (g_loopPeriodNs > 0)
-    rate = static_cast<float>(1e9 / static_cast<double>(g_loopPeriodNs));
-  if (rate <= 0.f && !B.getRefreshRate)
-    rate = 60.f; // no extension (e.g. some runtimes): assume a 60 Hz display
-  g_displayHz = rate;
-  const float ratio = rate / 60.f;
-  const int per = std::abs(ratio - std::round(ratio)) < 0.02f ? static_cast<int>(std::round(ratio)) : 0;
+  // ticks on that. Otherwise the reported rate while the frames come at it,
+  // else their period: a runtime without XR_FB_display_refresh_rate (a 90 Hz
+  // display used to be taken for 60 and stepped the game 90 times a second),
+  // or one granting a rate it doesn't run at (SteamVR on the Steam Frame, 90
+  // granted, 72 shown).
+  const float rate = g_loopPeriodNs > 0 ? static_cast<float>(1e9 / static_cast<double>(g_loopPeriodNs))
+                                        : policy::display_rate(reported, g_displayPeriodNs);
+  const float oldHz = g_displayHz.exchange(rate);
+  const int per = policy::per_game_frame(rate);
   const int old = g_displayPerGameFrame.exchange(env_flag("AURORA_XR_LOCKSTEP", true) ? per : 0);
-  if (old != g_displayPerGameFrame)
-    Log.info("Display at {:.1f} Hz: {}", rate,
-             g_displayPerGameFrame ? fmt::format("game paced to every {} display frame(s)", g_displayPerGameFrame.load())
-                                   : std::string{"not a multiple of 60 Hz, game keeps its own timer"});
+  if (old != g_displayPerGameFrame || std::abs(oldHz - rate) > 0.5f)
+    Log.info("Display at {:.1f} Hz{}: {}", rate,
+             reported > 0.f && std::abs(reported - rate) > 0.5f && g_loopPeriodNs <= 0
+                 ? fmt::format(" (the runtime reports {:.0f} Hz; frames come every {:.2f} ms)", reported,
+                               g_displayPeriodNs / 1e6)
+                 : std::string{},
+             g_displayPerGameFrame
+                 ? fmt::format("game paced to every {} display frame(s)", g_displayPerGameFrame.load())
+                 : std::string{"not a multiple of 60 Hz, game keeps its own timer (a headset "
+                               "set to 120 Hz shows each game frame for two display frames)"});
+  // SteamVR's auto-adjust moves the display's rate with no event.
+  static float lastDisplayHz = 0.f;
+  const float displayHz = reported > 0.f ? reported : policy::display_rate(0.f, g_displayPeriodNs);
+  if (std::abs(displayHz - lastDisplayHz) > 0.5f) {
+    lastDisplayHz = displayHz;
+    refresh_rate_moved(displayHz);
+  }
 }
 
 // Publish where the eyes will be when the render worker's next 3D frame is
@@ -3234,10 +3565,14 @@ void publish_views(XrTime displayTime) {
   XrViewState vs{XR_TYPE_VIEW_STATE};
   std::array<XrView, 2> views{{{XR_TYPE_VIEW}, {XR_TYPE_VIEW}}};
   uint32_t n = 0;
+  B.frameViewsValid = false;
   if (XR_FAILED(xrLocateViews(B.session, &vli, &vs, 2, &n, views.data())) || n != 2)
     return;
   const bool valid = (vs.viewStateFlags & XR_VIEW_STATE_ORIENTATION_VALID_BIT) != 0 &&
                      (vs.viewStateFlags & XR_VIEW_STATE_POSITION_VALID_BIT) != 0;
+  // This display frame's views, for the room's projection layer (XR thread).
+  B.frameViews = views;
+  B.frameViewsValid = (vs.viewStateFlags & XR_VIEW_STATE_ORIENTATION_VALID_BIT) != 0;
   std::array<XrView, 2> renderViews = views;
   const bool lead = g_tweak.lead;
   const int latency = g_present.latency;
@@ -3609,6 +3944,10 @@ constexpr float kPinchClose = 0.02f, kPinchOpen = 0.035f;
 bool locate_pinch(int h, XrTime time, Hand& hand) {
   if (!B.handTrackers[h])
     return false;
+  // SteamVR reports joints for a hand holding a controller, from the
+  // controller: that hand points and grabs with the controller.
+  if (!policy::joints_are_hand(B.handProfile[h]))
+    return false;
   std::array<XrHandJointLocationEXT, XR_HAND_JOINT_COUNT_EXT> joints{};
   XrHandJointLocationsEXT locs{XR_TYPE_HAND_JOINT_LOCATIONS_EXT};
   locs.jointCount = static_cast<uint32_t>(joints.size());
@@ -3686,6 +4025,13 @@ void locate_hands(XrTime time) {
     }
     if (hand.tracked || !hand.valid)
       hand.sel = false;
+    static const bool inputLog = env_flag("AURORA_XR_INPUT_LOG", false);
+    if (inputLog && hand.tracked != wasTracked)
+      Log.info("{} hand: {}", h == 0 ? "Left" : "Right", hand.tracked ? "a tracked hand (pinches)" : "a controller");
+    if (inputLog && (hand.sel != hand.wasSel || hand.held != hand.wasHeld))
+      Log.info("{} hand: trigger {:.2f} {}, grip {:.2f} {}{}", h == 0 ? "Left" : "Right",
+               action_float(h == 0 ? B.trigL : B.trigR), hand.sel ? "down" : "up", action_float(B.grab[h]),
+               hand.held ? "down" : "up", hand.valid ? "" : " (not tracked)");
   }
 }
 
@@ -3871,6 +4217,9 @@ void update_screen(bool active) {
         engage(hand);
       } else if (hand.on == Hand::On::Picture && clickPressed(hand)) {
         hand.clicking = true;
+        static const bool inputLog = env_flag("AURORA_XR_INPUT_LOG", false);
+        if (inputLog)
+          Log.info("{} hand: clicks the screen", h == 0 ? "Left" : "Right");
       } else if (hand.on == Hand::On::Back && clickPressed(hand)) {
         hand.backing = true;
       }
@@ -4078,9 +4427,10 @@ void free_finished_uploads(bool all = false) {
 
 // Fill a one-image swapchain once; the runtime keeps showing it. Without
 // pixels (rgba empty) it is cleared to zero instead, in `format` with
-// `layers` layers (else the swapchains' own format, one layer).
+// `layers` layers (else the swapchains' own format, one layer). optional:
+// within the swapchain budget only (new_swapchain).
 bool create_static_swapchain(XrSwapchain& out, uint32_t w, uint32_t h, const std::vector<uint8_t>& rgba,
-                             int64_t format = 0, uint32_t layers = 1) {
+                             int64_t format = 0, uint32_t layers = 1, bool optional = false) {
   XrSwapchainCreateInfo ci{XR_TYPE_SWAPCHAIN_CREATE_INFO};
   ci.createFlags = XR_SWAPCHAIN_CREATE_STATIC_IMAGE_BIT;
   // Color attachment: released in that layout, as OpenXR expects of color images.
@@ -4093,9 +4443,11 @@ bool create_static_swapchain(XrSwapchain& out, uint32_t w, uint32_t h, const std
   ci.faceCount = 1;
   ci.arraySize = layers;
   ci.mipCount = 1;
-  if (XR_FAILED(xrCreateSwapchain(B.session, &ci, &out))) {
+  if (XR_FAILED(new_swapchain(ci, out, optional))) {
+    if (g_swapchainLimited)
+      return false; // no room for it now
     ci.createFlags = 0;
-    XR_TRY(xrCreateSwapchain(B.session, &ci, &out));
+    XR_TRY(new_swapchain(ci, out, optional));
   }
   uint32_t n = 0;
   XR_TRY(xrEnumerateSwapchainImages(out, 0, &n, nullptr));
@@ -4130,7 +4482,7 @@ bool create_static_swapchain(XrSwapchain& out, uint32_t w, uint32_t h, const std
 
     uint32_t index = 0;
     XrSwapchainImageAcquireInfo ai{XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO};
-    XR_TRY(xrAcquireSwapchainImage(out, &ai, &index));
+    XR_TRY(ON_QUEUE(xrAcquireSwapchainImage(out, &ai, &index)));
     XrSwapchainImageWaitInfo wi{XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO};
     wi.timeout = XR_INFINITE_DURATION;
     XR_TRY(xrWaitSwapchainImage(out, &wi));
@@ -4178,9 +4530,9 @@ bool create_static_swapchain(XrSwapchain& out, uint32_t w, uint32_t h, const std
     // Not waited on: this queue also carries the stream releases, which
     // wait on the render worker, which can wait on this thread. The staging
     // buffer goes once the fence signals.
-    VK_TRY(vkQueueSubmit(B.queue, 1, &si, fence));
+    VK_TRY(ON_QUEUE(vkQueueSubmit(B.queue, 1, &si, fence)));
     XrSwapchainImageReleaseInfo ri{XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
-    XR_TRY(xrReleaseSwapchainImage(out, &ri));
+    XR_TRY(ON_QUEUE(xrReleaseSwapchainImage(out, &ri)));
     B.uploads.push_back({buf, mem, cmd, fence});
     buf = VK_NULL_HANDLE;
     mem = VK_NULL_HANDLE;
@@ -6107,7 +6459,7 @@ bool create_shadow_texture() {
       const float r = std::pow(std::pow(std::abs(u), 4.f) + std::pow(std::abs(v), 4.f), 0.25f);
       px[(y * kShadowSize + x) * 4 + 3] = static_cast<uint8_t>(std::lround((1.f - smoothstep(0.5f, 1.5f, r)) * 255.f));
     }
-  return create_static_swapchain(B.shadowSwapchain, kShadowSize, kShadowSize, px);
+  return create_static_swapchain(B.shadowSwapchain, kShadowSize, kShadowSize, px, 0, 1, true);
 }
 
 // The rotation b, then a.
@@ -6574,7 +6926,17 @@ bool upload_placing_image(PlacingImage& img) {
       px[i + c] = encode[static_cast<int>(std::lround(decode[img.rgba[i + c]] * a * kSteps))];
     px[i + 3] = img.rgba[i + 3];
   }
-  return create_static_swapchain(img.swapchain, img.width, img.height, px);
+  return create_static_swapchain(img.swapchain, img.width, img.height, px, 0, 1, true);
+}
+
+// The placing pictures' swapchains (their pixels stay, to make them again):
+// at teardown, and after a hold where the runtime caps swapchains.
+void free_placing_swapchains() {
+  std::lock_guard lock{g_placingMutex};
+  for (auto& clip : g_placingClips)
+    free_swapchain(clip.atlas.swapchain);
+  for (auto& img : g_placingImages)
+    free_swapchain(img.swapchain);
 }
 
 constexpr size_t kMaxPlacingLayers = 2 + 3; // the cards, the legend, the clips
@@ -6667,6 +7029,15 @@ void build_placing_layers(PlacingLayers& out, int mode) {
     if (img.width == 0)
       return false;
     if (!img.swapchain && !upload_placing_image(img)) {
+      // Over the runtime's swapchain budget: tried again on later frames
+      // (others may have gone by then). Any other failure is for good.
+      if (g_swapchainLimited) {
+        static bool warned = false;
+        if (!warned)
+          Log.warn("No swapchain to spare for placing picture {} yet", what);
+        warned = true;
+        return false;
+      }
       Log.warn("Placing picture {} unavailable", what);
       img.width = 0;
       return false;
@@ -7394,21 +7765,14 @@ bool calibration_textures() {
 }
 
 void destroy_calibration() {
-  for (XrSwapchain* sc : {&g_calRing, &g_calView}) {
-    if (*sc)
-      xrDestroySwapchain(*sc);
-    *sc = XR_NULL_HANDLE;
-  }
+  for (XrSwapchain* sc : {&g_calRing, &g_calView})
+    free_swapchain(*sc);
   std::lock_guard lock{g_placingMutex};
   for (CalImage& ci : g_calImages) {
-    if (ci.img.swapchain)
-      xrDestroySwapchain(ci.img.swapchain);
-    ci.img.swapchain = XR_NULL_HANDLE;
+    free_swapchain(ci.img.swapchain);
     ci.shownGen = 0;
   }
-  if (g_calClip.atlas.img.swapchain)
-    xrDestroySwapchain(g_calClip.atlas.img.swapchain);
-  g_calClip.atlas.img.swapchain = XR_NULL_HANDLE;
+  free_swapchain(g_calClip.atlas.img.swapchain);
   g_calClip.frames = 0;
 }
 
@@ -7519,9 +7883,7 @@ void build_calibration_layers(CalLayers& out, int mode) {
     std::lock_guard lock{g_placingMutex};
     // The clip: made into a swapchain when given, freed when taken away.
     if (g_calClip.atlas.gen != g_calClip.atlas.shownGen) {
-      if (g_calClip.atlas.img.swapchain)
-        xrDestroySwapchain(g_calClip.atlas.img.swapchain);
-      g_calClip.atlas.img.swapchain = XR_NULL_HANDLE;
+      free_swapchain(g_calClip.atlas.img.swapchain);
       if (g_calClip.frames > 0 && !upload_placing_image(g_calClip.atlas.img))
         Log.warn("Calibration clip unavailable");
       g_calClip.atlas.img.rgba.clear();
@@ -7531,9 +7893,7 @@ void build_calibration_layers(CalLayers& out, int mode) {
     for (CalImage& ci : g_calImages) {
       if (ci.gen == ci.shownGen || ci.img.width == 0)
         continue;
-      if (ci.img.swapchain)
-        xrDestroySwapchain(ci.img.swapchain);
-      ci.img.swapchain = XR_NULL_HANDLE;
+      free_swapchain(ci.img.swapchain);
       if (!upload_placing_image(ci.img))
         Log.warn("Calibration picture unavailable");
       ci.shownGen = ci.gen;
@@ -7854,7 +8214,7 @@ void room_depth_frame(XrTime displayTime) {
     VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
     si.commandBufferCount = 1;
     si.pCommandBuffers = &d.cmd;
-    VK_TRY_VOID(vkQueueSubmit(B.queue, 1, &si, d.fence));
+    VK_TRY_VOID(ON_QUEUE(vkQueueSubmit(B.queue, 1, &si, d.fence)));
     d.copied = im;
     d.copiedNs = now;
     d.pending = true;
@@ -9258,7 +9618,7 @@ void update_dev_panel(bool show, bool tintUsable) {
 bool build_dev_panel_layer(XrCompositionLayerQuad& q) {
   const auto now = std::chrono::steady_clock::now();
   while (!P.retired.empty() && now - P.retired.front().second > std::chrono::milliseconds(500)) {
-    xrDestroySwapchain(P.retired.front().first);
+    free_swapchain(P.retired.front().first);
     P.retired.pop_front();
   }
   if (!P.shown)
@@ -9296,10 +9656,10 @@ bool build_dev_panel_layer(XrCompositionLayerQuad& q) {
 
 void destroy_dev_panel() {
   for (auto& r : P.retired)
-    xrDestroySwapchain(r.first);
+    free_swapchain(r.first);
   P.retired.clear();
   if (P.image.swapchain)
-    xrDestroySwapchain(P.image.swapchain);
+    free_swapchain(P.image.swapchain);
   P.image.swapchain = XR_NULL_HANDLE;
   P.shown = false;
   P.active = P.activeHand = -1;
@@ -9433,7 +9793,7 @@ bool render_xr_frame() {
     const int64_t period = fs.predictedDisplayPeriod;
     const int64_t current = g_loopPeriodNs > 0 ? g_loopPeriodNs
                                                : static_cast<int64_t>(1e9 / std::max(g_displayHz.load(), 1.f));
-    if (std::llabs(period - current) * 10 > current) {
+    if (policy::period_changed(g_loopWatch, period, current, kPeriodSettleFrames)) {
       g_loopPeriodNs = period;
       update_pacing();
       // Latency counts loop frames: keep its time (rounded up, within the
@@ -9449,6 +9809,12 @@ bool render_xr_frame() {
       Log.info("XR loop period {:.2f} ms: SpaceWarp {}", period / 1e6,
                g_displayHz.load() < 100.f ? "active" : "idle");
     }
+  } else if (policy::period_changed(g_displayWatch, fs.predictedDisplayPeriod, g_displayPeriodNs,
+                                    kPeriodSettleFrames)) {
+    // The display's period: what pacing goes by where the runtime reports no
+    // rate, or one it doesn't run at.
+    g_displayPeriodNs = fs.predictedDisplayPeriod;
+    update_pacing();
   }
   B.loopWaitNs = monotonic_ns();
   if (B.loopLastWaitNs != 0) {
@@ -9532,7 +9898,7 @@ bool render_xr_frame() {
     B.sectionNs[9 + i] = pre[i + 1] - pre[i];
   {
     TraceSection trace{"xrBeginFrame"};
-    XR_TRY(xrBeginFrame(B.session, nullptr));
+    XR_TRY(ON_QUEUE(xrBeginFrame(B.session, nullptr)));
   }
   section(0);
 
@@ -9592,6 +9958,19 @@ bool render_xr_frame() {
   }
   // Paused, or held before it starts for placing the stage.
   const int placing = g_placing.load();
+  // Where the runtime caps swapchains (a budget is known), the placing
+  // pictures go half a second after a hold ends, making room for others;
+  // the next hold makes them again.
+  {
+    static std::chrono::steady_clock::time_point heldUntil{};
+    if (placing > 0) {
+      heldUntil = now;
+    } else if (g_swapchainBudget > 0 && heldUntil.time_since_epoch().count() != 0 &&
+               now - heldUntil > std::chrono::milliseconds(500)) {
+      heldUntil = {};
+      free_placing_swapchains();
+    }
+  }
   const bool held = g_fightPaused || placing > 0;
   {
     // Each 3D image is due for g_displayPerGameFrame display frames under
@@ -9672,17 +10051,43 @@ bool render_xr_frame() {
   std::array<const XrCompositionLayerBaseHeader*, 5 + kMaxPlacingLayers + kMaxPointerLayers> layers{};
   uint32_t layerCount = 0;
   XrCompositionLayerPassthroughFB ptLayer{XR_TYPE_COMPOSITION_LAYER_PASSTHROUGH_FB};
+  std::array<XrCompositionLayerProjectionView, 2> roomViews{};
+  XrCompositionLayerProjection roomLayer{XR_TYPE_COMPOSITION_LAYER_PROJECTION};
   sync_passthrough();
   sync_boundary();
-  const bool roomShown = B.passthroughLayer && B.passthroughRunning && g_passthroughWanted;
-  if (roomShown) {
+  // Blending, the room shows wherever the frame's alpha lets it, behind a
+  // clear projection layer at the bottom (the Steam Frame shows it only
+  // behind one, and a menu frame has none of its own).
+  const bool roomBlended = B.room == policy::Room::Alpha && g_passthroughWanted && B.frameViewsValid;
+  const bool roomShown = (B.passthroughLayer && B.passthroughRunning && g_passthroughWanted) || roomBlended;
+  // The fight's 3D view first, under everything (policy::fight_layer_first):
+  // the room's layer then, see-through where nothing drew. AURORA_XR_FIGHT_FIRST
+  // =0/1 overrides the runtime's choice.
+  static const bool fightFirstOn = env_flag("AURORA_XR_FIGHT_FIRST", policy::fight_layer_first(B.room));
+  const bool fightFirst = fightFirstOn && fs.shouldRender && fight;
+  if (roomBlended) {
+    for (int i = 0; i < 2; ++i) {
+      roomViews[i] = {XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW};
+      roomViews[i].pose = B.frameViews[i].pose;
+      roomViews[i].fov = B.frameViews[i].fov;
+      roomViews[i].subImage.swapchain = B.roomSwapchain;
+      roomViews[i].subImage.imageRect = {{0, 0}, {16, 16}};
+    }
+    roomLayer.layerFlags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT;
+    roomLayer.space = B.space;
+    roomLayer.viewCount = 2;
+    roomLayer.views = roomViews.data();
+    if (!fightFirst)
+      layers[layerCount++] = reinterpret_cast<const XrCompositionLayerBaseHeader*>(&roomLayer);
+  } else if (roomShown) {
     ptLayer.flags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT;
     ptLayer.layerHandle = B.passthroughLayer;
     layers[layerCount++] = reinterpret_cast<const XrCompositionLayerBaseHeader*>(&ptLayer);
   }
   XrCompositionLayerQuad shadowQuad{XR_TYPE_COMPOSITION_LAYER_QUAD};
   XrCompositionLayerColorScaleBiasKHR shadowTint{XR_TYPE_COMPOSITION_LAYER_COLOR_SCALE_BIAS_KHR};
-  const bool shadow = build_shadow_layer(shadowQuad, shadowTint, fs.shouldRender && fight && roomShown);
+  // Not over a 3D view that goes first: it would cover the stage above it.
+  const bool shadow = build_shadow_layer(shadowQuad, shadowTint, fs.shouldRender && fight && roomShown && !fightFirst);
   // The room's grade, while a fight that isn't held for placing shows over it.
   grade_frame(fight && placing == 0 && calibrating == 0 && roomShown);
   int shadowIndex = -1;
@@ -9788,7 +10193,7 @@ bool render_xr_frame() {
     // AURORA_XR_HUD_ON_TOP=1 keeps it on top in mixed reality too, as does
     // a stage whose scenery reaches it (aurora_xr_set_hud_on_top).
     static const bool hudOnTopEnv = env_flag("AURORA_XR_HUD_ON_TOP", false);
-    const bool hudUnder = g_passthroughWanted && !hudOnTopEnv && !g_hudOnTop;
+    const bool hudUnder = g_passthroughWanted && !hudOnTopEnv && !g_hudOnTop && !fightFirst;
     if (shadow) {
       shadowIndex = static_cast<int>(layerCount);
       layers[layerCount++] = reinterpret_cast<const XrCompositionLayerBaseHeader*>(&shadowQuad);
@@ -9849,7 +10254,8 @@ bool render_xr_frame() {
   layerCount = sanitize_layers(layers.data(), layerCount);
   XrFrameEndInfo fei{XR_TYPE_FRAME_END_INFO};
   fei.displayTime = fs.predictedDisplayTime;
-  fei.environmentBlendMode = XR_ENVIRONMENT_BLEND_MODE_OPAQUE;
+  // Opaque on the Quest, its room a layer of its own.
+  fei.environmentBlendMode = roomBlended ? XR_ENVIRONMENT_BLEND_MODE_ALPHA_BLEND : XR_ENVIRONMENT_BLEND_MODE_OPAQUE;
   fei.layerCount = layerCount;
   fei.layers = layers.data();
   section(7);
@@ -9863,13 +10269,15 @@ bool render_xr_frame() {
     TraceSection trace{"xrEndFrame"};
     // A frame the runtime refuses (a layer it finds invalid) is ended again
     // with the room alone, rather than ending the XR thread over it.
-    if (const XrResult r = xrEndFrame(B.session, &fei); XR_FAILED(r)) {
+    if (const XrResult r = ON_QUEUE(xrEndFrame(B.session, &fei)); XR_FAILED(r)) {
       static int refused = 0;
       if (refused++ < 5)
         Log.error("xrEndFrame failed: XrResult {} ({} layers); this frame shows the room alone",
                   static_cast<int>(r), layerCount);
+      if (roomBlended)
+        layers[0] = reinterpret_cast<const XrCompositionLayerBaseHeader*>(&roomLayer);
       fei.layerCount = roomShown ? 1 : 0;
-      XR_TRY(xrEndFrame(B.session, &fei));
+      XR_TRY(ON_QUEUE(xrEndFrame(B.session, &fei)));
     }
   }
   section(8);
@@ -9933,6 +10341,13 @@ bool render_xr_frame() {
              g_acquireWaitMaxNs[kStereo] / 1e6, g_acquireWaitsOver2[kStereo],
              g_acquireWaitMaxNs[kHud] / 1e6, g_acquireWaitsOver2[kHud], g_acquireWaitMaxNs[kScreen] / 1e6,
              g_acquireWaitsOver2[kScreen], pace_summary());
+    if (B.sharedQueue) {
+      const auto q = webgpu::queue_guard_stats();
+      Log.info(
+          "Shared queue: the XR thread waited for it {:.2f} ms at most, {} times over 1 ms; held {:.2f} ms at "
+          "most, by {}",
+          q.waitMaxNs / 1e6, q.waitsOver1ms, q.holdMaxNs / 1e6, q.holdMaxSite);
+    }
     g_acquireWaitMaxNs = {};
     g_acquireWaitsOver2 = {};
     g_missWhy = {};
@@ -10025,7 +10440,11 @@ bool poll_events() {
     } else if (B.anchors && spot_event(ev)) {
       // the stage spot's anchor
     } else if (ev.type == XR_TYPE_EVENT_DATA_DISPLAY_REFRESH_RATE_CHANGED_FB) {
+      const auto& rc = reinterpret_cast<const XrEventDataDisplayRefreshRateChangedFB&>(ev);
+      Log.info("Display refresh rate changed: {:.0f} -> {:.0f} Hz", rc.fromDisplayRefreshRate, rc.toDisplayRefreshRate);
       update_pacing();
+    } else if (ev.type == XR_TYPE_EVENT_DATA_INTERACTION_PROFILE_CHANGED) {
+      update_hand_profiles();
     } else if (ev.type == XR_TYPE_EVENT_DATA_INSTANCE_LOSS_PENDING) {
       return false;
 #ifdef XR_META_boundary_visibility
@@ -10049,10 +10468,17 @@ bool setup() {
       return false;
   if (g_streams[kStereo].staged)
     Log.info("3D images staged: {} of our own per stream, copied into the swapchains", g_streams[kStereo].ring.size());
-  if (const auto& mv = g_streams[kMotion]; B.appSw && mv.width > 0 &&
-                                           !create_static_swapchain(B.zeroMotionSwapchain, mv.width, mv.height, {},
-                                                                    mv.swapFormat, mv.layers))
+  if (const auto& mv = g_streams[kMotion];
+      B.appSw && mv.width > 0 &&
+      !create_static_swapchain(B.zeroMotionSwapchain, mv.width, mv.height, {}, mv.swapFormat, mv.layers, true))
     Log.warn("SpaceWarp: no zero motion vectors; images submitted again go without SpaceWarp info");
+  // The room by alpha blending: a clear image for the projection layer every
+  // frame starts with (create_static_swapchain clears it to zero).
+  if (B.room == policy::Room::Alpha && !create_static_swapchain(B.roomSwapchain, 16, 16, {})) {
+    Log.warn("No projection layer for the room; the room stays hidden");
+    B.room = policy::Room::None;
+  }
+  g_roomAvailable = B.room != policy::Room::None ? 1 : 0;
   if (!create_input())
     Log.warn("Controller input unavailable");
   if (!create_pointer_textures())
@@ -10083,7 +10509,7 @@ void teardown() {
   // Only our queue: Dawn may be submitting on its own, and vkDeviceWaitIdle
   // would need every queue externally synchronized.
   if (B.queue)
-    vkQueueWaitIdle(B.queue);
+    ON_QUEUE(vkQueueWaitIdle(B.queue));
   if (B.dev)
     free_finished_uploads(true);
   if (B.dev) {
@@ -10110,27 +10536,15 @@ void teardown() {
       B.destroyHandTracker(ht);
     ht = XR_NULL_HANDLE;
   }
-  for (XrSwapchain* sc : {&B.beamSwapchain, &B.dotSwapchain, &B.barSwapchain, &B.backSwapchain,
-                          &B.zeroMotionSwapchain, &B.shadowSwapchain}) {
+  for (XrSwapchain* sc : {&B.beamSwapchain, &B.dotSwapchain, &B.barSwapchain, &B.backSwapchain, &B.zeroMotionSwapchain,
+                          &B.shadowSwapchain, &B.roomSwapchain}) {
     if (*sc)
-      xrDestroySwapchain(*sc);
+      free_swapchain(*sc);
     *sc = XR_NULL_HANDLE;
   }
   destroy_dev_panel();
   destroy_calibration();
-  {
-    std::lock_guard lock{g_placingMutex};
-    for (auto& clip : g_placingClips) {
-      if (clip.atlas.swapchain)
-        xrDestroySwapchain(clip.atlas.swapchain);
-      clip.atlas.swapchain = XR_NULL_HANDLE;
-    }
-    for (auto& img : g_placingImages) {
-      if (img.swapchain)
-        xrDestroySwapchain(img.swapchain);
-      img.swapchain = XR_NULL_HANDLE;
-    }
-  }
+  free_placing_swapchains();
   if (B.actionSet)
     xrDestroyActionSet(B.actionSet); // destroys its actions too
   B.actionSet = XR_NULL_HANDLE;
@@ -10148,7 +10562,7 @@ void teardown() {
   // stopped (Phase::Failed or g_stop) before this runs.
   for (auto& st : g_streams) {
     if (st.swapchain)
-      xrDestroySwapchain(st.swapchain);
+      free_swapchain(st.swapchain);
     st.swapchain = XR_NULL_HANDLE;
   }
   if (B.floorSpace)
@@ -10157,7 +10571,7 @@ void teardown() {
   if (B.space)
     xrDestroySpace(B.space);
   if (B.session)
-    xrDestroySession(B.session);
+    ON_QUEUE(xrDestroySession(B.session));
   B.space = XR_NULL_HANDLE;
   B.session = XR_NULL_HANDLE;
   if (B.dev) {
@@ -12525,7 +12939,7 @@ void screen_size(uint32_t contentWidth, uint32_t contentHeight, uint32_t& width,
 }
 
 wgpu::Texture begin_frame(uint32_t width, uint32_t height) noexcept {
-  if (!wanted() || width == 0 || height == 0)
+  if (!wanted() || width == 0 || height == 0 || g_stopping)
     return {};
   Phase phase = g_phase;
   if (phase == Phase::Idle) {
@@ -12539,8 +12953,9 @@ wgpu::Texture begin_frame(uint32_t width, uint32_t height) noexcept {
     B.phys = h.physicalDevice;
     B.dev = h.device;
     B.queueFamily = h.queueFamilyIndex;
-    B.queueIndex = 1;
-    B.queue = dawn::native::vulkan::GetExtraQueue(webgpu::g_device.Get(), 0);
+    // A spare queue of its own in Dawn's family, or Dawn's shared (device_created).
+    B.queueIndex = B.sharedQueue ? 0 : 1;
+    B.queue = B.sharedQueue ? h.queue : dawn::native::vulkan::GetExtraQueue(webgpu::g_device.Get(), 0);
     g_bindlessOk = webgpu::g_device.HasFeature(wgpu::FeatureName::ChromiumExperimentalSamplingResourceTable);
     gfx::set_xr_bindless(env_flag("AURORA_XR_BINDLESS", true) && g_bindlessOk);
     Log.info("Bindless eye batching: {}", gfx::xr_bindless() ? "on" : "off");
@@ -12602,13 +13017,18 @@ wgpu::Texture begin_frame(uint32_t width, uint32_t height) noexcept {
     // twice the bins of 2x, and every draw is replayed per bin. Four-CPU
     // Brinstar's eye pass at GPU level 2: 10.7 ms at 4x, 9.4 at 2x, 7.6 at 1x
     // (2x needs the Dawn fork's sample count 2, 051c687).
+    // So on any tile-based GPU (Adreno, Mali, PowerVR), Android or not: the
+    // Steam Frame's Adreno runs Linux.
     {
+      VkPhysicalDeviceProperties pp{};
+      vkGetPhysicalDeviceProperties(B.phys, &pp);
+      const bool tiler = pp.vendorID == 0x5143 || pp.vendorID == 0x13B5 || pp.vendorID == 0x1010;
 #ifdef __ANDROID__
-      constexpr float kDefaultSamples = 2.f;
+      constexpr bool android = true;
 #else
-      constexpr float kDefaultSamples = 1.f;
+      constexpr bool android = false;
 #endif
-      const int n = static_cast<int>(env_float("AURORA_XR_MSAA", kDefaultSamples));
+      const int n = static_cast<int>(env_float("AURORA_XR_MSAA", android || tiler ? 2.f : 1.f));
       g_xrSamples = g_multiview && (n == 2 || n == 4) ? static_cast<uint32_t>(n) : 1u;
     }
     Log.info("3D eyes: {}, {}x MSAA", g_multiview ? "multiview, both in one pass" : "side by side, one pass each",
@@ -12636,7 +13056,9 @@ wgpu::Texture begin_frame(uint32_t width, uint32_t height) noexcept {
     gfx::set_xr_early_hooks(&early_eyes, &early_submitted, &early_around_submit);
     const bool earlyEyes = g_multiview && env_flag("AURORA_XR_EARLY_EYES", kEarlyEyesDefault);
     gfx::set_xr_early_eyes(earlyEyes);
-    g_deferEyes = earlyEyes && env_flag("AURORA_XR_DEFER_EYES", kEarlyEyesDefault);
+    // Not with a shared queue: holding Dawn's flush (HoldQueueFlush) is no lock
+    // against the XR thread's use of the queue.
+    g_deferEyes = earlyEyes && !B.sharedQueue && env_flag("AURORA_XR_DEFER_EYES", kEarlyEyesDefault);
     g_phase = Phase::Imported;
     phase = Phase::Imported;
   }
@@ -12725,6 +13147,16 @@ bool prepare_device() noexcept {
     g_phase = Phase::Failed;
     return false;
   }
+#ifndef __ANDROID__
+  // Mesa's Turnip (the Steam Frame) has one graphics queue, but can offer a
+  // second sharing its submissions (the tu_emulate_second_queue driconf
+  // option, read from the environment when the runtime creates Dawn's Vulkan
+  // instance in this process). Then the runtime gets a queue of its own; if
+  // not, it shares Dawn's (device_created). Other drivers ignore it.
+  // AURORA_XR_TU_SECOND_QUEUE=0 leaves it alone.
+  if (env_flag("AURORA_XR_TU_SECOND_QUEUE", true))
+    setenv("tu_emulate_second_queue", "true", 0);
+#endif
   dawn::native::vulkan::ExternalVulkanHooks hooks;
   hooks.createInstance = &hook_create_instance;
   hooks.getPhysicalDevice = &hook_physical_device;
@@ -12733,6 +13165,32 @@ bool prepare_device() noexcept {
   dawn::native::vulkan::SetExternalVulkanHooks(&hooks);
   B.prepared = true;
   return true;
+}
+
+void device_created() noexcept {
+  if (!B.prepared || !webgpu::g_device)
+    return;
+  const auto h = dawn::native::vulkan::GetDeviceVkHandles(webgpu::g_device.Get());
+  // AURORA_XR_SHARED_QUEUE=1 shares the queue even where there's a spare
+  // (testing the shared path on a GPU that has one).
+  if (policy::queue_mode(h.extraQueueCount, env_flag("AURORA_XR_SHARED_QUEUE", false)) == policy::QueueMode::Separate) {
+    Log.info("OpenXR queue: a spare one in Dawn's queue family {}", h.queueFamilyIndex);
+    return;
+  }
+#ifdef AURORA_QUEUE_GUARD_WRAP
+  B.sharedQueue = true;
+  // AURORA_XR_QUEUE_GUARD=0: shared without the lock, which is wrong; only
+  // to check that Vulkan's validation layer sees the races it prevents.
+  const bool guard = env_flag("AURORA_XR_QUEUE_GUARD", true);
+  webgpu::set_queue_shared(guard, webgpu::g_device.Get());
+  Log.info("OpenXR queue: Dawn's queue 0 of family {}, shared with Dawn{}", h.queueFamilyIndex,
+           guard ? "" : " WITHOUT the queue guard (AURORA_XR_QUEUE_GUARD=0, testing only)");
+#else
+  // Without the Dawn entry points wrapped (cmake/aurora_xr.cmake), sharing
+  // can't be made safe: begin_frame finds no queue and presents to the window.
+  Log.warn("OpenXR queue: Dawn's queue family {} has no spare queue, and sharing Dawn's isn't built in",
+           h.queueFamilyIndex);
+#endif
 }
 
 void release_instance() noexcept {
@@ -12744,6 +13202,11 @@ void release_instance() noexcept {
 }
 
 void shutdown() noexcept {
+  // A frame the render worker took after the caller last synchronized it
+  // could still be drawing into a swapchain image: no more images, then the
+  // worker drained, then the XR thread (which destroys them) stopped.
+  g_stopping = true;
+  gfx::render_worker::synchronize();
   g_stop = true;
   if (g_thread.joinable() && g_thread.get_id() != std::this_thread::get_id())
     g_thread.join();
@@ -12757,11 +13220,13 @@ extern "C" void aurora_xr_set_rumble(bool on) {
 
 extern "C" bool aurora_xr_get_pad(PADStatus* out) {
   PADFightRaw raw;
+  u16 dpad = 0;
   {
     std::lock_guard lock{aurora::xr::g_padMutex};
     if (!aurora::xr::g_padValid)
       return false;
     raw = aurora::xr::g_touchRaw;
+    dpad = aurora::xr::g_frameDpad;
   }
   // Through the fight mapping in a fight (PADSetFightMappingActive), the
   // usual one otherwise: the sticks at full scale, the triggers' analog
@@ -12772,6 +13237,13 @@ extern "C" bool aurora_xr_get_pad(PADStatus* out) {
   aurora::pad::fight_compose(PAD_FIGHT_DEVICE_TOUCH, raw,
                              PADFightMappingActive() ? nullptr : aurora::pad::fight_standard(PAD_FIGHT_DEVICE_TOUCH),
                              127.f, 127.f, 0, *out);
+  out->button |= dpad;
+  // AURORA_XR_INPUT_LOG=1: the pad's buttons whenever they change.
+  static const bool inputLog = aurora::xr::env_flag("AURORA_XR_INPUT_LOG", false);
+  static u16 lastButtons = 0;
+  if (inputLog && out->button != lastButtons)
+    aurora::xr::Log.info("XR pad buttons {:#06x}", out->button);
+  lastButtons = out->button;
   return true;
 }
 
@@ -12785,6 +13257,8 @@ extern "C" bool aurora_xr_screen_pointer(float* x, float* y, bool* pressed) {
   *pressed = p.pressed;
   return true;
 }
+
+extern "C" bool aurora_xr_take_view_press(void) { return aurora::xr::g_viewPressed.exchange(false); }
 
 extern "C" bool aurora_xr_screen_back(void) {
   std::lock_guard lock{aurora::xr::g_padMutex};
@@ -12946,6 +13420,8 @@ extern "C" void aurora_xr_set_room_light_held(bool vanilla) {
 }
 
 extern "C" void aurora_xr_set_passthrough(bool on) { aurora::xr::g_passthroughWanted = on; }
+extern "C" bool aurora_xr_passthrough_available(void) { return aurora::xr::g_roomAvailable != 0; }
+extern "C" int aurora_xr_controllers(void) { return aurora::xr::g_controllers.load(std::memory_order_relaxed); }
 
 extern "C" void aurora_xr_set_stage_shadow(bool on) { aurora::xr::g_stageShadow = on ? 1 : 0; }
 
